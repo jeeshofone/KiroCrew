@@ -442,3 +442,109 @@ Writers: `apps/manager.py` (`_BUILTIN_APPS`, `_DEFAULT_ON_BUILTINS`,
 `register_builtin_apps`), `apps/discovery.py::discover_builtin_apps`;
 consumers: `website/src/pages/AppsPage.tsx` (`pickFeatured`),
 `website/src/components/appstore/types.ts` (`isVerified`, `sourceLabel`).
+
+## 13. An app token's WebSocket stream is scoped by its manifest, deny-by-default
+
+`/api/ws` is the third surface an app token reaches, alongside the HTTP API and
+MCP. Connecting grants no events by itself: the socket records the caller's app
+identity and its `permissions.events` declarations, and every fan-out is filtered
+per socket at ONE chokepoint — `DashboardState._send_ws_all` →
+`_ws_client_allowed` → `dashboard/ws_event_scope.py`. Both dispatch paths
+(`broadcast_ws` and the `_broadcast` `_type` translation) and the
+subagent-subscriber fan-out funnel through it. An event absent from the module's
+tables is DENIED, so a new event name is a silent loss of function for apps until
+it is classified — `test_ws_event_scoping.py` fails the build on an unclassified
+broadcast name rather than letting it reach production.
+
+Three tiers. Tier 0 (`dashboard`, `refresh`, `update_progress`) carries no
+sensitive payload and always delivers — and that classification is a claim about
+CONTENT, so it has to be maintained: `_push_status` writes the `dashboard` frame
+straight to each socket every few seconds, and its payload is deliberately
+counts-and-environment only. The checkout's `branch`/`commit` are stripped for app
+tokens (they say what the operator is working on and have no consumer outside the
+owner surfaces); `/api/status` and the SSE stream run on dashboard-user tokens and
+keep the full snapshot. Moving the whole frame behind a declaration was rejected:
+every client needs its `version` to force a reload across a gateway upgrade, so
+that would silently cut existing apps off from the upgrade signal. Tier 1 is slot-scoped: visibility follows
+the slot's `SlotOrigin` and the app's `slots:*` declarations (`slots:own` is the
+default, then `slots:user`, `slots:app:<name>`, `slots:all`), with `subagent:*` an
+independent dimension so an app can watch subagent status without receiving chat
+content. Tier 2 is global and needs an explicit declaration; notifications split
+by source, so `notification` covers the app's own pushes while gateway-internal
+ones (cron output, `send_message`, watchlist results) require
+`notification:system` — bundling them would make one declaration a broad grant.
+
+**`SlotOrigin` is declared by the layer that knows it, never derived.**
+`get_or_create_slot` cannot distinguish a person typing from a background
+injection, so it leaves an undeclared non-app slot UNTAGGED (`""`) instead of
+calling it USER. The request layer decides USER/APP because only it sees whether
+an app token was presented; background callers pass CRON/SYSTEM explicitly. `""`
+is invisible to every cross-slot scope, so a caller that forgets to declare loses
+visibility rather than leaking. The origin round-trips through session metadata:
+both the write (`_save_slot_to_history`) and the restore (the rehydrate paths) are
+required, or every slot comes back unattributed after a restart.
+
+**A socket's scope can only SHRINK while it stays open.** `permissions.events` is
+resolved at connect, and `disable_app` rewrites the registry without closing
+sockets, so every decision INTERSECTS the connect-time snapshot with the
+currently declared set (`ws_event_scope.effective_allowed_events`). ENABLEMENT is
+part of that declared set, not a separate check: `disable_app` flips `enabled` in
+`installed.json` and leaves `app.json` intact, so a manifest-only read would
+report a disabled app's declarations unchanged — a disabled or uninstalled app
+declares nothing, which collapses an open socket to Tier 0.
+
+Four paths read the set and all four narrow: the gate, the `slots` payload
+filter, the subagent-batch payload filter, and the LOG fan-out. The log path is
+the odd one — `subscribe_logs` grants once and the ring handler then writes
+straight to `_ws_log_subscribers` without passing the chokepoint, so the re-check
+lives at the send (`handlers/updates._safe_ws_send`), which also drops the
+subscription. That check must stay on the event loop: the handler's `emit()` runs
+on arbitrary threads, where a cold cache miss would fall back to a synchronous
+manifest read.
+
+A NARROWED or deleted manifest therefore takes effect within one refresh
+interval, while a WIDENED one does not reach an open socket at all — that requires
+a reconnect, so a live session can only ever hold scopes it was authenticated for.
+The reload uses the same off-loop stale-while-revalidate shape as `exposeToApps`,
+with one deliberate difference: a cold miss falls back to the connect snapshot
+rather than to empty, because an empty fallback would withhold every event from
+every app on the first broadcast after a restart. Closing the socket instead was
+rejected — it would cut a streaming turn mid-flight and turn a manifest save into a
+reconnect storm without giving a tighter guarantee than withholding already does.
+
+**Cross-app visibility is mutual.** `slots:app:X` also requires X's manifest to
+name the observer in `permissions.exposeToApps`, so an app cannot name a sibling
+unilaterally. That list is read through a stale-while-revalidate cache because the
+gate is synchronous and sits on the broadcast hot path: it never reads the disk
+itself, a cold miss denies (fail-closed) and schedules an off-loop refresh, and a
+stale entry serves the previous value while refreshing.
+
+**A grant that is not a list denies.** `permissions.api`, `events`, `mcpTools` and
+`exposeToApps` are list-valued; a JSON scalar is refused rather than coerced,
+because iterating a string yields its characters (`"*"` → the wildcard, and
+`"/api/chat"` → the prefix `"/"`, which matches every path).
+
+**Filtering the frame is not always enough.** Two event shapes carry other
+tenants' data inside a payload the gate admits wholesale, so they are narrowed on
+the send path in `_serialize_for_client`: the `slots` re-push (a full slot list)
+and the coalesced `subagent_batch_*` frames (one frame, many subagents' rows, no
+single slot to judge). The `slots` envelope additionally carries global
+safety-posture booleans that no slot scope narrows — `yolo` rides the same
+declaration that gates `yolo_expired`, and `channelTrusted` is withheld from app
+tokens outright. A withheld field is OMITTED, never sent as `false`, because a
+falsy default still answers a question the app must not ask.
+
+`_APP_TOKEN_IMPLICIT_ALLOW` holds `/api/ws` alone. An endpoint belongs there only
+with a compensating per-response control — event scoping is that control for
+`/api/ws` — so `/api/status` is not in it despite being a liveness probe: it
+returns owner hash, host specs, cron and usage stats, and the live safety-override
+state, and an app that wants it declares it in `permissions.api`.
+
+Writers: `dashboard/ws_event_scope.py`, `dashboard/ws.py` (connect-time scope
+resolution), `dashboard/state.py` (`_send_ws_all`, `_ws_client_allowed`,
+`_serialize_for_client`, `SlotOrigin`), `dashboard/token_auth.py`
+(`_APP_TOKEN_IMPLICIT_ALLOW`, `app_token_path_allowed`), `apps/manifest.py`
+(`_granted_list`); consumers: `website/src/app-sdk/index.ts` (mirrors the tables
+for developer-facing diagnostics, drift-guarded by
+`website/src/test/appSdkEventScope.test.ts`). Runtime-facing summary for app
+authors: [../../../src/kiro_crew/docs/app-platform-trust-model.md](../../../src/kiro_crew/docs/app-platform-trust-model.md).
