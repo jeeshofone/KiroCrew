@@ -613,6 +613,70 @@ Skills with auxiliary files (scripts, assets) include `dir` path so the LLM can 
 
 **`skill_search` MCP tool (`kirocrew-core`):** greps skill name/description then, only on a metadata miss, the skill body (bounded, tool-call only — never per message). Schema in `mcp_core.py`, validated against `SKILL_SEARCH_SCHEMA` (`validation.py`). Does NOT record usage — searching is not using. Scope is **locally installed skills only**.
 
+**Direct reads.** The model reaches most skills by reading `SKILL.md` itself — a
+file-read tool, or `cat` in a shell — which bypasses the loader and so recorded
+nothing. Unrecorded, the ledger described one access route only, pushing
+search-discovered skills permanently down the ranking and making them harder to
+find still: a self-reinforcing bias, not a flat undercount.
+
+Crediting is two-phase, because the ledger's hits mean *a body reached the
+model*. `SkillsLoader.resolve_tool_read_keys(tool_name, raw_params, command)`
+resolves which served skills a tool call would deliver, recording nothing;
+`credit_skill_reads(keys)` records once the read is known to have happened.
+
+**Only content-delivering reads qualify.** A tool call that merely *names* a
+skill path earns nothing — `rm`, `mv`, `cp`, `wc`, `chmod`, `stat`, and `grep`
+(which emits matching lines, not the body) are all excluded. Crediting a mention
+would re-create the very mention-as-use conflation that keeps the searches tally
+out of `score()`, and would let a skill-maintenance session push an unread skill
+up the ranking. The shell path attributes a verb **per command segment**
+(`_shell_segments_reading_content`), so `cat a.txt && rm x/SKILL.md` does not
+read as a `cat` of the skill; the structured path allowlists content-returning
+tools (`_CONTENT_READ_TOOLS`), so an edit or grep tool carrying a `path` is not
+mistaken for a delivery.
+
+Reads are attributed through `_served_key_by_realpath()`, which applies the same
+canonical rule as `resolve_ledger_aliases` (real file beats symlink, then
+alphabetical), so a read through a symlinked skill lands on the key the Context
+Budget screen displays instead of splitting one file's cost.
+
+Observation sits in the **ACP client**, registered process-wide via
+`set_global_skill_read_observer` — the same module-level-slot pattern as
+`get_global_hook_store`. That layer is the only one that sees every surface's
+tool calls (dashboard, Slack, subagents, task runner); wiring it per surface
+would have left subagent reads uncounted, which is a skewed ledger rather than a
+partial one. The per-surface permission gate (`HookManager.on_tool_call`) is NOT
+usable here: file reads are auto-approved and never reach it.
+
+Registration goes through one helper, `register_skill_read_observer` in
+`skill_usage.py` — a leaf module, so no runtime imports another surface just to
+register. Called from every runtime that owns a `ContextBuilder`:
+`start_dashboard`, `start_api_server`, and the CLI in `cli_server.py`. Crediting
+must not vary by entry point: route-dependent visibility is precisely the bias
+this exists to remove, so a runtime that recorded nothing would ship a smaller
+version of the same defect. The helper takes several candidates and installs the
+first exposing a loader, because the API-server path builds its state **without**
+a `context_builder` and reaches the loader through `task_runner._ctx`; it returns
+whether it installed one so that path can log a miss instead of silently
+recording nothing.
+
+The read-intent allowlists (`_CONTENT_READ_TOOLS`, `_SHELL_READ_VERBS`) encode
+the provider's current tool spellings, so a rename would silently restore the
+pre-existing undercount. A call whose arguments clearly name a `SKILL.md` yet
+yields no candidate is therefore logged at debug — the one signal that separates
+tool-name drift from a legitimately non-reading call.
+
+`_maybe_note_skill_read` resolves at the tool call and **offloads to a thread** —
+resolution walks the skills tree after cache expiry and resolves every served
+skill, which on the event loop would stall every session in the gateway. Both the
+initial `tool_call` and its `tool_call_update` refinement are observed, since
+which one carries `rawInput` is provider-specific, deduped by `tool_call_id`.
+`_maybe_credit_skill_read` then records only on a `status == "completed"` result
+(`tool_final`), so a read that was denied, errored, or never ran leaves no
+delivery; that call is in-memory and safe inline. A cheap `SKILL.md` substring
+gate runs before the offload, so a tool call touching no skill costs a substring
+scan; observer failures in either phase are logged and swallowed.
+
 **Registry discovery — `skill_discover` / `skill_fetch` MCP tools (`kirocrew-core`).**
 The agent-facing twins of the dashboard's Skills → Discover panel, covering the
 skills that are *not* on disk. Both are read-only and reach the existing

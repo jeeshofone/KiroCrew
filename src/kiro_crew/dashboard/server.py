@@ -183,6 +183,7 @@ from kiro_crew.safety_override import (
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
+from kiro_crew.skill_usage import register_skill_read_observer
 from kiro_crew.skills import SkillsLoader, set_pending_staged_hook
 from kiro_crew.suggestions import api_suggestions
 from kiro_crew.tips import api_tips_feedback, api_tips_next, api_tips_status
@@ -1972,6 +1973,10 @@ async def start_dashboard(
     state._hook_store = ScriptHookStore()
     set_global_hook_store(state._hook_store)
 
+    # Credit the skill-usage ledger for skill bodies the model reads directly
+    # (a file-read tool or `cat`), which bypass the loader entirely.
+    register_skill_read_observer(state.context_builder)
+
     # Wire script hooks into subagent tool execution path
     if state.subagents is not None:
         state.subagents.hook_store = state._hook_store
@@ -3435,6 +3440,15 @@ async def start_api_server(
     )
     state._hook_store = ScriptHookStore()
     set_global_hook_store(state._hook_store)
+
+    # This path builds its state without a context_builder, so the loader is
+    # reached through the task runner. Logged on a miss rather than silently
+    # recording nothing, since a route that credits no reads is the bias this
+    # observer exists to remove.
+    if not register_skill_read_observer(
+        state.context_builder, getattr(task_runner, "_ctx", None)
+    ):
+        logger.info("skill-read observer not registered: no skills loader reachable")
 
     # Wire script hooks into subagent tool execution path
     if state.subagents is not None:

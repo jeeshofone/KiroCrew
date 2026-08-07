@@ -56,6 +56,7 @@ from kiro_crew.service import linux as svc_linux
 from kiro_crew.service import macos as svc_macos
 from kiro_crew.service.common import SERVICE_NAME, Platform, current_platform
 from kiro_crew.session import SessionManager
+from kiro_crew.skill_usage import register_skill_read_observer
 from kiro_crew.skills import SkillsLoader
 from kiro_crew.slack.gateway import run_gateway
 from kiro_crew.taskrunner import TaskRunner
@@ -1688,7 +1689,7 @@ async def _run_task(args: argparse.Namespace) -> None:
     ctx = ContextBuilder(
         memory=memory, skills=skills, hooks=hooks, lessons=lessons, bot_name=cfg.agent.bot_name
     )
-
+    register_skill_read_observer(ctx)
     runner = TaskRunner(
         sessions=sessions,
         context_builder=ctx,

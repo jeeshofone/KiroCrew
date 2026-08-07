@@ -342,6 +342,108 @@ def _within_any(candidate: str, roots: tuple[str, ...]) -> bool:
     return False
 
 
+#: Basename every skill's body lives under. Used as a cheap pre-filter before
+#: any filesystem work when deciding whether a tool call touched a skill.
+_SKILL_FILE = "SKILL.md"
+
+#: Argument names under which file-reading tools carry their target. Covers the
+#: builtin read tool's ``path`` plus the spellings other tools use; a name that
+#: is absent simply yields no candidate.
+_TOOL_READ_PATH_KEYS = ("path", "file_path", "filePath", "paths", "files")
+
+#: A whitespace/quote-delimited token ending in the skill basename — how a skill
+#: read appears inside a shell command (``cat /x/SKILL.md``). Anchored on the
+#: basename so it cannot match an arbitrary argument.
+_SHELL_SKILL_PATH_RE = re.compile(r"""[^\s"'|;&><]+SKILL\.md""")
+
+
+def _tool_read_path_candidates(
+    tool_name: str, raw_params: dict | None, command: str | None
+) -> list[str]:
+    """File targets of a tool call that DELIVERS file content to the model.
+
+    Returns nothing for a call that merely names a path — a delete, move, line
+    count, or grep. The ledger's hits mean "a body reached the model", so
+    crediting a mention would re-create the mention-as-use conflation that the
+    separate searches tally exists to avoid.
+
+    Never raises on a malformed params dict — a tool's arguments are
+    model-authored and may hold anything.
+    """
+    out: list[str] = []
+    if isinstance(raw_params, dict) and tool_name in _CONTENT_READ_TOOLS:
+        for key in _TOOL_READ_PATH_KEYS:
+            value = raw_params.get(key)
+            if isinstance(value, str):
+                out.append(value)
+            elif isinstance(value, (list, tuple)):
+                out.extend(v for v in value if isinstance(v, str))
+    if isinstance(command, str) and command:
+        for segment in _shell_segments_reading_content(command):
+            out.extend(_SHELL_SKILL_PATH_RE.findall(segment))
+    return out
+
+
+#: Shell commands that deliver a file's CONTENT to the model. Deliberately
+#: narrow: the ledger counts bodies that reached the model, so a command that
+#: merely names a path — ``rm``, ``mv``, ``wc``, ``chmod`` — earns nothing, and
+#: neither does ``grep``, which emits matching lines rather than the body.
+#: ``head``/``tail`` deliver a prefix, which is still a body the model read.
+_SHELL_READ_VERBS = frozenset(
+    {"cat", "bat", "head", "tail", "less", "more", "view", "type"}
+)
+
+#: Tools whose result hands the model a file's content. ``grep``/``glob`` are
+#: read-KIND but return matches and names, not bodies, so they are excluded for
+#: the same reason ``grep`` is above.
+_CONTENT_READ_TOOLS = frozenset({"fs_read", "read", "read_file", "readFile"})
+
+#: Splits a shell command into independently-invoked segments, so the verb that
+#: applies to a given path is the one that precedes it in ITS segment — without
+#: this, ``cat a.txt && rm x/SKILL.md`` would read as a ``cat`` of the skill.
+_SHELL_SEGMENT_RE = re.compile(r"(?:\|\||&&|[;|&\n]|\$\(|`)")
+
+
+def _shell_segments_reading_content(command: str) -> list[str]:
+    """Segments of *command* whose leading verb delivers file content.
+
+    A segment's verb is its first bare token; leading environment assignments
+    (``FOO=bar cat x``) and absolute paths (``/bin/cat``) are tolerated.
+    """
+    reading: list[str] = []
+    for segment in _SHELL_SEGMENT_RE.split(command):
+        for token in segment.split():
+            if "=" in token and not token.startswith("-"):
+                continue  # leading VAR=value assignment
+            verb = token.rsplit("/", 1)[-1]
+            if verb in _SHELL_READ_VERBS:
+                reading.append(segment)
+            break  # only the segment's first bare token is its verb
+    return reading
+
+
+def _mentions_skill_basename(raw_params: dict | None, command: str | None) -> bool:
+    """Whether a tool call's arguments name a skill body at all.
+
+    Independent of read intent: used only to tell "this call had nothing to do
+    with skills" apart from "this call named a skill but our read-intent
+    allowlists did not recognise it", which is what a provider tool rename looks
+    like from here.
+    """
+    if isinstance(command, str) and _SKILL_FILE in command:
+        return True
+    if not isinstance(raw_params, dict):
+        return False
+    for value in raw_params.values():
+        if isinstance(value, str):
+            if _SKILL_FILE in value:
+                return True
+        elif isinstance(value, (list, tuple)):
+            if any(isinstance(v, str) and _SKILL_FILE in v for v in value):
+                return True
+    return False
+
+
 def _iter_skill_files(base: Path) -> list[tuple[str, Path]]:
     """Recursively find all SKILL.md files under *base*.
 
@@ -708,6 +810,99 @@ class SkillsLoader:
             return skill_file.is_relative_to(self._dir)
         except (OSError, ValueError):
             return False
+
+    def _served_key_by_realpath(self) -> dict[str, str]:
+        """Map each served skill file's realpath to its canonical served key.
+
+        Applies the same canonical rule as ``resolve_ledger_aliases`` — the real
+        file's key beats a symlink's, then alphabetical — so a read through a
+        symlinked skill is credited to the key the budget screen displays rather
+        than splitting one file's cost across two rows. Uncached and
+        resolve()-bound for the same reason stated there, so callers must gate
+        it behind a cheap check rather than running it per tool call.
+        """
+        by_realpath: dict[str, list[tuple[str, Path]]] = {}
+        for key, skill_file in self._iter():
+            try:
+                rp = str(skill_file.resolve())
+            except (OSError, RuntimeError):
+                # A cyclic symlink raises RuntimeError, not OSError.
+                continue
+            by_realpath.setdefault(rp, []).append((key, skill_file))
+        return {
+            rp: min(pairs, key=lambda p: (p[1].is_symlink(), p[0]))[0]
+            for rp, pairs in by_realpath.items()
+        }
+
+    def resolve_tool_read_keys(
+        self,
+        tool_name: str = "",
+        raw_params: dict | None = None,
+        command: str | None = None,
+    ) -> list[str]:
+        """Served skill keys whose body a tool call is about to deliver.
+
+        Resolution only — nothing is recorded, so the caller can run this off
+        the event loop and credit later, once the read is confirmed to have
+        completed. Returns keys deduped, so one command naming a file twice
+        yields it once.
+
+        Only content-delivering reads qualify (see
+        ``_tool_read_path_candidates``): a tool call that merely names a skill
+        path earns nothing, because the ledger's hits mean a body reached the
+        model.
+
+        Filesystem-bound (``_iter`` plus a ``resolve()`` per served skill), so
+        candidates are filtered on the ``SKILL.md`` basename first and callers
+        must keep this off the event loop.
+        """
+        if self._usage is None:
+            return []
+        candidates = [
+            c
+            for c in _tool_read_path_candidates(tool_name, raw_params, command)
+            if _SKILL_FILE in c
+        ]
+        if not candidates:
+            # The read-intent allowlists (`_CONTENT_READ_TOOLS`,
+            # `_SHELL_READ_VERBS`) encode the provider's current tool spellings.
+            # A rename would silently restore the pre-existing undercount with
+            # nothing failing, so a call that clearly names a skill yet yields no
+            # candidate is logged — the one signal that distinguishes drift from
+            # a legitimately non-reading tool call.
+            if _mentions_skill_basename(raw_params, command):
+                logger.debug(
+                    "skill-read: %r names a skill but is not a content read "
+                    "(tool=%r); check the read-intent allowlists if the provider "
+                    "renamed its tools",
+                    command or raw_params,
+                    tool_name,
+                )
+            return []
+        try:
+            realpath_to_key = self._served_key_by_realpath()
+        except OSError:
+            return []
+        keys: list[str] = []
+        for cand in candidates:
+            try:
+                rp = str(Path(cand).expanduser().resolve())
+            except (OSError, RuntimeError, ValueError):
+                continue
+            key = realpath_to_key.get(rp)
+            if key is not None and key not in keys:
+                keys.append(key)
+        return keys
+
+    def credit_skill_reads(self, keys: list[str]) -> None:
+        """Record a delivery for each key in *keys*. Best-effort, never raises.
+
+        Separate from ``resolve_tool_read_keys`` so the credit lands only after
+        the read has actually completed — a tool call that was denied or failed
+        must not leave a delivery behind.
+        """
+        for key in keys:
+            self._record_use(key)
 
     def resolve_ledger_aliases(self) -> dict[str, list[str]]:
         """Map served skill keys to ledger keys that resolve to the same file.
