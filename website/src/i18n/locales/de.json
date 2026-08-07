@@ -2536,7 +2536,10 @@
         "needs_restart": "Multi-Instanz wurde gerade aktiviert — starte das Gateway neu, um es zu aktivieren.",
         "not_connected": "nicht verbunden",
         "switch_note": "Beim Wechseln wechseln auch Erscheinungsbild und Chat-Verlauf — jede Instanz behält ihr eigenes. Eine gespeicherte Instanz, die verschwindet, fällt auf diesen Computer zurück.",
-        "this_computer": "Dieser Computer"
+        "this_computer": "Dieser Computer",
+        "host_disable_note": "Mochi auf einer anderen Instanz zu deaktivieren stoppt nur die eigene Hintergrundarbeit dieser Instanz — dein Haustier bleibt auf der Instanz, die du hier auswählst.",
+        "switch_failed": "Instanz konnte gerade nicht gewechselt werden — deine Auswahl ist gespeichert und wird angewendet, sobald diese Instanz antwortet.",
+        "desktop_only": "Die Auswahl der Instanz, die das Haustier zeigt, benötigt die Desktop-App."
       },
       "manifest": {
         "description": "Ein Desktop-Begleiter, der auf deinem Bildschirm wohnt. Mochi chattet über sein eigenes Panel, beobachtet Seiten und Feeds für dich, plant seinen Tag um deinen Zeitplan herum, erinnert sich an eure gemeinsame Zeit und tippt dir nur dann auf die Schulter, wenn sich wirklich etwas geändert hat.",
@@ -2759,6 +2762,7 @@
         "shortcut_one_key": "Nur eine Nicht-Modifikatortaste erlaubt",
         "shortcut_taken": "Eine andere App belegt diese Taste bereits: {{actions}}. Wähle eine andere Kombination.",
         "shortcuts": "Tastenkürzel",
+        "shortcuts_desktop_only": "Das Ändern der globalen Tastenkürzel benötigt die Desktop-App.",
         "silent_subagents": "Stille Hintergrundagenten",
         "silent_subagents_desc": "Unterdrückt Benachrichtigungen, wenn Hintergrundaufgaben abgeschlossen werden (Plan, Beobachtungsprüfungen). Ergebnisse erscheinen weiterhin im Chat.",
         "tier_active": "Aktiv",

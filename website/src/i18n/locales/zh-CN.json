@@ -2492,7 +2492,10 @@
         "needs_restart": "多实例刚刚开启 —— 重启 gateway 后生效。",
         "not_connected": "未连接",
         "switch_note": "切换同时会换外观和聊天记录 —— 每个实例各有一份。选中的实例消失时会自动退回本机。",
-        "this_computer": "本机"
+        "this_computer": "本机",
+        "host_disable_note": "在其他实例上关闭 Mochi 只会停掉该实例自己的后台工作 —— 宠物会留在你这里选中的实例上。",
+        "switch_failed": "暂时无法切换实例 —— 你的选择已保存，等该实例响应后就会生效。",
+        "desktop_only": "选择宠物显示哪个实例需要桌面应用。"
       },
       "manifest": {
         "description": "一个住在你屏幕上的桌面伙伴。Mochi 在自己的面板里聊天，替你盯着网页和信息源，按你的日程规划一天。它记得你们相处的点滴，只在确实有变化时才拍你肩膀。",
@@ -2715,6 +2718,7 @@
         "shortcut_one_key": "只能有一个非修饰键",
         "shortcut_taken": "这个按键已被其他应用占用：{{actions}}。请换一个组合。",
         "shortcuts": "快捷键",
+        "shortcuts_desktop_only": "修改全局快捷键需要桌面应用。",
         "silent_subagents": "静默后台任务",
         "silent_subagents_desc": "后台任务完成时不发送通知（计划、监控检查）。结果仍会显示在聊天中。",
         "tier_active": "活跃",

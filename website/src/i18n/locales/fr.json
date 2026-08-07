@@ -2580,7 +2580,10 @@
         "needs_restart": "Le mode multi-instance vient d'être activé — redémarrez le gateway pour l'activer.",
         "not_connected": "non connectée",
         "switch_note": "Changer d'instance change aussi l'apparence et l'historique du chat — chaque instance conserve les siens. Une instance enregistrée qui disparaît revient à cet ordinateur.",
-        "this_computer": "Cet ordinateur"
+        "this_computer": "Cet ordinateur",
+        "host_disable_note": "Désactiver Mochi sur une autre instance arrête seulement le travail en arrière-plan de cette instance — ton compagnon reste sur l'instance que tu choisis ici.",
+        "switch_failed": "Impossible de changer d'instance pour le moment — ton choix est enregistré et s'appliquera dès que cette instance répondra.",
+        "desktop_only": "Choisir l'instance affichée par le compagnon nécessite l'application de bureau."
       },
       "manifest": {
         "description": "Un compagnon de bureau qui vit sur ton écran. Mochi discute depuis son propre panneau, surveille des pages et des flux pour toi, organise sa journée autour de ton emploi du temps, se souvient des moments passés ensemble et ne te tape sur l’épaule que lorsque quelque chose a vraiment changé.",
@@ -2803,6 +2806,7 @@
         "shortcut_one_key": "Une seule touche non modificatrice est permise",
         "shortcut_taken": "Une autre app utilise déjà cette touche : {{actions}}. Choisissez une autre combinaison.",
         "shortcuts": "Raccourcis",
+        "shortcuts_desktop_only": "Modifier les raccourcis globaux nécessite l'application de bureau.",
         "silent_subagents": "Agents d'arrière-plan silencieux",
         "silent_subagents_desc": "Supprime les notifications à la fin des tâches en arrière-plan (plan, vérifications de suivi). Les résultats apparaissent toujours dans le chat.",
         "tier_active": "Actif",
