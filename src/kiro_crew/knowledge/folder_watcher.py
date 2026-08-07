@@ -19,6 +19,8 @@ from kiro_crew.sel import sel
 from .chunker import CHUNK_TOKEN_SIZE, MAX_CHUNKS_PER_FILE
 from .dedup import dedup_document
 from .ingestion import DUPLICATE_JOB_STATUS
+from .kiroignore import KIROIGNORE_FILENAME
+from .kiroignore import load as load_kiroignore
 from .readers import FileReader
 
 logger = logging.getLogger(__name__)
@@ -141,6 +143,18 @@ def _prop_int(value: object) -> int:
     if isinstance(value, float) and not math.isfinite(value):
         return 0
     return int(value) if value > 0 else 0
+
+
+def _rel_posix(rel_dir: str, name: str) -> str:
+    """Join a walk-relative directory and an entry name into a ``/``-separated path.
+
+    ``.kiroignore`` patterns are written with ``/``, so a Windows ``\\``-separated
+    relative path has to be normalised or every pattern carrying a separator
+    silently never matches.
+    """
+    if rel_dir in ("", "."):
+        return name
+    return f"{rel_dir.replace(os.sep, '/')}/{name}"
 
 
 #: Per-source property that overrides the configured folder budget. Separate from
@@ -521,6 +535,9 @@ class FolderWatcher:
         supported = FileReader.SUPPORTED
         results = []
         skip_dirs = HARD_SKIP_DIRS | extra_skip_dirs
+        # Root-level rules only, re-read each sweep so editing the file takes effect
+        # without touching the source's properties.
+        kiroignore = load_kiroignore(root)
         root_real = ""
         if confine_to_root:
             try:
@@ -529,15 +546,25 @@ class FolderWatcher:
                 return []
 
         for dirpath, dirnames, filenames in os.walk(root):
+            rel_dir = os.path.relpath(dirpath, root)
             # Prune skip dirs in-place.
             # Windows: the `.`-prefix hidden check is POSIX-centric — Windows marks
             # hidden via the NTFS hidden attribute, not a dotfile name, so some
             # dirs that are hidden on Windows aren't pruned (benign over-ingestion).
             # Tracked as follow-on work.
             dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".")]
+            if kiroignore is not None:
+                # Excluded directories are PRUNED, not filtered per file, so a huge
+                # generated tree (cdk.out, coverage output) is never descended.
+                dirnames[:] = [
+                    d for d in dirnames
+                    if not kiroignore.is_ignored(_rel_posix(rel_dir, d), is_dir=True)]
 
-            rel_dir = os.path.relpath(dirpath, root)
             for fname in filenames:
+                # The rule file is configuration, not a document. Its extensionless
+                # name is in FileReader.SUPPORTED, so it would otherwise be indexed.
+                if rel_dir == "." and fname == KIROIGNORE_FILENAME:
+                    continue
                 # Skip OS-generated temp/lock/junk files (basename, case-insensitive)
                 if any(fnmatch(fname.lower(), pat) for pat in DEFAULT_IGNORE_GLOBS):
                     continue
@@ -546,6 +573,9 @@ class FolderWatcher:
                 # normalized before matching or every pattern containing a
                 # separator silently never matches on Windows.
                 if any(fnmatch(rel_path.replace(os.sep, "/"), pat) for pat in ignore_patterns):
+                    continue
+                if kiroignore is not None and kiroignore.is_ignored(
+                        _rel_posix(rel_dir, fname), is_dir=False):
                     continue
                 # Extension filter
                 ext = Path(fname).suffix.lower()
