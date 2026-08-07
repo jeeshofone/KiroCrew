@@ -30,6 +30,9 @@ import reducer, {
   sseChatMessageUpdate,
   sseContextUsage,
   toggleActivity,
+  openActivityPanel,
+  openActivityToTab,
+  switchSlot,
   resolveByApprovalId,
   sseSideResult,
   sideClose,
@@ -938,6 +941,25 @@ describe('activity viewer reducers', () => {
     const state = reducer(initial, toggleActivity())
     expect(state.activityOpen).toBe(true)
     expect(reducer(state, toggleActivity()).activityOpen).toBe(false)
+  })
+
+  it('counts a view request only when one is actually made', () => {
+    // The counter is what tells the side panel's tab strip "focus this view".
+    // A chat switch restores the incoming chat's cached activityTab, and that
+    // restore must NOT read as a request — otherwise reopening a chat drags
+    // focus off the tab the user left it on.
+    expect(initial.activityTabRequest).toBe(0)
+    const requested = reducer(withSlot, openActivityToTab('subagents'))
+    expect(requested.activityTabRequest).toBe(1)
+    // Same view asked for twice is two requests: the user may have clicked away
+    // in the strip in between, and the second ask must still pull focus back.
+    expect(reducer(requested, openActivityToTab('subagents')).activityTabRequest).toBe(2)
+
+    const switched = reducer(requested, switchSlot.pending('req-1', 'slot-2'))
+    expect(switched.activityTab).toBe('files')
+    expect(switched.activityTabRequest).toBe(1)
+    // Opening the panel without naming a view is not a request either.
+    expect(reducer(switched, openActivityPanel()).activityTabRequest).toBe(1)
   })
 
   it('sseToolActivity adds to toolLog', () => {

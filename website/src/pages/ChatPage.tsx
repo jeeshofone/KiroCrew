@@ -4121,16 +4121,22 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // Bridge explicit view requests (e.g. the /side slash command dispatches
   // openActivityToTab('side')) into the tab model.
   const activityTab = useAppSelector(s => s.chat.activityTab)
-  // Skip the mount invocation: this bridge only reacts to a GENUINE activityTab
-  // change (e.g. the /side slash command via openActivityToTab). Firing on mount
-  // would re-open the activityTab view (Files by default) on top of the
-  // now-persisted strip every time ChatPage remounts after a route change.
+  // Keyed on the REQUEST counter, never on the tab's value. `activityTab` also
+  // changes when a chat switch restores the incoming chat's cached tab (Files
+  // when it has none), and bridging that would force-focus Files — or whatever
+  // view was last requested in that chat — over the tab the tab strip has
+  // remembered and the user actually left the chat on. Only openActivityToTab
+  // bumps the counter, so only a deliberate request moves focus.
+  const activityTabRequest = useAppSelector(s => s.chat.activityTabRequest)
+  // Skip the mount invocation: the counter is already non-zero after any earlier
+  // request this page load, so firing on mount would re-open that view on top of
+  // the now-persisted strip every time ChatPage remounts after a route change.
   const activityTabBridged = useRef(false)
   useEffect(() => {
     if (!activityTabBridged.current) { activityTabBridged.current = true; return }
     if (activityOpen) tabsCtl.openView(activityTab === ('nav' as string) ? 'files' : activityTab)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activityTab])
+  }, [activityTabRequest])
   // Stable row callbacks. Inline lambdas in the row renderer would hand
   // AssistantMessage a fresh function identity every render, so its memo()
   // could never bail out — the boundary would break at the call site, not in the
