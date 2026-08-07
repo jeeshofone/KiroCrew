@@ -800,6 +800,11 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         return web.json_response({"error": "rule is required"}, status=400)
     category = cleaned.get("category", "knowledge")
     scope = cleaned.get("scope", "global")
+    # LEARN_ADD_SCHEMA accepts and validates ``negative``, but both write paths
+    # below discarded it -- write_lesson got a literal None and the JSONL Lesson
+    # omitted the kwarg -- so every NOT-clause sent to this route, from the
+    # learn_add MCP tool, the dashboard, or the CLI, was silently lost.
+    negative = cleaned.get("negative") or None
     # Write to vector store if available, else JSONL
     vs = _get_memory(state).vector_store
     if vs:
@@ -821,31 +826,46 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         # for a lesson that was actually saved (and re-saved on every retry).
         # Writing first, then sweeping in the background, keeps the slow LLM call
         # off the request path.
-        await asyncio.to_thread(
+        wrote = await asyncio.to_thread(
             vs.write_lesson,
             rule,
             category,
-            None,
+            negative,
             "user_explicit",
             rule_emb,
             rule_emb_generation,
         )
-        candidates = await asyncio.to_thread(
-            vs.find_contradiction_candidates, rule, 0.4, 0.85, rule_emb
-        )
-        if candidates:
-            # Fire-and-forget via this module's _background_tasks
-            # pattern. The sweep only supersedes OTHER (older) lessons, never
-            # the one just written (self-match scores ~1.0, above the 0.85
-            # candidate ceiling), so deferring it is safe. No retry/queue: a
-            # missed sweep self-heals on the next learn_add touching the topic.
-            task = asyncio.create_task(
-                _resolve_and_supersede(state, sk, rule, candidates, vs)
+        # Sweep ONLY when the lesson actually landed. write_lesson returns False
+        # for a value its preflight refuses (reachable now that ``negative`` is
+        # forwarded here at all -- this call site passed a literal None before) and
+        # for a dedup refusal. The return value used to be discarded, so a refused
+        # write still ran the sweep below, and _resolve_and_supersede would
+        # delete_semantic an older contradicted lesson whose "replacement" was never
+        # stored -- destroying a lesson on a request that persisted nothing, under
+        # HTTP 200. Superseding on the authority of a write that did not happen is
+        # wrong for BOTH False cases, so gate on the result rather than the cause.
+        if wrote:
+            candidates = await asyncio.to_thread(
+                vs.find_contradiction_candidates, rule, 0.4, 0.85, rule_emb
             )
-            state._background_tasks.add(task)
-            task.add_done_callback(state._background_tasks.discard)
+            if candidates:
+                # Fire-and-forget via this module's _background_tasks
+                # pattern. The sweep only supersedes OTHER (older) lessons, never
+                # the one just written (self-match scores ~1.0, above the 0.85
+                # candidate ceiling), so deferring it is safe. No retry/queue: a
+                # missed sweep self-heals on the next learn_add touching the topic.
+                task = asyncio.create_task(
+                    _resolve_and_supersede(state, sk, rule, candidates, vs)
+                )
+                state._background_tasks.add(task)
+                task.add_done_callback(state._background_tasks.discard)
     else:
-        lesson = Lesson(rule=rule, category=category, ts=datetime.now(timezone.utc).isoformat())
+        lesson = Lesson(
+            rule=rule,
+            category=category,
+            negative=negative,
+            ts=datetime.now(timezone.utc).isoformat(),
+        )
         if scope == "workspace":
             ws = cleaned.get("workspace")
             _get_lessons(state, ws).save(lesson)
