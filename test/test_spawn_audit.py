@@ -137,7 +137,17 @@ PREEXEC_EXEMPT: frozenset[str] = frozenset(
 BENIGN_SPAWNS: frozenset[str] = frozenset(
     {
         "acp/runtime.py::_get_rss_mb",
-        "acp/runtime.py::_get_rss_tree_mb",
+        # _get_rss_tree_mb is deliberately NOT listed: its own spawn moved into
+        # _ps_process_table below, so an entry for it would be stale and would
+        # mask a future regression that put a spawn back inline.
+        #
+        # Whole-machine process-table snapshot behind _get_rss_tree_mb's macOS
+        # branch, extracted so N pids share ONE walk. Same trust profile as
+        # _get_rss_mb above: one fixed argv (`ps -Ao pid=,ppid=,rss=`) with a 2s
+        # timeout, no shell, no cwd, and no arguments at all — nothing here is
+        # agent-influenced, and the binary is resolved through
+        # platform_compat.trusted_system_bin (a vetted absolute path), not PATH.
+        "acp/runtime.py::_ps_process_table",
         # Console-entry self-heal for stale editable installs: ONE fixed
         # `python -m pip install -e <repo>` argv, no shell. The repo path is
         # derived from the module's own __file__ (never user/agent input) and
@@ -604,6 +614,12 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "dashboard/handlers/updates.py::_venv_pip_install",
         "dashboard/handlers/updates.py::api_update_apply",
         "dashboard/handlers_system.py::_collect_system_metrics",
+        # Split out of _collect_system_metrics above so the whole-machine process
+        # walk can be cached on its own (much longer) TTL instead of the live
+        # graph's. Identical trust profile to its former enclosing function,
+        # which is still listed: one fixed argv (`ps -eo pid,command`) with a 5s
+        # timeout, no shell, no cwd, no agent-influenced arguments.
+        "dashboard/handlers_system.py::_scan_mcp_processes",
         "dashboard/handlers_system.py::_get_static_system_info",
         "dashboard/port_reclaim.py::_listeners_on_port",
         "env.py::_run",

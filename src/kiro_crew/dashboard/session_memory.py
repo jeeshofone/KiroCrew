@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 from kiro_crew.acp.runtime import _get_rss_tree_mb, _iter_descendant_pids
 from kiro_crew.dashboard.handlers_system import _get_static_system_info
 from kiro_crew.dashboard.state import NEW_SESSION_TITLE
+from kiro_crew.executors import subprocess_executor
 from kiro_crew.messaging.link import telemetry_channel_of
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.session import BACKGROUND_KEY
@@ -348,8 +349,14 @@ class SessionMemorySampler:
     ) -> dict[str, object]:
         """Build the full payload: session rows, task rows, totals, history.
 
-        Session sampling is offloaded with ``asyncio.to_thread``; task rows are
-        read from samples the reaper already took, so they need no offload.
+        Session sampling runs on the dedicated ``subprocess_executor`` (``mc-subproc``)
+        rather than ``asyncio.to_thread``, which would use the DEFAULT executor —
+        the pool the event loop also hands ``getaddrinfo`` and every other
+        ``run_in_executor(None, ...)`` call. This sampling is browser-triggered on
+        a 5s poll and spawns ``ps`` on platforms without ``/proc``, so parking it
+        in the shared pool is what let a slow sample stall unrelated requests;
+        task rows are read from samples the reaper already took, so they need no
+        offload.
         ``get_slot`` resolves display titles (see :func:`session_title`); without
         it rows fall back to their raw keys.
 
@@ -361,7 +368,9 @@ class SessionMemorySampler:
         though the spend exists. Omitting it degrades to the direct join.
         """
         rows = sessions.runtime_pids()
-        samples = await asyncio.to_thread(self._blocking_sample, rows)
+        samples = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), self._blocking_sample, rows
+        )
         per_pid = samples["per_pid"]
         assert isinstance(per_pid, dict)
         spend = samples["spend"]
