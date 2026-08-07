@@ -45,7 +45,7 @@ files / uploads / artifacts / URLs
 | `FETCH_TIMEOUT` | `120.0` | `llm_pool.py`, `agent_fetch.py` | URL-fetch worker timeout |
 | `AGENT_NAME` | `"kirocrew-knowledge"` | `llm_pool.py` | kiro-cli agent the ACP worker drives |
 | `_VALID_SANDBOX_MODES` | `{auto, standard, strict, cc, off}` | `llm_pool.py` | Accepted `agent.sandbox` values |
-| `HARD_SKIP_DIRS` | `{.git, node_modules, __pycache__, .venv, venv}` | `folder_watcher.py` | Directories never walked |
+| `HARD_SKIP_DIRS` | `{.git, node_modules, __pycache__, .venv, venv, dist, build, out, target, cdk.out}` | `folder_watcher.py` | Directories never walked |
 | `_LARGE_REBUILD_WARN_THRESHOLD` | `1000` | `watcher.py` | Stale-item count at which the self-heal rebuild logs a prominent WARNING (usually an embedder-sig change invalidating the whole corpus) |
 | `DEFAULT_MAX_FILES` | `5000` | `folder_watcher.py` | Per-source file cap (newest-first) |
 | `CHUNK_TOKEN_SIZE` | `800` | `chunker.py` | Target chunk size (words) |
@@ -86,8 +86,10 @@ Base metadata always carries `format`, `title` (file stem), `file_size`, `extens
 `FolderWatcher.scan_source(source)` scans a folder-type source under a per-`source_id` `asyncio.Lock` (one scan per source at a time) and returns `{new, changed, deleted, skipped, capped, failed}`.
 
 **`_walk(root, ignore_patterns, extra_skip_dirs)`** (run via `asyncio.to_thread`) is the discovery step:
-- Prunes `HARD_SKIP_DIRS`, any per-source-type extra skip dirs (`SOURCE_TYPE_SKIP_DIRS["obsidian_vault"] = {.obsidian, .trash}`), and **all** dotfiles/dot-dirs in place during `os.walk`.
-- Skips OS junk/lock files by case-insensitive basename match against `DEFAULT_IGNORE_GLOBS` (macOS AppleDouble `._*`, `.ds_store`, Office `~$*`, LibreOffice `.~lock.*`, `thumbs.db`, `desktop.ini`, `*.tmp`, editor swap/backup, partial downloads). This exists because a discovered-but-unreadable file that carries a supported extension fails ingestion, is never auto-retried, and would otherwise leave a source permanently stalled below 100%.
+- Prunes `HARD_SKIP_DIRS`, any per-source-type extra skip dirs (`SOURCE_TYPE_SKIP_DIRS["obsidian_vault"] = {.obsidian, .trash}`), and **all** dotfiles/dot-dirs in place during `os.walk`. Build-output trees are in `HARD_SKIP_DIRS` because a rebuild presents hundreds of regenerated files as changed content; `cdk.out` (AWS CDK synth output) needs its own entry because its name only *contains* a dot, so the dot-prefix rule never prunes it.
+- Skips files that are never documents by case-insensitive basename match against `DEFAULT_IGNORE_GLOBS`. Two classes:
+  - OS junk / editor and Office lock files (macOS AppleDouble `._*`, `.ds_store`, Office `~$*`, LibreOffice `.~lock.*`, `thumbs.db`, `desktop.ini`, `*.tmp`, editor swap/backup, partial downloads). A discovered-but-unreadable file carrying a supported extension fails ingestion, is never auto-retried, and would leave a source permanently stalled below 100%.
+  - Dependency lock files (`package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lockb`, `bun.lock`, `poetry.lock`, `uv.lock`, `pipfile.lock`, `cargo.lock`, `gemfile.lock`, `composer.lock`, `packages.lock.json`, `gradle.lockfile`, `flake.lock`). These ingest successfully, which is the problem: they are large machine-generated resolution output, each chunk costs one extraction call, and regenerating one bills it again on the next sweep.
 - Applies the source's `ignore_patterns` (fnmatch against the relative path).
 - **Extension filter**: keeps a file only if its lower-cased suffix is in `FileReader.SUPPORTED` **or** equals `.canvas` (Obsidian canvas files).
 - **Sensitive-path guard**: resolves each candidate (`Path.resolve()`) and skips it if `is_sensitive_path()` matches.

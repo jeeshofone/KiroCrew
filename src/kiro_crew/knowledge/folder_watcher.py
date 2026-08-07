@@ -28,8 +28,13 @@ logger = logging.getLogger(__name__)
 # per-file graph reload runs on the event loop and can stall it past the loop
 # watchdog (dist/assets/*.js was the motivating case). Dot-dirs (.cache, .next,
 # .venv) are already pruned separately by the startswith(".") rule in _walk.
+# ``cdk.out`` is the same churn with a cost attached rather than a stall: AWS CDK
+# rewrites hashed asset bundles and template JSON on every synth, so each build
+# presents megabytes of generated JSON as changed content and the scan pays a
+# fresh extraction call per chunk. Its name only CONTAINS a dot, so the
+# dot-prefix rule never prunes it, and the bare ``out`` entry does not match it.
 HARD_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
-                  "dist", "build", "out", "target"}
+                  "dist", "build", "out", "target", "cdk.out"}
 DEFAULT_MAX_FILES = 5000
 
 # How many times a file left in 'scanning' is retried before its row is retired to
@@ -55,12 +60,23 @@ SOURCE_TYPE_SKIP_DIRS: dict[str, set[str]] = {
     "obsidian_vault": {".obsidian", ".trash"},
 }
 
-# OS-generated temp / lock / junk files that are never real documents. Matched
-# case-insensitively against the file basename for every folder source type, in
-# addition to any per-source ignore_patterns. Without this, files that carry an
-# otherwise-supported extension are discovered, fail ingestion, and (since failed
-# files are never auto-retried) leave a source permanently stalled below 100%.
-# The motivating case: macOS AppleDouble sidecars (``._<name>.docx``).
+# Files that are never real documents, matched case-insensitively against the
+# file basename for every folder source type in addition to any per-source
+# ignore_patterns. Entries must therefore be lowercase.
+#
+# Two classes, for two different reasons:
+#
+# OS-generated temp / lock / junk files carry an otherwise-supported extension,
+# so they are discovered, fail ingestion, and -- since failed files are never
+# auto-retried -- leave a source permanently stalled below 100%. macOS
+# AppleDouble sidecars (``._<name>.docx``) are the common case.
+#
+# Dependency lock files ingest successfully, which is worse: they are large,
+# fully machine-generated, and answer no question a human would ask, yet every
+# chunk costs one extraction call and a regenerated lock file is billed again on
+# the next sweep. Several of them carry an extension no reader supports today,
+# so the glob is what keeps them out regardless of what ``FileReader.SUPPORTED``
+# accepts.
 DEFAULT_IGNORE_GLOBS: tuple[str, ...] = (
     "._*",            # macOS AppleDouble resource forks
     ".ds_store",      # macOS Finder metadata
@@ -77,6 +93,22 @@ DEFAULT_IGNORE_GLOBS: tuple[str, ...] = (
     "*.crdownload",   # incomplete browser downloads
     "*.part",
     "*.partial",
+    # Dependency lock files: generated resolution output, not documentation.
+    "package-lock.json",     # npm
+    "npm-shrinkwrap.json",
+    "yarn.lock",             # Yarn
+    "pnpm-lock.yaml",        # pnpm
+    "bun.lockb",             # Bun (binary and text forms)
+    "bun.lock",
+    "poetry.lock",           # Python
+    "uv.lock",
+    "pipfile.lock",
+    "cargo.lock",            # Rust
+    "gemfile.lock",          # Ruby
+    "composer.lock",         # PHP
+    "packages.lock.json",    # NuGet
+    "gradle.lockfile",       # Gradle
+    "flake.lock",            # Nix
 )
 
 

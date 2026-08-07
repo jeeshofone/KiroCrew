@@ -11,8 +11,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from kiro_crew.knowledge import folder_watcher
 from kiro_crew.knowledge.connectors.local_folder import LocalFolderConnector
 from kiro_crew.knowledge.folder_watcher import MAX_SCAN_ATTEMPTS, FolderWatcher
+from kiro_crew.knowledge.readers import FileReader
 from kiro_crew.knowledge.store import KnowledgeStore
 
 
@@ -161,6 +163,92 @@ class TestFolderWatcherWalk:
         text, meta = reader.read(str(org_file))
         assert "Body text" in text
         assert meta["extension"] == ".org"
+
+
+#: Real-world capitalisation, so the case-insensitive basename match is exercised.
+LOCK_FILES = (
+    "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
+    "bun.lockb", "bun.lock", "poetry.lock", "uv.lock", "Pipfile.lock",
+    "Cargo.lock", "Gemfile.lock", "composer.lock", "packages.lock.json",
+    "gradle.lockfile", "flake.lock",
+)
+
+
+class TestGeneratedArtifactDefaults:
+    """Generated build output and dependency locks must not reach the embedder.
+
+    They ingest fine, which is what makes them expensive: each is regenerated on
+    every build, so a sweep re-chunks them and pays an extraction call per chunk
+    for content that answers no question.
+    """
+
+    def _names(self, store, pipeline, root):
+        fw = FolderWatcher(store, pipeline)
+        return {Path(p).name for p, _ in fw._walk(str(root), [], set())}
+
+    def _cdk_tree(self, tmp_path):
+        root = tmp_path / "repo"
+        (root / "cdk.out" / "asset.9f3c").mkdir(parents=True)
+        (root / "cdk.out" / "tree.json").write_text('{"tree": {}}')
+        (root / "cdk.out" / "asset.9f3c" / "manifest.json").write_text("{}")
+        (root / "notes.md").write_text("# real doc")
+        return root
+
+    def _lock_tree(self, tmp_path):
+        root = tmp_path / "repo"
+        root.mkdir()
+        (root / "notes.md").write_text("# real doc")
+        for name in LOCK_FILES:
+            (root / name).write_text("generated resolution output")
+        return root
+
+    def test_cdk_out_is_pruned(self, store, pipeline, tmp_path):
+        root = self._cdk_tree(tmp_path)
+        names = self._names(store, pipeline, root)
+        assert "notes.md" in names
+        assert "tree.json" not in names
+        assert "manifest.json" not in names
+
+    def test_cdk_out_entry_is_load_bearing(self, store, pipeline, tmp_path, monkeypatch):
+        # Nothing else keeps synth output out: the name only CONTAINS a dot so the
+        # dot-prefix rule skips it, the bare "out" entry does not match it, and
+        # .json is reader-supported.
+        monkeypatch.setattr(folder_watcher, "HARD_SKIP_DIRS",
+                            folder_watcher.HARD_SKIP_DIRS - {"cdk.out"})
+        names = self._names(store, pipeline, self._cdk_tree(tmp_path))
+        assert "tree.json" in names
+        assert "manifest.json" in names
+
+    def test_dependency_lock_files_are_never_discovered(self, store, pipeline, tmp_path):
+        names = self._names(store, pipeline, self._lock_tree(tmp_path))
+        assert "notes.md" in names
+        assert names.isdisjoint(LOCK_FILES)
+
+    def test_lock_files_stay_out_when_their_extension_is_readable(
+            self, store, pipeline, tmp_path, monkeypatch):
+        # ``.lock``/``.lockb``/``.lockfile`` are not reader-supported today, so the
+        # extension filter would mask a missing glob. Widening SUPPORTED isolates
+        # the globs as the thing under test.
+        monkeypatch.setattr(FileReader, "SUPPORTED",
+                            FileReader.SUPPORTED | {".lock", ".lockb", ".lockfile"})
+        names = self._names(store, pipeline, self._lock_tree(tmp_path))
+        assert "notes.md" in names
+        assert names.isdisjoint(LOCK_FILES)
+
+    def test_lock_globs_are_load_bearing(self, store, pipeline, tmp_path, monkeypatch):
+        lock_globs = {n.lower() for n in LOCK_FILES}
+        monkeypatch.setattr(FileReader, "SUPPORTED",
+                            FileReader.SUPPORTED | {".lock", ".lockb", ".lockfile"})
+        monkeypatch.setattr(folder_watcher, "DEFAULT_IGNORE_GLOBS", tuple(
+            g for g in folder_watcher.DEFAULT_IGNORE_GLOBS if g not in lock_globs))
+        names = self._names(store, pipeline, self._lock_tree(tmp_path))
+        assert set(LOCK_FILES) <= names
+
+    def test_every_lock_glob_is_registered_lowercase(self):
+        # The match runs against a lowercased basename, so an entry carrying any
+        # uppercase character can never fire.
+        for name in LOCK_FILES:
+            assert name.lower() in folder_watcher.DEFAULT_IGNORE_GLOBS, name
 
 
 class TestFolderWatcherScan:
