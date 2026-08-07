@@ -541,6 +541,62 @@ def _resolve_ssh_auth_sock(env: dict[str, str]) -> None:
 
 # Subprocess stdout buffer — kiro-cli can send large JSON-RPC lines (tool outputs)
 _STDOUT_BUFFER_LIMIT = 10 * 1024 * 1024  # 10MB
+# Ceiling on the bytes discarded while draining ONE oversize line. Per drain call
+# and expressed in BYTES: each call provably ends ON a frame boundary, so a replay
+# of many legitimately-oversize-but-terminated frames each gets its own budget and
+# stays survivable. A count of oversize FRAMES would kill the runtime on exactly
+# that replay. Only a single blob that never terminates can exhaust this.
+_OVERSIZE_DRAIN_MAX_BYTES = 16 * _STDOUT_BUFFER_LIMIT  # 160MB
+
+
+class OversizeLineUnrecoverable(Exception):
+    """An oversize stdout line exceeded the drain budget without terminating."""
+
+
+async def _drain_oversize_line(
+    reader: asyncio.StreamReader, exc: asyncio.LimitOverrunError
+) -> int:
+    """Discard one oversize line ENTIRELY, leaving the stream on a frame boundary.
+
+    Called after ``readuntil(b"\\n")`` raised ``LimitOverrunError``, which consumes
+    nothing. ``exc.consumed`` is the already-buffered prefix that provably holds no
+    separator, so consuming it cannot cross into the next frame; retrying
+    ``readuntil`` then either returns the remainder of the line or raises for
+    another step. Same consume-prefix-and-retry drain as
+    ``mcp_gateway/backend.py::run_stdout_pump``; a plain ``read(n)`` would instead
+    eat into the NEXT frame.
+
+    The recovered remainder is **discarded, never parsed**. It is a byte-slice of
+    the line cut at an arbitrary offset, so it can split a multibyte UTF-8
+    character — and ``json.loads`` on that raises ``UnicodeDecodeError``, which is
+    NOT a ``json.JSONDecodeError`` and would escape the caller's non-JSON guard
+    into its crash handler, killing every multiplexed session over one oversize
+    frame.
+
+    Returns the bytes discarded. Raises ``OversizeLineUnrecoverable`` past
+    ``_OVERSIZE_DRAIN_MAX_BYTES`` (the stream is garbage, not merely verbose) and
+    propagates ``IncompleteReadError`` on EOF mid-drain so the caller can use its
+    normal end-of-stream path.
+    """
+    discarded = 0
+    while True:
+        if exc.consumed <= 0:
+            # Unreachable via CPython, whose consumed always exceeds the reader's
+            # limit; guarded because a zero would make this loop spin without
+            # awaiting and starve the event loop.
+            raise OversizeLineUnrecoverable(
+                f"stream reported a {exc.consumed}-byte oversize prefix"
+            )
+        discarded += len(await reader.readexactly(exc.consumed))
+        if discarded > _OVERSIZE_DRAIN_MAX_BYTES:
+            raise OversizeLineUnrecoverable(
+                f"discarded {discarded} bytes with no frame boundary "
+                f"(limit {_OVERSIZE_DRAIN_MAX_BYTES})"
+            )
+        try:
+            return discarded + len(await reader.readuntil(b"\n"))
+        except asyncio.LimitOverrunError as again:
+            exc = again
 
 # Max consecutive empty reads before checking if process is alive
 _MAX_CONSECUTIVE_EMPTY = 5
@@ -2968,14 +3024,29 @@ class AcpClient:
             return None
         except (ValueError, asyncio.LimitOverrunError) as exc:
             # A single JSON-RPC line exceeded the stdout StreamReader buffer
-            # (_STDOUT_BUFFER_LIMIT). asyncio leaves the stream in a corrupted
-            # state after an overrun — every subsequent read also fails — so
-            # treat the process as dead and let session recovery respawn it
-            # instead of freezing the session on an unhandled exception.
-            raise AcpProcessDied(
-                f"ACP stdout line exceeded {_STDOUT_BUFFER_LIMIT}-byte buffer: {exc}"
-            ) from exc
-
+            # (_STDOUT_BUFFER_LIMIT). This does NOT corrupt the stream, contrary
+            # to what this call site used to assume: before raising ValueError,
+            # readline() deletes the oversize line through its terminating
+            # newline when one is already buffered, else clears the buffer, then
+            # resumes the transport (CPython asyncio.streams.StreamReader
+            # .readline — its docstring states this). So drop the frame and let
+            # the caller read the next one, exactly like the blank-line and
+            # non-JSON paths below; raising AcpProcessDied here ended a healthy
+            # live turn over one unreadably large frame.
+            #
+            # NOTE the deliberate asymmetry with AcpRuntime._reader_loop, which
+            # additionally enforces a drain budget: that reader is a standalone
+            # task with no deadline, so an endlessly unterminated stream needs an
+            # explicit terminal state there. HERE every call is bounded by the
+            # caller's `timeout` and the callers run their own deadlines, so the
+            # worst case is one turn ending on its deadline instead of a frame —
+            # no unbounded state, and still strictly better than killing the turn
+            # on the first oversize frame. Computing a byte budget would require
+            # readuntil (readline reports neither the branch taken nor the bytes
+            # dropped), i.e. hand-rolling readline's buffer repair on the path
+            # that is NOT the reported failure.
+            logger.warning("Dropped an oversize ACP stdout frame: %s", exc)
+            return None
         if not line:
             # EOF — process likely died or closing. Check and avoid busy-loop.
             if self._process and self._process.returncode is not None:

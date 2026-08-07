@@ -467,15 +467,60 @@ Three properties make the counter safe on the demux hot path: it never awaits
 (`_DROP_SUMMARY_MAX_KEYS` = 64 distinct keys forces an early flush instead of
 growth, and both backend-controlled key halves are truncated to
 `_DROP_SUMMARY_KEY_MAX_CHARS` = 80), and the residual count is flushed in the
-loop's `finally` on **every** exit (EOF, stdout overrun, cancel, crash) so a
-low-rate trickle is reported late rather than swallowed. No lock is needed:
-`_reader_loop` is the sole writer (`spawn()` creates exactly one reader task).
-The two response-shaped drop branches (non-numeric id, unmatched id) stay
+loop's `finally` on **every** exit (EOF, exhausted oversize-drain budget, cancel,
+crash) so a low-rate trickle is reported late rather than swallowed. No lock is
+needed: `_reader_loop` is the sole writer (`spawn()` creates exactly one reader
+task). The two response-shaped drop branches (non-numeric id, unmatched id) stay
 per-frame on purpose — the id is their whole diagnostic value and is distinct per
 frame, so aggregating by it would give the counter an unbounded key space while
 aggregating without it would discard the only identifying datum; both are also
 bounded by the requests this runtime issued, so neither has the after-teardown
 steady state.
+
+**An oversize stdout line is a dropped frame, not a dead runtime.** A single
+JSON-RPC line over the reader's `_STDOUT_BUFFER_LIMIT` (10 MB) used to
+`_mark_dead` the runtime, which fails every pending future and poisons every
+session queue — so one huge frame ended *every* session multiplexed on that
+process mid-turn, surfacing to users as "process exited / chat failure". Both ACP
+readers did this on the strength of a claim that asyncio leaves the stream
+corrupted after an overrun and every subsequent read also fails. That claim is
+false: `StreamReader.readline` repairs the buffer *before* raising `ValueError`
+(deleting the oversize line through its terminating newline when one is buffered,
+else clearing the buffer) and resumes the transport, as its own docstring states.
+
+So `_reader_loop` reads through `readuntil(b"\n")` and, on `LimitOverrunError`,
+hands the line to `_drain_oversize_line()`, which consumes it **entirely, through
+its terminating newline**, and discards it — the same consume-prefix-and-retry
+drain as `mcp_gateway/backend.py::run_stdout_pump`, where a plain `read(n)` would
+eat into the *next* frame. Draining the whole line rather than one prefix at a
+time is load-bearing, not tidiness: the unterminated branch's discard boundary is
+an arbitrary byte offset (`consumed = len(buffer)`), so surfacing the remainder as
+a line hands the parser a byte-slice that can start mid-character. `json.loads`
+then raises `UnicodeDecodeError`, which is **not** a `json.JSONDecodeError` — it
+escapes the loop's non-JSON guard into its crash handler and kills every
+multiplexed session, the very outcome this replaces. Any oversize frame carrying
+CJK or emoji reaches it whenever the final remainder falls under the reader limit.
+
+Because this reader is a standalone task with no deadline, an endlessly
+unterminated stream still needs a terminal state, so the drain carries a budget of
+`_OVERSIZE_DRAIN_MAX_BYTES` (160 MB) and raises `OversizeLineUnrecoverable` past
+it, which the loop turns into `_mark_dead`. The budget counts **bytes** and is
+scoped to a single drain call — deliberately *not* a count of oversize *frames*,
+and needing no cross-iteration state because every call that returns ends on a
+frame boundary. A replay of properly terminated but oversize frames therefore
+stays survivable frame after frame; a frame counter would reproduce the very
+defect this replaces. The liveness oracle cannot substitute for the budget: it
+judges by CPU/IO movement, and a garbage-spewing stream moves both, so it would
+report `WORKING`.
+
+A pending request whose response was in a dropped frame is not orphaned —
+`_send_and_await` wraps every future in `wait_for(timeout=…)`, so the caller gets
+a timeout; the warning names the request ids in flight at the drop so that timeout
+is attributable. `AcpClient._read_message` takes the same drop-and-continue stance
+by returning `None` (joining its blank-line and non-JSON paths) but keeps
+`readline` and carries **no** budget: every call there is bounded by the caller's
+`timeout` and the callers run their own deadlines, so the worst case is one turn
+ending on its deadline rather than unbounded state.
 
 Every kiro session runs on `AcpRuntime` + `AcpSessionHandle`:
 `AcpProvider.start()` (`providers/acp.py`) unconditionally calls

@@ -33,6 +33,8 @@ from kiro_crew.acp._dispatch import (
 )
 from kiro_crew.acp.client import (
     _NOT_LOGGED_IN_RE,
+    OversizeLineUnrecoverable,
+    _drain_oversize_line,
     _get_start_time,
     _KiroExecutableTrustError,
     _resolve_kiro_bin_for_spawn,
@@ -90,6 +92,11 @@ __all__ = [
 # ── AcpRuntime ──
 
 _STDOUT_BUFFER_LIMIT = 10 * 1024 * 1024  # 10MB
+# How many in-flight request ids to name in the oversize-frame warning. A dropped
+# frame can carry a response, and the caller then fails as an opaque
+# _send_and_await timeout — naming what was in flight at the drop makes that
+# timeout attributable instead of a mystery. Capped so the line stays bounded.
+_DROP_IDS_IN_LOG = 8
 _INIT_TIMEOUT = 30.0
 _REQUEST_TIMEOUT = 30.0
 _INIT_NOTIFICATION_BUFFER_LIMIT = 100
@@ -872,11 +879,50 @@ class AcpRuntime:
         try:
             while True:
                 try:
-                    line = await stdout.readline()
-                except (ValueError, asyncio.LimitOverrunError) as exc:
-                    logger.error("stdout buffer overrun: %s", exc)
-                    self._mark_dead(f"stdout overrun: {exc}")
-                    return
+                    line = await stdout.readuntil(b"\n")
+                except asyncio.IncompleteReadError as exc:
+                    # EOF, possibly holding a trailing unterminated line. Keep
+                    # readline()'s old shape: hand the partial to the parser, and
+                    # an empty partial falls through to the exit branch below.
+                    line = exc.partial
+                except asyncio.LimitOverrunError as exc:
+                    # ONE oversize frame must not kill the demux — same invariant
+                    # as the non-dict and non-numeric-id guards below. Tearing
+                    # the runtime down here ends EVERY multiplexed session
+                    # mid-turn, which is what users see as "process exited /
+                    # chat failure" after a single huge tool result.
+                    #
+                    # _drain_oversize_line consumes the whole line THROUGH its
+                    # terminating newline and discards it, so the stream is back
+                    # on a frame boundary and no byte-slice of the oversize line
+                    # ever reaches json.loads. Its budget is per call and needs no
+                    # cross-iteration state, because every call that returns ends
+                    # on a boundary — so a replay of oversize-but-terminated
+                    # frames is survivable frame after frame.
+                    #
+                    # An awaited request whose response was in a dropped frame is
+                    # not orphaned: _send_and_await wraps every future in
+                    # wait_for(timeout=...), so the caller gets a timeout instead
+                    # of hanging. The ids in flight at the drop are logged so that
+                    # timeout is attributable.
+                    try:
+                        dropped = await _drain_oversize_line(stdout, exc)
+                    except asyncio.IncompleteReadError:
+                        self._mark_dead("stdout closed mid-oversize-line")
+                        return
+                    except OversizeLineUnrecoverable as fatal:
+                        logger.error("stdout unrecoverable: %s", fatal)
+                        self._mark_dead(f"stdout overrun: {fatal}")
+                        return
+                    logger.warning(
+                        "dropped an oversize stdout frame (%d bytes); resynced at "
+                        "next frame (in-flight awaited=%s routed=%s): %s",
+                        dropped,
+                        sorted(self._pending_requests)[:_DROP_IDS_IN_LOG],
+                        sorted(self._routed_requests)[:_DROP_IDS_IN_LOG],
+                        exc,
+                    )
+                    continue
 
                 if not line:
                     rc = self._process.returncode if self._process else "?"
