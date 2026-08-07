@@ -7062,6 +7062,7 @@
       "more_pull_request_in_this_session_other": "{{count}} weitere Pull Requests in dieser Sitzung",
       "more_pull_request_or_issue_in_this_session_one": "{{count}} weiterer Pull Request oder Issue in dieser Sitzung",
       "more_pull_request_or_issue_in_this_session_other": "{{count}} weitere Pull Requests oder Issues in dieser Sitzung",
+      "open_source_link_in_side_panel": "{{url}} im Seitenpanel öffnen ({{modifier}} zum Öffnen im Browser)",
       "filter_unread": "Ungelesen",
       "filter_unread_description": "Nur Sitzungen mit ungelesenen Nachrichten anzeigen",
       "filter_running": "Läuft",

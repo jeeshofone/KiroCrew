@@ -7225,6 +7225,7 @@
       "more_pull_request_or_issue_in_this_session_many": "{{count}} pull requests o incidencias más en esta sesión",
       "more_pull_request_or_issue_in_this_session_one": "{{count}} pull request o incidencia más en esta sesión",
       "more_pull_request_or_issue_in_this_session_other": "{{count}} pull requests o incidencias más en esta sesión",
+      "open_source_link_in_side_panel": "Abrir {{url}} en el panel lateral ({{modifier}} para abrirlo en el navegador)",
       "filter_unread": "Sin leer",
       "filter_unread_description": "Mostrar solo las sesiones con mensajes sin leer",
       "filter_running": "En ejecución",

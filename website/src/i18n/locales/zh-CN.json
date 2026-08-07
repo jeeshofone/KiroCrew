@@ -6980,6 +6980,7 @@
       "expand_group_results": "展开 {{group}} 的结果",
       "more_pull_request_in_this_session_other": "此会话中还有 {{count}} 个拉取请求",
       "more_pull_request_or_issue_in_this_session_other": "此会话中还有 {{count}} 个拉取请求或 issue",
+      "open_source_link_in_side_panel": "在侧边面板中打开 {{url}} ({{modifier}} 在浏览器中打开)",
       "filter_unread": "未读",
       "filter_unread_description": "仅显示有未读消息的会话",
       "filter_running": "运行中",

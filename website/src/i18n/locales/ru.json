@@ -7307,6 +7307,7 @@
       "more_pull_request_or_issue_in_this_session_many": "ещё {{count}} пул-реквестов или задач в этой сессии",
       "more_pull_request_or_issue_in_this_session_one": "ещё {{count}} пул-реквест или задача в этой сессии",
       "more_pull_request_or_issue_in_this_session_other": "ещё {{count}} пул-реквеста или задачи в этой сессии",
+      "open_source_link_in_side_panel": "Открыть {{url}} в боковой панели ({{modifier}} — открыть в браузере)",
       "filter_unread": "Непрочитанные",
       "filter_unread_description": "Показывать только сессии с непрочитанными сообщениями",
       "filter_running": "В работе",

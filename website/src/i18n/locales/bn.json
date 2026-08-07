@@ -7143,6 +7143,7 @@
       "more_pull_request_in_this_session_other": "এই সেশনে আরও {{count}}টি পুল রিকোয়েস্ট",
       "more_pull_request_or_issue_in_this_session_one": "এই সেশনে আরও {{count}}টি পুল রিকোয়েস্ট বা ইস্যু",
       "more_pull_request_or_issue_in_this_session_other": "এই সেশনে আরও {{count}}টি পুল রিকোয়েস্ট বা ইস্যু",
+      "open_source_link_in_side_panel": "সাইড প্যানেলে {{url}} খুলুন (ব্রাউজারে খুলতে {{modifier}})",
       "filter_unread": "অপঠিত",
       "filter_unread_description": "শুধু অপঠিত মেসেজ আছে এমন সেশনগুলো দেখায়",
       "filter_running": "চলমান",

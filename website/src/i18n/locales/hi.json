@@ -7143,6 +7143,7 @@
       "more_pull_request_in_this_session_other": "इस सत्र में {{count}} और पुल रिक्वेस्ट",
       "more_pull_request_or_issue_in_this_session_one": "इस सत्र में {{count}} और पुल रिक्वेस्ट या इश्यू",
       "more_pull_request_or_issue_in_this_session_other": "इस सत्र में {{count}} और पुल रिक्वेस्ट या इश्यू",
+      "open_source_link_in_side_panel": "{{url}} को साइड पैनल में खोलें (इसे ब्राउज़र में खोलने के लिए {{modifier}})",
       "filter_unread": "अपठित",
       "filter_unread_description": "केवल अपठित संदेशों वाले सत्र दिखाता है",
       "filter_running": "चल रहे",
