@@ -16,6 +16,7 @@ agent loads only the one it needs.
 | [providers.md](providers.md) | The `LLMProvider` interface and the KiroACP-only provider surface. |
 | [session.md](session.md) | Sessions, slots, session keys, the warm pool, and PID tracking. |
 | [history.md](history.md) | Conversation persistence, JSONL rotation, and transcript search. |
+| [session-storage.md](session-storage.md) | What sessions cost on disk, and the user-initiated trash that reclaims it. |
 | [config.md](config.md) | The config schema, defaults, loading, and live reload. |
 | [cli.md](cli.md) | Every CLI command, the gateway flags, and the test harness. |
 | [heartbeat.md](heartbeat.md) | The liveness heartbeat and its restricted tool allowlist. |

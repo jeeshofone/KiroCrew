@@ -59,6 +59,11 @@ logger = logging.getLogger(__name__)
 SESSIONS_DIR_NAME = "sessions"
 ARCHIVE_DIR_NAME = "archive"
 ARCHIVE_RETENTION_DAYS = 7
+
+# Separates a transcript's stem from an archive segment's timestamp. NOT a dot,
+# because session keys legitimately contain dots (a Slack thread_ts), which would
+# make a right-most-dot parse attribute a segment to the wrong session.
+ARCHIVE_SEGMENT_DELIMITER = "__"
 _CONSOLIDATION_THRESHOLD = 30  # preferences/projects update threshold (messages)
 # Skill detection judges a wider window than the incremental history tail: a
 # reusable procedure usually spans the whole session, not just the slice since
@@ -537,11 +542,11 @@ def _archive_lines(
     )
     payload = header + "".join(lines)
     # Atomic exclusive-create to avoid TOCTOU clobber when two archives land in the same second.
-    # Use '__' delimiter so keys containing dots (e.g. Slack thread_ts) don't confuse rfind('.') parsing.
     for n in itertools.count():
         if n > 1000:
             raise RuntimeError(f"Failed to create archive file after {n} attempts")
-        candidate = adir / f"{safekey}__{stamp}{f'-{n}' if n else ''}.jsonl"
+        suffix = f"-{n}" if n else ""
+        candidate = adir / f"{safekey}{ARCHIVE_SEGMENT_DELIMITER}{stamp}{suffix}.jsonl"
         try:
             with candidate.open("x", encoding="utf-8") as f:
                 f.write(payload)
@@ -731,6 +736,43 @@ def monotonic_transcript_ts(previous: str | None, now: datetime) -> str:
 def _safe_key(key: str) -> str:
     """Convert a session key (e.g. Slack thread_ts) to a safe filename."""
     return re.sub(r"[^\w\-.]", "_", key)
+
+
+def transcript_stem(key: str) -> str:
+    """The canonical filename stem *key*'s transcript and archive segments share.
+
+    Exported so callers that account for or reclaim a session's disk usage can
+    pair a session key with its files without re-deriving the sanitization. A
+    second copy of that rule would drift the moment this one changed, and the
+    failure is silent and destructive: the pairing misses, and a caller deleting
+    "the session" removes one half and leaves the other behind.
+
+    Prefer :func:`transcript_stems` when the answer feeds a decision about which
+    files belong to a session — a Slack thread predating the canonical
+    ``slack:<ts>`` key still logs under its bare thread_ts stem, and this function
+    alone would not find it.
+    """
+    return _safe_key(key)
+
+
+def transcript_stems(key: str) -> tuple[str, ...]:
+    """Every filename stem *key*'s transcript could occupy, canonical first.
+
+    :meth:`ConversationLog._path` falls back to the pre-migration bare
+    ``thread_ts`` filename for Slack threads that predate the canonical session
+    key, so one session key can legitimately resolve to either name. A caller that
+    only knew the canonical stem would treat the legacy transcript as belonging to
+    no session — and therefore as reclaimable while the session is still
+    resumable. Returning both keeps that decision correct without duplicating the
+    fallback rule.
+    """
+    stems = [_safe_key(key)]
+    bare = legacy_key(key)
+    if bare is not None:
+        legacy = _safe_key(bare)
+        if legacy not in stems:
+            stems.append(legacy)
+    return tuple(stems)
 
 
 def _redact_at_write_boundary(role: str, content: str) -> str:
@@ -1468,9 +1510,7 @@ class ConversationLog:
         any real append advances the mtime and invalidates it.
         """
         try:
-            data = json.loads(
-                self._summary_cache_path(key).read_text(encoding="utf-8")
-            )
+            data = json.loads(self._summary_cache_path(key).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
         summary = data.get("summary")
@@ -3725,11 +3765,7 @@ class HistoryConsolidator:
             # window (see _run_skill_detection), not the incremental tail. Runs
             # only on history consolidation, guarded by flag + loader; failures
             # are logged, never fatal.
-            if (
-                include_history
-                and self._auto_skills_enabled
-                and self._skills_loader is not None
-            ):
+            if include_history and self._auto_skills_enabled and self._skills_loader is not None:
                 try:
                     await self._run_skill_detection(key)
                 except Exception:
@@ -3740,10 +3776,7 @@ class HistoryConsolidator:
             # their own (create/approve were the only triggers). Consolidation is
             # the existing idle/periodic path; throttle to at most once/hour
             # across all sessions so frequent consolidations don't rescan the set.
-            if (
-                self._skills_loader is not None
-                and (_time.time() - self._last_lifecycle) > 3600
-            ):
+            if self._skills_loader is not None and (_time.time() - self._last_lifecycle) > 3600:
                 self._last_lifecycle = _time.time()
                 try:
                     await asyncio.to_thread(
@@ -3850,7 +3883,7 @@ class HistoryConsolidator:
             '"procedure_md": "<concise markdown body with '
             "## When to use / ## Steps / ## Gotchas sections, "
             '<=8000 chars>"' + scripts_field + "}. "
-            'Return null if the session was trivial, a single-shot answer, '
+            "Return null if the session was trivial, a single-shot answer, "
             "a one-off failure with no reusable takeaway, or involved "
             "sensitive paths. When a session plausibly contains a procedure "
             "a future session could reuse, lean toward returning it — every "
@@ -3874,8 +3907,10 @@ class HistoryConsolidator:
         conversation = "\n".join(_fmt_message(m) for m in window)
         prompt = (
             "You are a skill-extraction agent. Review this session excerpt and "
-            "return a JSON object with these keys:\n\n" + numbered
-            + "\n\n## Session excerpt\n" + conversation
+            "return a JSON object with these keys:\n\n"
+            + numbered
+            + "\n\n## Session excerpt\n"
+            + conversation
             + "\n\nRespond with ONLY valid JSON, no markdown fences."
         )
         result = await self._call_llm(prompt)
@@ -4023,27 +4058,26 @@ class HistoryConsolidator:
         # only enumerates LIVE skills — .pending is pruned from discovery).
         try:
             for p in loader.list_pending_skills():
-                existing.append({
-                    "key": f"auto/{p.get('slug', '')}",
-                    "description": p.get("description", ""),
-                    "triggers": p.get("triggers", ""),
-                })
+                existing.append(
+                    {
+                        "key": f"auto/{p.get('slug', '')}",
+                        "description": p.get("description", ""),
+                        "triggers": p.get("triggers", ""),
+                    }
+                )
         except Exception:
             pass
         loop = self._event_loop
 
         def _lexical() -> "tuple[str, str | None]":
-            hit = loader.find_similar(
-                description, threshold=self._auto_similarity_threshold
-            )
+            hit = loader.find_similar(description, threshold=self._auto_similarity_threshold)
             return (VERDICT_DUP, hit) if hit else (VERDICT_NEW, None)
 
         if self._judge_model and existing and loop is not None:
+
             def _judge_fn(prompt: str) -> str:
                 try:
-                    fut = asyncio.run_coroutine_threadsafe(
-                        self._dedupe_judge(prompt), loop
-                    )
+                    fut = asyncio.run_coroutine_threadsafe(self._dedupe_judge(prompt), loop)
                     return fut.result(timeout=60) or ""
                 except Exception:
                     return ""
@@ -4190,9 +4224,7 @@ class HistoryConsolidator:
             # ``approve_pending_update`` requires a live target, so staging that
             # would queue a candidate the user can never approve. Drop it
             # instead, audited so the loss is visible.
-            logger.info(
-                "Skill update skipped: target '%s' is not a live auto skill", target_key
-            )
+            logger.info("Skill update skipped: target '%s' is not a live auto skill", target_key)
             sel().log_tool_invocation(
                 session_key=key,
                 tool_name="auto_skill_create",
@@ -4219,9 +4251,7 @@ class HistoryConsolidator:
         if live_prose and self._event_loop is not None:
             try:
                 fut = asyncio.run_coroutine_threadsafe(
-                    self._merge_skill_update(
-                        live_prose, description, triggers, procedure_md
-                    ),
+                    self._merge_skill_update(live_prose, description, triggers, procedure_md),
                     self._event_loop,
                 )
                 merged = fut.result(timeout=90)
@@ -4239,9 +4269,7 @@ class HistoryConsolidator:
                 body = red
                 used_merge = True
 
-        provenance = AutoSkillProvenance(
-            session_key=key, created_at=AutoSkillProvenance.now_iso()
-        )
+        provenance = AutoSkillProvenance(session_key=key, created_at=AutoSkillProvenance.now_iso())
         # The slug pattern caps at 64 chars, and our own generation prompt permits
         # up to 60, so `<target>-update` can overflow and be REJECTED by staging —
         # silently dropping the learning, because consolidation advances its
@@ -4271,8 +4299,7 @@ class HistoryConsolidator:
             base_version=base_version,
         )
         if name:
-            logger.info("Staged skill update %s (target %s) from session %s",
-                        name, target_key, key)
+            logger.info("Staged skill update %s (target %s) from session %s", name, target_key, key)
             sel().log_tool_invocation(
                 session_key=key,
                 tool_name="auto_skill_create",
@@ -4377,7 +4404,9 @@ class HistoryConsolidator:
                 # another *proposal*, which the human reviews side by side anyway.
                 if verdict == VERDICT_UPDATE and target:
                     try:
-                        _target_is_live = self._skills_loader.read_auto_skill_body(target) is not None
+                        _target_is_live = (
+                            self._skills_loader.read_auto_skill_body(target) is not None
+                        )
                     except Exception:
                         _target_is_live = False
                     if not _target_is_live:

@@ -1241,9 +1241,7 @@ def _claimed_dashboard_slots(state: DashboardState) -> frozenset[str]:
         data = getattr(smap, "_data", None)
         if not isinstance(data, dict):
             return frozenset()
-        return frozenset(
-            k[len("dashboard:"):] for k in data if k.startswith("dashboard:")
-        )
+        return frozenset(k[len("dashboard:") :] for k in data if k.startswith("dashboard:"))
     except Exception:
         logger.debug("could not read claimed dashboard slots", exc_info=True)
         return frozenset()
@@ -1767,11 +1765,7 @@ async def start_dashboard(
                 description = str(info.get("description") or "").strip()
                 triggers = str(info.get("triggers") or "").strip()
                 subject = target or name if is_update else name
-                title = (
-                    "Skill update awaiting review"
-                    if is_update
-                    else "New skill awaiting review"
-                )
+                title = "Skill update awaiting review" if is_update else "New skill awaiting review"
                 # The body LEADS with name + description because the feed row
                 # renders only its first ~80 characters, stripped to one line.
                 # The title already says a skill is awaiting review, so opening
@@ -1791,9 +1785,7 @@ async def start_dashboard(
                 if triggers:
                     lines.append(f"\n**Triggers:** {triggers}")
                 if info.get("has_scripts"):
-                    lines.append(
-                        "\n_Bundles executable scripts — review them before approving._"
-                    )
+                    lines.append("\n_Bundles executable scripts — review them before approving._")
                 body = "\n".join(lines)
                 payload = {
                     "slug": slug,
@@ -2041,6 +2033,10 @@ async def start_dashboard(
     # Status / system
     app.router.add_get("/api/status", handlers.api_status)
     app.router.add_get("/api/system", handlers.api_system)
+    app.router.add_get("/api/system/session-storage", handlers.api_session_storage)
+    app.router.add_post("/api/system/session-storage/cleanup", handlers.api_session_storage_cleanup)
+    app.router.add_post("/api/system/session-storage/restore", handlers.api_session_storage_restore)
+    app.router.add_post("/api/system/session-storage/empty", handlers.api_session_storage_empty)
     app.router.add_get("/api/stream", handlers.api_stream)
     app.router.add_get("/api/sso-ttl", handlers.api_sso_ttl)
     app.router.add_get("/api/dashboard/branding", handlers.api_branding)
@@ -2175,9 +2171,7 @@ async def start_dashboard(
     app.router.add_post("/api/skills/-/pending/{slug}/approve", handlers.api_skill_pending_approve)
     app.router.add_post("/api/skills/-/pending/{slug}/dismiss", handlers.api_skill_pending_dismiss)
     app.router.add_post("/api/skills/-/pin", handlers.api_skill_pin)
-    app.router.add_post(
-        "/api/skills/-/inject-on-trigger", handlers.api_skill_inject_on_trigger
-    )
+    app.router.add_post("/api/skills/-/inject-on-trigger", handlers.api_skill_inject_on_trigger)
     # Skill context budget (read-only cost analysis with alias folding).
     app.router.add_get("/api/skills/-/budget", handlers.api_skills_budget)
     app.router.add_get("/api/skills/{name:.+}/-/tree", handlers.api_skill_tree)
@@ -2335,9 +2329,7 @@ async def start_dashboard(
     app.router.add_delete("/api/agents/detail/{name}", handlers.api_agent_detail)
     # KiroCrew Agent CRUD
     app.router.add_get("/api/agents", handlers.api_kirocrew_agents)
-    app.router.add_get(
-        "/api/agents/resolved-model", handlers.api_kirocrew_agent_resolved_model
-    )
+    app.router.add_get("/api/agents/resolved-model", handlers.api_kirocrew_agent_resolved_model)
     app.router.add_post("/api/agents", handlers.api_kirocrew_agents_create)
     app.router.add_post("/api/agents/sync", handlers.api_kirocrew_agents_sync)
     app.router.add_put("/api/agents/{name}", handlers.api_kirocrew_agent_update)
@@ -2451,9 +2443,7 @@ async def start_dashboard(
 
     # Diagnostics / "Report a Problem" (redacted support bundle)
     app.router.add_post("/api/diagnostics/collect", handlers.api_diagnostics_collect)
-    app.router.add_get(
-        "/api/diagnostics/download/{filename}", handlers.api_diagnostics_download
-    )
+    app.router.add_get("/api/diagnostics/download/{filename}", handlers.api_diagnostics_download)
 
     # Portability (export/import config+memory as zip)
     app.router.add_get("/api/portability/export", handlers.api_portability_export)
@@ -3307,9 +3297,7 @@ async def start_dashboard(
         # dashboard session that merely happens to be named like a channel
         # stem is never mistaken for an orphan of it.
         _claimed = await asyncio.to_thread(_claimed_dashboard_slots, state)
-        merged = await asyncio.to_thread(
-            migrate_channel_transcripts, dashboard_slots=_claimed
-        )
+        merged = await asyncio.to_thread(migrate_channel_transcripts, dashboard_slots=_claimed)
         if merged:
             logger.info("Merged %d leftover channel transcript copies", merged)
     except Exception:

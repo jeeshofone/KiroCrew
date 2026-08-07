@@ -300,6 +300,12 @@ from kiro_crew.dashboard.handlers.prompts import (  # noqa: E402, F401
 )
 
 # ── Sessions (extracted to handlers/sessions.py) ──
+from kiro_crew.dashboard.handlers.session_storage import (  # noqa: E402, F401
+    api_session_storage,
+    api_session_storage_cleanup,
+    api_session_storage_empty,
+    api_session_storage_restore,
+)
 from kiro_crew.dashboard.handlers.sessions import (  # noqa: E402, F401
     _SHUTDOWN_TIMEOUT_SECS,
     _fetch_usage_bg,
@@ -490,14 +496,16 @@ def _list_aim_prompts() -> list[dict[str, Any]]:
                 logger.debug("Skipping sensitive path: %s", sop_file)
                 continue
             name = sop_file.stem.removesuffix(".sop")
-            result.append({
-                "name": name,
-                "fullName": f"agent-sop:{name}",
-                "description": _extract_sop_description(sop_file),
-                "path": resolved,
-                "package": root.name,
-                "source": "package",
-            })
+            result.append(
+                {
+                    "name": name,
+                    "fullName": f"agent-sop:{name}",
+                    "description": _extract_sop_description(sop_file),
+                    "path": resolved,
+                    "package": root.name,
+                    "source": "package",
+                }
+            )
 
     # Also scan ~/.kiro/prompts/ for user-created prompts
     home = Path.home()
