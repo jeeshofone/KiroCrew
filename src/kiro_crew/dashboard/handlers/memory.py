@@ -1159,14 +1159,59 @@ async def api_memory_consolidate(request: web.Request) -> web.Response:
     if not key:
         return web.json_response({"error": "session key required"}, status=400)
     include_history = body.get("include_history", True)
-    # Fire consolidation in background
+    # Claim the key before the eligibility probe below, which awaits. Testing
+    # membership and adding must happen with no yield between them: the probe
+    # offloads a transcript read, and a check-then-act spanning that await lets
+    # two concurrent POSTs both pass the guard and both dispatch, double-billing
+    # an LLM turn on the same span. The claim is released again on every path
+    # that does not hand the key to _consolidate, which discards it in its own
+    # finally once the task ends.
     if key in state.consolidator._running:
         return web.json_response({"error": "consolidation already running"}, status=409)
     state.consolidator._running.add(key)
-    task = asyncio.create_task(state.consolidator._consolidate(key, include_history))
-    state.consolidator._tasks.add(task)
-    task.add_done_callback(state.consolidator._tasks.discard)
-    return web.json_response({"ok": True, "key": key})
+    dispatched = False
+    try:
+        # The manual trigger honours the same durable retry accounting as the idle
+        # sweep and the expiry sweep. A span whose consolidation keeps failing is in
+        # exponential backoff (or abandoned at the attempt cap), and re-firing it by
+        # hand spends another billed LLM turn on the same failure — so a bypass here
+        # would reopen the unbounded-retry hole from the UI.
+        #
+        # The extent the cap is scoped to needs the transcript's message total, and
+        # reading it is blocking file IO — offload it rather than stalling the loop on
+        # a large transcript.
+        _total = None
+        if include_history:
+            try:
+                _total = (
+                    await asyncio.to_thread(
+                        state.consolidator._log.consolidation_counts, key
+                    )
+                )[0]
+            except Exception:
+                # No count means the extent test is skipped and the cap stands, which
+                # only ever refuses a turn — never spends one on an unverified premise.
+                logger.warning("Could not read message count for %s", key, exc_info=True)
+        if include_history and not state.consolidator.retry_eligible(
+            key, message_count=_total
+        ):
+            return web.json_response(
+                {
+                    "error": "consolidation is in retry backoff for this session",
+                    "code": "consolidation_retry_backoff",
+                },
+                status=429,
+            )
+        task = asyncio.create_task(
+            state.consolidator._consolidate(key, include_history)
+        )
+        dispatched = True
+        state.consolidator._tasks.add(task)
+        task.add_done_callback(state.consolidator._tasks.discard)
+        return web.json_response({"ok": True, "key": key})
+    finally:
+        if not dispatched:
+            state.consolidator._running.discard(key)
 
 
 async def api_memory_observability(request: web.Request) -> web.Response:

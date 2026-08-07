@@ -27,8 +27,10 @@ from kiro_crew.dashboard.chat_utils import (
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot, _normalize_slot_key
 from kiro_crew.effort import EFFORT_LEVELS, EFFORT_VALUES
 from kiro_crew.history import (
+    SLOT_OWNED_META_KEYS,
     _archive_lines,
     carry_provenance,
+    carry_unowned_metadata,
     latest_transcript_ts,
     transcript_sort_key,
     update_metadata_off_loop,
@@ -1447,15 +1449,16 @@ def _save_slot_to_history(
                 "last_consolidated": existing_meta.get("last_consolidated", 0),
             }
             # Preserve history-layer-owned metadata this dashboard save does NOT
-            # manage. ``rotation_generation`` (bumped by ``_maybe_rotate``, with
-            # its ``rotated_at`` stamp) lets a concurrent consolidation detect a
-            # rotation and skip applying a stale offset. Reconstructing the
-            # metadata subset here would drop it, resetting the generation to 0
-            # and re-opening the exact consolidation race the rotation-generation
-            # fix closed. Carry these forward verbatim (absent field == no-op).
-            for _meta_key in ("rotation_generation", "rotated_at", "compacted_at"):
-                if _meta_key in existing_meta:
-                    meta_line[_meta_key] = existing_meta[_meta_key]
+            # manage. The save is authoritative only for the slot fields it writes
+            # (SLOT_OWNED_META_KEYS), where an absent field means "cleared"; every
+            # other key is another layer's durable state, and reconstructing the
+            # subset deletes it. That is not hypothetical: it erased the rotation
+            # generation (re-opening the consolidation race the generation check
+            # closed) and then the consolidation retry accounting (resetting the
+            # backoff so billed retries resumed). Carrying unowned keys through by
+            # default closes the class instead of enumerating one more field to
+            # rescue. Applied after the slot fields below so an inherited value can
+            # never shadow the slot's own state.
             if closed:
                 meta_line["closed"] = True
                 # Epoch stamp of WHEN the tab was closed. The channel-slot
@@ -1523,6 +1526,38 @@ def _save_slot_to_history(
             tab_id = getattr(slot, "_tab_id", None) or existing_meta.get("tab_id")
             if tab_id:
                 meta_line["tab_id"] = tab_id
+            # ``rewrite`` is the structural signal for "this save EDITS the
+            # conversation": the regenerate / rewind / fork paths pass an explicit
+            # window snapshot (or leave ``_pending_rewrite`` set), while a steady
+            # flush re-serializes the same window it already persisted.
+            #
+            # An edit swaps the live window's tail for content no consolidation
+            # turn has read, so it advances the rotation generation — the
+            # session's content-identity counter. That single write covers both
+            # halves of the invariant that a consolidation marker and its retry
+            # budget are bound to the content they measured:
+            #
+            # * An attempt already IN FLIGHT snapshotted the pre-edit generation,
+            #   so its ``mark_consolidated`` write is rejected as stale
+            #   (``ConversationLog.mark_consolidated``) instead of marking the
+            #   REPLACEMENT tail consolidated without ever extracting it. A
+            #   regenerate lands at the same message count, the same generation
+            #   and the same marker, so nothing else about the save distinguishes
+            #   it and the completion write would otherwise apply.
+            # * A charged (or capped) budget stamped against the pre-edit
+            #   generation stops describing the current span, so the replacement
+            #   content earns a fresh budget rather than inheriting an exhausted
+            #   one (``ConversationLog._attempts_describe_current_span``).
+            #
+            # This is the same release a rotation gets, and deliberately the same
+            # in both directions: the armed backoff deadline survives, so a user
+            # repeatedly regenerating a reply cannot re-bill a failing
+            # consolidation turn on each gesture.
+            if rewrite:
+                meta_line["rotation_generation"] = (
+                    int(existing_meta.get("rotation_generation", 0) or 0) + 1
+                )
+            carry_unowned_metadata(meta_line, existing_meta, SLOT_OWNED_META_KEYS)
             meta_str = json.dumps(meta_line) + "\n"
 
             # ── Frozen prefix (never rewritten) + freshly serialized window ──

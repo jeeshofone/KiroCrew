@@ -21,7 +21,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Container, Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Generic, TypeVar
+from typing import TYPE_CHECKING, Generic, NamedTuple, TypeVar
 
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
@@ -60,12 +60,155 @@ SESSIONS_DIR_NAME = "sessions"
 ARCHIVE_DIR_NAME = "archive"
 ARCHIVE_RETENTION_DAYS = 7
 _CONSOLIDATION_THRESHOLD = 30  # preferences/projects update threshold (messages)
+# Persistent retry accounting for history consolidation. A pass spends a billed
+# LLM turn BEFORE it can write the durable "consolidated" marker, so any failure
+# in between leaves the span unconsolidated — and every entry point (the 60s
+# idle sweep, session-expiry sweeps, the dashboard trigger) then re-spends that
+# turn, forever, because the only thing suppressing a repeat is an in-memory
+# throttle that a failure skips and a restart forgets. Attempts are therefore
+# counted in the transcript's metadata line (durable, per span) and gated behind
+# exponential backoff up to a hard cap. At the cap the span is abandoned with
+# the marker written anyway: losing one memory pass costs one summary, while
+# retrying forever costs an LLM turn per heartbeat tick indefinitely.
+_CONSOLIDATION_MAX_ATTEMPTS = 5
+_CONSOLIDATION_BACKOFF_BASE_SECS = 900.0  # 15 min, doubling per failed attempt
+_CONSOLIDATION_BACKOFF_MAX_SECS = 86400.0  # 24 h ceiling on a single wait
+# Every metadata field the accounting owns, so the marker's success path can drop
+# the whole set in one place and a rebuilding writer can name it as foreign.
+_CONSOLIDATION_META_KEYS: frozenset[str] = frozenset(
+    {
+        "consolidation_attempts",
+        "consolidation_retry_at",
+        "consolidation_env_failures",
+        "consolidation_attempts_generation",
+        "consolidation_attempts_offset",
+        "consolidation_attempts_count",
+    }
+)
+
+
+class AttemptedSpan(NamedTuple):
+    """The span identity a consolidation turn actually covered.
+
+    All three fields come from ONE atomic
+    :meth:`ConversationLog.snapshot_for_consolidation` taken BEFORE the turn:
+    where the span starts (*generation*, *offset*) and how far it reaches
+    (*total*). They travel together because the accounting's whole guarantee is
+    that a charged attempt is stamped with the span it measured — mixing a
+    snapshot value with one re-read after the turn stamps content that was never
+    attempted, and the cap then either outlives its span (stranding messages
+    forever) or releases early (re-billing indefinitely).
+
+    Re-reading the metadata line at failure time is the specific mistake this
+    type exists to prevent. A rotation or a marker-resetting rewrite DURING the
+    turn moves all three, so a post-turn read stamps the counter with the NEW
+    span's identity while the count it carries was charged against the old one.
+    At the cap that leaves the post-rotation messages capped without ever having
+    been attempted, and because their generation and offset already match the
+    stamp no later append can release them.
+    """
+
+    #: Transcript message total the turn covered — the snapshot's total, not the
+    #: file's size afterwards. Named ``total`` rather than ``count`` because a
+    #: ``NamedTuple`` field called ``count`` would shadow ``tuple.count``.
+    total: int
+    #: ``rotation_generation`` at the snapshot.
+    generation: int
+    #: ``last_consolidated`` at the snapshot — where the attempted span begins.
+    offset: int
+
+
 # Skill detection judges a wider window than the incremental history tail: a
 # reusable procedure usually spans the whole session, not just the slice since
 # the last consolidation, so a tail-only view systematically misses skills in
 # any session consolidated more than once. Bound the window so pathologically
 # long sessions stay cost-safe.
 _SKILL_DETECTION_WINDOW = 200
+
+# The keys :meth:`ConversationLog.compact` is authoritative for; every other field
+# on the metadata line is another layer's and is carried through.
+_COMPACT_OWNED_META_KEYS: frozenset[str] = frozenset(
+    {"_type", "created_at", "last_consolidated", "compacted_at"}
+)
+
+# The keys the dashboard's slot save is authoritative for. It reconstructs the
+# line from the slot's in-memory state, so for THESE absence is meaningful (a
+# cleared title, an un-pinned slot, a reopened tab) — hence they are named here
+# and not preserved, while everything else survives the save.
+SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
+    {
+        "_type",
+        "created_at",
+        "last_consolidated",
+        "closed",
+        "closed_at",
+        "memory_mode",
+        "title",
+        "agent",
+        "model",
+        "reasoning_effort",
+        "mode",
+        "workspace",
+        "project",
+        "folder_id",
+        "app",
+        "artifact",
+        "pinned",
+        "color_index",
+        "color_theme",
+        "tags",
+        "forked_from",
+        "linked_session_key",
+        "tab_id",
+    }
+)
+
+
+def carry_unowned_metadata(
+    rebuilt: dict,
+    existing: dict,
+    owned: Container[str],
+) -> dict:
+    """Carry every pre-existing metadata field the rebuilding writer does not own.
+
+    A writer that reconstructs a transcript's metadata line from its own state
+    (the dashboard slot save, :meth:`ConversationLog.compact`) is authoritative
+    ONLY for the keys it writes: for those, absence is meaningful and must erase
+    (clearing a title, un-pinning, reopening a closed tab). For every OTHER key
+    absence means "not mine to know about", so reconstructing the subset silently
+    deletes another layer's durable state.
+
+    Enumerating the foreign keys to preserve instead is the failure mode this
+    replaces: each new field has to be added to every rebuilder, and the one that
+    is missed loses data with no error — the rotation generation and the
+    consolidation retry accounting were both erased that way. So *owned* names the
+    writer's OWN keys and everything else is carried through verbatim, making
+    preservation the default and erasure the deliberate act.
+
+    Preservation is unconditional, INCLUDING the consolidation retry accounting
+    (:data:`_CONSOLIDATION_META_KEYS`), because a rebuild is not evidence about
+    content: a slot flush re-serializes the same window, and a compaction archives
+    turns the budget has already measured without introducing any the LLM has not
+    seen — erasing the accounting there resets a live backoff and resumes billed
+    retries.
+
+    A save that genuinely EDITS the conversation is distinguished by the content
+    identity it writes, not by what this helper drops: the dashboard rewrite path
+    advances ``rotation_generation``, which releases the budget through the span
+    identity the accounting is stamped with (see :class:`AttemptedSpan` and
+    :meth:`ConversationLog._attempts_describe_current_span`) and invalidates any
+    in-flight attempt's marker write. Keeping that in ONE counter is what makes an
+    edit and a rotation behave identically; a second, parallel drop-the-keys valve
+    here would additionally discard the armed backoff deadline, handing a session
+    whose consolidation keeps failing a free billed turn on every user edit.
+
+    Returns *rebuilt*, mutated in place.
+    """
+    for meta_key, value in existing.items():
+        if meta_key in owned or meta_key in rebuilt:
+            continue
+        rebuilt[meta_key] = value
+    return rebuilt
 
 
 def _fmt_message(m: dict) -> str:
@@ -102,6 +245,19 @@ _SESSION_KEEP_LINES = 200
 # don't.
 _FLOCK_ACQUIRE_TIMEOUT_S = 10.0
 _FLOCK_POLL_INTERVAL_S = 0.05
+
+
+class _ConsolidationNotDispatched(Exception):
+    """A consolidation prompt never reached the provider.
+
+    Distinguishes "we could not send the turn" (no session manager; kiro-cli
+    missing, not logged in, or failing to start) from "the turn ran and returned
+    nothing useful". Only the latter costs money, so only the latter may consume
+    the attempt budget that abandons a span — charging an unsent turn would let a
+    broken host mark messages consolidated that no LLM has ever read. Raised
+    rather than reported as a flag beside the result so a caller cannot silently
+    drop the distinction.
+    """
 
 
 class HistoryLockTimeout(TimeoutError):
@@ -1714,14 +1870,23 @@ class ConversationLog:
         return messages[offset:], len(messages)
 
     def rotation_generation(self, key: str) -> int:
-        """Return the session's rotation generation counter.
+        """Return the session's content-identity counter for *key*.
 
-        Incremented by :meth:`_maybe_rotate` on every rotation. A consolidator
-        snapshots this alongside the message offset before its (slow) LLM call
-        and passes it back to :meth:`mark_consolidated`, which resets the offset
-        whenever the generation changed — closing the rotation-during-await race
-        for ANY retained count, not just files that shrank below the offset.
-        Absent field (legacy metadata / never rotated) reads as ``0``.
+        Advanced by every write that makes the transcript's messages a DIFFERENT
+        body of content than a consolidation may have snapshotted: a rotation
+        (:meth:`_maybe_rotate`), a dashboard rewrite save (regenerate / rewind /
+        fork), and a channel transcript merge. A consolidator snapshots it
+        alongside the message offset before its (slow) LLM call and passes it back
+        to :meth:`mark_consolidated`, which refuses to apply the offset whenever
+        the generation changed — closing the change-during-await race for ANY
+        retained count, including an edit that leaves the count untouched. It is
+        also the span identity the retry accounting is stamped against
+        (:meth:`_attempts_describe_current_span`), so the same bump releases a
+        budget charged against the superseded content.
+
+        Named for the rotation that first needed it; the field is now the general
+        content-identity counter. Absent field (legacy metadata / never advanced)
+        reads as ``0``.
         """
         return int(self._read_metadata(key).get("rotation_generation", 0) or 0)
 
@@ -1759,22 +1924,31 @@ class ConversationLog:
         *offset* is an absolute message index captured by the caller BEFORE a
         (potentially slow) LLM consolidation call. *generation* is the rotation
         generation counter (:meth:`rotation_generation`) captured at the same
-        moment. If a rotation fired while the consolidator awaited the LLM, the
-        file was truncated to its newest messages, ``last_consolidated`` reset
-        to 0, and the generation bumped — so the caller's *offset* is in the
-        stale PRE-rotation numbering: every surviving index shifted by the
-        number of dropped lines, so applying it would silently mark
-        never-consolidated retained messages as already processed.
+        moment. It advances on anything that changes the content under a
+        consolidation in flight, and each case makes the caller's *offset*
+        meaningless in a different way:
+
+        * A **rotation** truncated the file to its newest messages and reset
+          ``last_consolidated`` to 0, so every surviving index shifted by the
+          number of dropped lines and applying the offset would mark
+          never-consolidated retained messages as processed.
+        * A **transcript edit** (the dashboard regenerate / rewind / fork save)
+          replaced the live window's tail with content this turn never read. The
+          message count, the marker and the extent can all be unchanged, so the
+          offset still *looks* applicable — and applying it would mark the
+          REPLACEMENT tail consolidated without ever extracting it.
+
+        Both are silent memory loss, and the generation is what distinguishes
+        them from a turn whose span is still intact.
 
         Detection uses two independent signals:
 
         1. **Generation change** (primary, when *generation* is supplied):
-           any rotation between snapshot and write bumps the counter, so a
-           mismatch resets ``last_consolidated`` to 0 regardless of how many
-           messages the rotation retained. This closes the case a pure
-           offset-vs-count heuristic misses — a rotation that keeps >= *offset*
-           messages leaves ``offset <= msg_count`` true yet has still shifted
-           every index.
+           anything that changes the content between snapshot and write bumps the
+           counter, so a mismatch resets ``last_consolidated`` to 0. This closes
+           both cases a pure offset-vs-count heuristic misses — a rotation that
+           keeps >= *offset* messages, and an edit that keeps the count identical,
+           each leave ``offset <= msg_count`` true.
         2. **Offset exceeds current count** (fallback, always): the file shrank
            below the captured offset (rotation truncated it). Retained if
            *generation* is unavailable (legacy callers) or as defense-in-depth.
@@ -1802,20 +1976,25 @@ class ConversationLog:
             msg_count = sum(1 for ln in lines[1:] if ln.strip())
             current_generation = int(meta.get("rotation_generation", 0) or 0)
             if generation is not None and current_generation != generation:
-                # PRIMARY signal: a rotation fired between the caller's snapshot
-                # and now (the generation counter advanced). The offset is in
-                # the stale PRE-rotation numbering — every surviving index has
-                # shifted by the number of dropped lines — so it cannot be
-                # applied regardless of how many messages the rotation retained.
-                # A rotation that kept >= *offset* messages leaves
-                # ``offset <= msg_count`` true and would sail past the count
-                # heuristic below, silently marking never-consolidated retained
-                # messages as done. Reset to 0 and reconsolidate the retained
-                # tail (harmless, idempotent) rather than risk that loss.
+                # PRIMARY signal: the content under this consolidation changed
+                # between the caller's snapshot and now (the generation counter
+                # advanced) — a rotation, or a dashboard rewrite that swapped the
+                # live window's tail. Either way the offset cannot be applied.
+                # After a rotation it is in the stale PRE-rotation numbering
+                # (every surviving index shifted by the number of dropped lines);
+                # after an edit the numbering still fits but the messages it would
+                # mark are the REPLACEMENT tail, which no turn has read. Neither
+                # is caught by the count heuristic below: a rotation that kept
+                # >= *offset* messages and an edit that kept the count identical
+                # both leave ``offset <= msg_count`` true, and marking either
+                # would drop never-consolidated content from memory/history
+                # extraction. Reset to 0 and reconsolidate the current tail
+                # (harmless, idempotent) rather than risk that loss.
                 logger.warning(
                     "mark_consolidated: rotation generation changed %s->%d for "
-                    "%s (rotation during consolidation); resetting "
-                    "last_consolidated to 0 to avoid skipping retained messages",
+                    "%s (rotation or transcript edit during consolidation); "
+                    "resetting last_consolidated to 0 to avoid marking content "
+                    "no consolidation turn read",
                     generation,
                     current_generation,
                     key,
@@ -1847,6 +2026,22 @@ class ConversationLog:
                 safe_offset = offset
             meta["last_consolidated"] = safe_offset
             meta["updated_at"] = metadata_now_iso()
+            # The marker is the success signal for the retry accounting written
+            # by record_consolidation_failure: once a span is marked, its failed
+            # attempts and backoff deadline describe a span that no longer
+            # exists, and leaving them behind would charge the NEXT span for this
+            # one's failures. Dropped in the same locked write so no window
+            # exists where the marker is applied but the budget is not released.
+            #
+            # Only when the offset was actually APPLIED, though. Both branches
+            # above reset to 0 without advancing anything, so the span is still
+            # unconsolidated — and the abandon-at-cap path calls this method
+            # precisely to stop spending on it. Clearing the accounting there
+            # would hand a capped span a fresh budget every time a rotation
+            # raced the marker write, so the cap would never actually hold.
+            if safe_offset == offset:
+                for _acct_key in _CONSOLIDATION_META_KEYS:
+                    meta.pop(_acct_key, None)
             lines[0] = json.dumps(meta) + "\n"
             # Reduce lock hold for this one-line metadata rewrite: skip the
             # fsync (fsync=False). ``last_consolidated`` is recoverable
@@ -1865,6 +2060,291 @@ class ConversationLog:
         messages = self._read_messages(key)
         offset = self._read_metadata(key).get("last_consolidated", 0)
         return max(0, len(messages) - offset)
+
+    def consolidation_counts(self, key: str) -> tuple[int, int]:
+        """Return ``(total_messages, unconsolidated)`` from a SINGLE read.
+
+        The consolidator's entry points need both: the unconsolidated count to
+        decide there is anything to do, and the total as the extent
+        :meth:`consolidation_retry_state` compares the charged span against. Both
+        come from one ``_read_messages`` call so the eligibility check costs no
+        additional transcript read on the event loop.
+        """
+        messages = self._read_messages(key)
+        offset = self._read_metadata(key).get("last_consolidated", 0)
+        try:
+            offset = int(offset or 0)
+        except (TypeError, ValueError, OverflowError):
+            offset = 0
+        return len(messages), max(0, len(messages) - offset)
+
+    def consolidation_retry_state(
+        self, key: str, message_count: int | None = None
+    ) -> tuple[int, float]:
+        """Return ``(failed_attempts, next_eligible_at)`` for *key*.
+
+        Both live on the metadata line beside ``last_consolidated``, so the
+        accounting shares the marker's lifetime: it survives a gateway restart
+        (the consolidator's own throttle is in-memory only) and is cleared by
+        :meth:`mark_consolidated` when the span finally lands. ``(0, 0.0)`` means
+        no failed attempt is on record — the common case — so callers can treat a
+        missing entry as "eligible now".
+
+        Read UNCACHED. The accounting is cross-process (a gateway sweep, the CLI,
+        a subagent all record failures for the same session), and every writer of
+        these fields restores the file's pre-write mtime so housekeeping does not
+        reorder ``list_sessions``. The metadata cache is keyed on mtime, so a warm
+        entry survives another process's write byte-for-byte and would serve a
+        stale attempt count — bypassing the backoff on the read path and, on the
+        read-increment-write path, overwriting the other process's durable count
+        with a lower one. Dropping the entry first costs one first-line read.
+
+        Metadata is caller-supplied JSON, so every conversion is defensive:
+        ``1e309`` parses to ``inf`` and ``int(inf)`` raises ``OverflowError``
+        (which would surface as a 500 from the manual trigger or break the idle
+        sweep), while a ``NaN`` deadline makes every ``now >= retry_at``
+        comparison false and disables consolidation for the session forever.
+        Non-finite and unconvertible values therefore reset to the eligible zero
+        state rather than propagating.
+        """
+        self._meta_cache.pop(key, None)
+        meta = self._read_metadata(key)
+        try:
+            attempts = int(meta.get("consolidation_attempts", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            attempts = 0
+        try:
+            retry_at = float(meta.get("consolidation_retry_at", 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            retry_at = 0.0
+        if not math.isfinite(retry_at):
+            retry_at = 0.0
+        if attempts and not self._attempts_describe_current_span(meta, message_count):
+            # The counter belongs to a span that no longer exists: a rotation
+            # archived those messages (generation bumped), a rewrite reset the
+            # marker they started from, or the transcript has grown past the
+            # extent that was charged. The cap ABANDONS a span, so carrying a
+            # capped count onto different content would silence consolidation for
+            # this session permanently — every message written after that point
+            # would stay ineligible forever. The new span gets a fresh budget.
+            #
+            # The deadline is deliberately kept: a fresh budget is not a free
+            # immediate turn, so a session that keeps failing still waits out the
+            # backoff already armed (4 h at the cap) rather than re-billing the
+            # instant one more message lands.
+            attempts = 0
+        return max(0, attempts), retry_at
+
+    def _attempts_describe_current_span(
+        self, meta: dict, message_count: int | None
+    ) -> bool:
+        """True when the recorded attempts belong to the span in front of us now.
+
+        A span is identified by where it starts AND how far it reaches: the
+        ``(rotation_generation, last_consolidated)`` pair it was charged against
+        plus the message count that was actually attempted. While a span keeps
+        failing none of the three move — the marker is only advanced on success —
+        so the cap holds across attempts. Anything that changes the CONTENT under
+        the counter moves one of them: a rotation and a dashboard rewrite
+        (regenerate / rewind / fork) both advance the generation, a rewrite that
+        cannot apply a stale offset resets the marker, and new messages push the
+        transcript past the extent that was attempted.
+
+        The generation is what covers the edit that moves nothing else. A
+        regenerate replaces the assistant tail with a reply the failing turns
+        never saw and lands at the same message count, the same marker and the
+        same extent, so without the bump a capped budget would sit over brand-new
+        content and refuse it forever.
+
+        The extent matters because the cap is what ABANDONS a span, and it is only
+        reachable from :meth:`HistoryConsolidator.retry_eligible` when the
+        abandon-marker write itself failed. Without it, that one transient write
+        failure would refuse the session forever: appended messages leave the
+        generation and marker untouched, so every entry point would keep rejecting
+        a transcript that is no longer the one that failed, and the session's
+        history would never be consolidated again.
+
+        *message_count* is the transcript's CURRENT total, supplied by the caller.
+        It is never read from disk here: this predicate runs inside
+        ``retry_eligible`` on the gateway event loop, and a synchronous full-file
+        read there stalls every other gateway task on a large transcript. Callers
+        that already hold a count pass it (see :meth:`consolidation_counts`);
+        ``None`` means "no count available", which skips the extent test and keeps
+        the cap — the conservative direction, since the alternative is spending a
+        billed turn on an unverified premise.
+
+        Growth is compared with ``>`` rather than ``!=`` on purpose. A count that
+        SHRANK is a rotation or compaction, which already moves the generation or
+        the marker; treating a shrink as new content on its own would hand a
+        budget to a span with nothing added to it.
+
+        Unstamped accounting (written before a given field existed) is treated as
+        belonging to the current span, so an unknown provenance keeps the cap
+        rather than granting an unbounded supply of billed retries.
+
+        The stamp this compares against is the ATTEMPTED span, captured before the
+        turn (see :class:`AttemptedSpan`), which is what makes all three tests
+        meaningful: if the stamp were re-read after the turn it would describe the
+        transcript in front of us by construction, and every test here would
+        trivially match.
+        """
+        for meta_key, span_key in (
+            ("rotation_generation", "consolidation_attempts_generation"),
+            ("last_consolidated", "consolidation_attempts_offset"),
+        ):
+            if span_key not in meta:
+                continue
+            try:
+                if int(meta.get(span_key, 0) or 0) != int(meta.get(meta_key, 0) or 0):
+                    return False
+            except (TypeError, ValueError, OverflowError):
+                # Unreadable stamp — fall back to keeping the cap.
+                continue
+        if message_count is not None and "consolidation_attempts_count" in meta:
+            try:
+                attempted = int(meta.get("consolidation_attempts_count", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                return True
+            if message_count > attempted:
+                return False
+        return True
+
+    def _current_span_fields(self, span: AttemptedSpan) -> dict:
+        """The span-identity stamp to store beside a freshly charged attempt.
+
+        Every field comes from *span* — the consolidation's own pre-turn snapshot
+        (see :class:`AttemptedSpan`) — and NOTHING is re-read from the metadata
+        line here. The stamp must describe the span the turn actually attempted,
+        and the metadata line at failure time describes the transcript as it is
+        *now*, which a rotation or a marker-resetting rewrite during the turn has
+        already changed.
+        The clamps are the only normalization: *span* is typed, and its values come
+        from a snapshot's own ``len()``/generation reads, so there is nothing to
+        coerce — but a negative offset or count would be nonsense to stamp.
+        """
+        return {
+            "consolidation_attempts_generation": span.generation,
+            "consolidation_attempts_offset": max(0, span.offset),
+            "consolidation_attempts_count": max(0, span.total),
+        }
+
+    def record_consolidation_failure(
+        self,
+        key: str,
+        base_secs: float,
+        max_secs: float,
+        span: AttemptedSpan,
+        now: float | None = None,
+    ) -> tuple[int, float]:
+        """Durably count one failed consolidation attempt for *key*.
+
+        *span* is the identity of what the failing turn actually attempted, taken
+        from the pre-turn snapshot (see :class:`AttemptedSpan`). It serves twice:
+        as the stamp written beside the counter, and as the span the existing
+        counter is compared against — so a turn that attempted a DIFFERENT span
+        starts a fresh budget while one attempting the same span increments toward
+        the cap. Nothing about the span is re-read from the file here, so a
+        rotation or rewrite that landed during the turn cannot relabel this charge
+        as belonging to content it never measured.
+
+        Returns the new ``(attempts, next_eligible_at)``. The wait doubles per
+        attempt from *base_secs*, capped at *max_secs*, so a persistently broken
+        span costs a geometrically shrinking number of billed LLM turns instead
+        of one per heartbeat tick.
+
+        The read-increment-write runs under a single :meth:`_locked` hold: two
+        processes consolidating the same session (gateway sweep and CLI) would
+        otherwise both read the same count and write the same value, letting the
+        span consume unbounded attempts while the counter sits still. The read
+        inside is uncached for the same reason (see
+        :meth:`consolidation_retry_state`) — an mtime-preserving write by the
+        other process is invisible to a warm cache.
+
+        Returns ``(0, 0.0)`` without writing when the session's transcript is gone
+        (deleted while the consolidation was in flight): ``_update_metadata_locked``
+        upserts, so writing would resurrect the session as an empty metadata-only
+        file. Blocking file IO — call it off the event loop.
+        """
+        stamp = _time.time() if now is None else now
+        with self._locked(key):
+            if not self._path(key).exists():
+                # The session was deleted while this consolidation was in flight.
+                # _update_metadata_locked upserts, so writing here would recreate
+                # the transcript as a metadata-only file — resurrecting a deleted
+                # session as empty history in list_sessions. Nothing to account
+                # for: the span it described is gone.
+                logger.info(
+                    "Skipping consolidation retry accounting for %s: session deleted",
+                    key,
+                )
+                return 0, 0.0
+            attempts = self.consolidation_retry_state(key, span.total)[0] + 1
+            # The exponent comes from caller-supplied metadata, so clamp it before
+            # shifting: an absurd stored count would otherwise make ``2 ** n``
+            # allocate a huge int (or raise) instead of returning a wait. The
+            # backoff saturates at *max_secs* far below the clamp, so no reachable
+            # attempt count is affected.
+            retry_at = stamp + min(max_secs, base_secs * (2 ** min(attempts - 1, 64)))
+            self._update_metadata_locked(
+                key,
+                {
+                    "consolidation_attempts": attempts,
+                    "consolidation_retry_at": retry_at,
+                    # Bind the count to the span it was charged against — where it
+                    # starts and how far it reaches — so a rotation, a rewrite, or
+                    # a grown transcript cannot leave a capped counter sitting over
+                    # content it never measured (see
+                    # _attempts_describe_current_span). Every field comes from the
+                    # pre-turn snapshot, never from the file as it stands now, and
+                    # is written in the SAME locked update as the counter, so no
+                    # window exists where the count is charged but its span is
+                    # unidentified or misidentified.
+                    **self._current_span_fields(span),
+                },
+            )
+        return attempts, retry_at
+
+    def record_consolidation_environment_failure(
+        self,
+        key: str,
+        base_secs: float,
+        max_secs: float,
+        now: float | None = None,
+    ) -> tuple[int, float]:
+        """Arm the backoff for a consolidation that never reached the provider.
+
+        Counted separately from :meth:`record_consolidation_failure` because the
+        two failures have different costs. A spent turn costs money, so its
+        counter feeds a hard abandon cap. A pre-dispatch failure — no session
+        manager, or kiro-cli failing to start — costs nothing, so it must never
+        abandon a span: doing so would write the durable marker over messages no
+        LLM has ever read. It still needs a deadline, or a permanently broken host
+        re-attempts on every 60s heartbeat tick forever, so the count drives the
+        same widening wait up to *max_secs* and then holds there.
+
+        Returns the new ``(environment_failures, next_eligible_at)``. Same single
+        locked read-increment-write and same deleted-session guard as the billed
+        path. Blocking file IO — call it off the event loop.
+        """
+        stamp = _time.time() if now is None else now
+        with self._locked(key):
+            if not self._path(key).exists():
+                return 0, 0.0
+            meta = self._read_metadata(key)
+            try:
+                failures = int(meta.get("consolidation_env_failures", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                failures = 0
+            failures = max(0, failures) + 1
+            retry_at = stamp + min(max_secs, base_secs * (2 ** min(failures - 1, 64)))
+            self._update_metadata_locked(
+                key,
+                {
+                    "consolidation_env_failures": failures,
+                    "consolidation_retry_at": retry_at,
+                },
+            )
+        return failures, retry_at
 
     def load_transcript(self, key: str) -> str:
         """Load full session as formatted text for LLM summarization."""
@@ -3115,7 +3595,11 @@ class ConversationLog:
                 _archive_lines(key, dropped, reason="compact", base=self._dir)
             except Exception:
                 logger.warning("Failed to archive dropped lines for %s", key, exc_info=True)
-        # Preserve select fields from original metadata
+        # Rebuild only the fields compaction owns; everything else on the metadata
+        # line belongs to another layer (the rotation generation an in-flight
+        # consolidation checks, its retry accounting, the slot's title/agent/pin)
+        # and is carried through verbatim. Enumerating what to keep is how those
+        # fields got dropped in the first place.
         orig_meta = self.get_metadata(key) or {}
         meta = {
             "_type": "metadata",
@@ -3123,13 +3607,7 @@ class ConversationLog:
             "last_consolidated": orig_meta.get("last_consolidated", 0),
             "compacted_at": metadata_now_iso(),
         }
-        # Carry the rotation generation forward so a compaction (which is NOT a
-        # rotation) doesn't reset it to 0 and spuriously trip the generation
-        # mismatch in mark_consolidated for an in-flight consolidation.
-        if orig_meta.get("rotation_generation"):
-            meta["rotation_generation"] = orig_meta["rotation_generation"]
-        if orig_meta.get("memory_mode"):
-            meta["memory_mode"] = orig_meta["memory_mode"]
+        carry_unowned_metadata(meta, orig_meta, _COMPACT_OWNED_META_KEYS)
         lines = [json.dumps(meta) + "\n"]
         for m in messages:
             lines.append(json.dumps(m) + "\n")
@@ -3443,6 +3921,141 @@ class HistoryConsolidator:
         # swaps the window's content) still forces a fresh pass.
         self._last_skillgen_marker: dict[str, tuple[int, int]] = {}
 
+    def retry_eligible(
+        self, key: str, now: float | None = None, message_count: int | None = None
+    ) -> bool:
+        """True when *key* may spend a billed consolidation turn right now.
+
+        Every automatic entry point consults this so a span whose consolidation
+        keeps failing backs off instead of re-billing an LLM turn on each sweep.
+        A span at :data:`_CONSOLIDATION_MAX_ATTEMPTS` is refused: the abandon path
+        normally writes the marker (which also clears the accounting), so reaching
+        here at the cap means even that write failed, and refusing keeps a broken
+        span from spending forever.
+
+        That refusal covers the SPAN, not the session. The cap is scoped to the
+        content it measured, so a rotation or new messages release it with a fresh
+        bounded budget (see
+        :meth:`ConversationLog._attempts_describe_current_span`) — otherwise one
+        transient marker-write failure would stop this session from ever
+        consolidating again.
+
+        Costs one metadata-line read and NO transcript read: this runs on the
+        gateway event loop (heartbeat sweep, expiry, dashboard trigger), where a
+        synchronous full-file read would stall every other gateway task on a large
+        transcript. *message_count* is the transcript's current total, which every
+        automatic caller already holds from its own
+        :meth:`ConversationLog.consolidation_counts` call; omitting it skips the
+        extent test and keeps the cap.
+        """
+        attempts, retry_at = self._log.consolidation_retry_state(key, message_count)
+        if attempts >= _CONSOLIDATION_MAX_ATTEMPTS:
+            return False
+        return (_time.time() if now is None else now) >= retry_at
+
+    async def _note_failed_attempt(
+        self, key: str, span: AttemptedSpan, reason: str
+    ) -> None:
+        """Charge one attempt for a billed turn that never reached the marker.
+
+        Called only once the prompt has actually reached the provider, so a
+        pre-dispatch failure (no session manager, kiro-cli failing to start) and a
+        cheap pre-call failure (snapshot, metadata read) both keep their free
+        retry. At the attempt cap the durable marker is written anyway and the span
+        is abandoned with a warning: the alternative is re-billing this failure
+        indefinitely.
+
+        *span* is the pre-turn snapshot identity (see :class:`AttemptedSpan`), used
+        both to stamp the charge and to place the abandon marker — the same values
+        for both, so the marker cannot be written for a span other than the one the
+        cap was reached on.
+        """
+        try:
+            attempts, retry_at = await asyncio.to_thread(
+                self._log.record_consolidation_failure,
+                key,
+                _CONSOLIDATION_BACKOFF_BASE_SECS,
+                _CONSOLIDATION_BACKOFF_MAX_SECS,
+                span,
+            )
+        except Exception:
+            # Without a persisted count the sweep cannot back off, so say so
+            # loudly — but never let bookkeeping mask the original failure.
+            logger.warning(
+                "Could not persist consolidation retry state for %s", key, exc_info=True
+            )
+            return
+        if attempts < 1:
+            # The session was deleted mid-consolidation, so nothing was recorded
+            # and there is no span left to abandon.
+            return
+        if attempts < _CONSOLIDATION_MAX_ATTEMPTS:
+            logger.warning(
+                "Consolidation attempt %d/%d failed for %s (%s); "
+                "next attempt in %.0fs",
+                attempts,
+                _CONSOLIDATION_MAX_ATTEMPTS,
+                key,
+                reason,
+                max(0.0, retry_at - _time.time()),
+            )
+            return
+        logger.warning(
+            "Abandoning consolidation for %s after %d failed attempts (%s): "
+            "marking %d messages consolidated WITHOUT a memory pass, so this "
+            "span's history/preferences/lessons are not extracted",
+            key,
+            attempts,
+            reason,
+            span.total,
+        )
+        try:
+            await asyncio.to_thread(
+                self._log.mark_consolidated, key, span.total, span.generation
+            )
+        except Exception:
+            # The count stays at the cap, so retry_eligible() keeps refusing —
+            # the span stops spending even though the marker is missing.
+            logger.warning(
+                "Could not mark abandoned consolidation for %s", key, exc_info=True
+            )
+
+    async def _note_environment_failure(self, key: str, reason: str) -> None:
+        """Arm the backoff for a consolidation that never reached the provider.
+
+        Deliberately does NOT touch the attempt cap. A pre-dispatch failure spends
+        nothing, so abandoning the span over one would write the durable marker
+        over messages no LLM has ever read — losing a memory pass to a broken
+        kiro-cli install rather than to a genuinely unprocessable span. The
+        environment counter only widens the retry interval, so a permanently broken
+        host settles at the backoff ceiling instead of re-attempting every tick.
+        """
+        try:
+            failures, retry_at = await asyncio.to_thread(
+                self._log.record_consolidation_environment_failure,
+                key,
+                _CONSOLIDATION_BACKOFF_BASE_SECS,
+                _CONSOLIDATION_BACKOFF_MAX_SECS,
+            )
+        except Exception:
+            logger.warning(
+                "Could not persist consolidation environment backoff for %s",
+                key,
+                exc_info=True,
+            )
+            return
+        if failures < 1:
+            return
+        logger.warning(
+            "Consolidation for %s could not reach the LLM (%s; environment "
+            "failure #%d, nothing billed); retrying in %.0fs without consuming "
+            "the attempt budget",
+            key,
+            reason,
+            failures,
+            max(0.0, retry_at - _time.time()),
+        )
+
     def maybe_consolidate(self, key: str) -> None:
         """Fire preferences/projects consolidation if message threshold exceeded."""
         self._last_activity[key] = _time.time()
@@ -3467,11 +4080,20 @@ class HistoryConsolidator:
         """Check all tracked sessions for idle-based history consolidation."""
         now = _time.time()
         for key, last in list(self._last_activity.items()):
+            if now - last < self._history_idle_secs:
+                continue
+            total, unconsolidated = self._log.consolidation_counts(key)
             if (
-                now - last < self._history_idle_secs
-                or self._log.unconsolidated_count(key) < 1
+                unconsolidated < 1
                 or now - self._history_consolidated.get(key, 0) < self._history_idle_secs
                 or key in self._running
+                # Durable backoff, checked last so it only costs a metadata read
+                # once the cheap conditions pass. The in-memory throttle above is
+                # set only when the task ends without an exception and is lost on
+                # restart, so it alone cannot stop a repeatedly failing span from
+                # re-billing an LLM turn every tick. *total* comes from the read
+                # above, so the check adds no transcript read on the loop.
+                or not self.retry_eligible(key, now, message_count=total)
             ):
                 continue
             self._running.add(key)
@@ -3495,7 +4117,8 @@ class HistoryConsolidator:
 
         Used by session-end hooks (dashboard close, Slack end, idle expiry)
         and the ``kirocrew consolidate`` CLI command.  Skips if the session
-        is already being consolidated or has no unconsolidated messages.
+        is already being consolidated, has no unconsolidated messages, or is
+        inside the durable consolidation retry backoff.
 
         Safety: skill detection (_run_skill_detection) re-checks
         _session_touched_sensitive() over its window before proposing anything,
@@ -3503,7 +4126,17 @@ class HistoryConsolidator:
         """
         if key in self._running:
             return
-        if self._log.unconsolidated_count(key) < 1:
+        total, unconsolidated = self._log.consolidation_counts(key)
+        if unconsolidated < 1:
+            return
+        # This path consults no time-based throttle at all — every session expiry
+        # for the same key fires a fresh consolidation — so the durable backoff is
+        # the only thing standing between a repeatedly failing span and one billed
+        # LLM turn per expiry.
+        if not self.retry_eligible(key, message_count=total):
+            logger.info(
+                "consolidate_session skipped for %s: consolidation retry backoff", key
+            )
             return
         # Short-circuit sensitive sessions before scheduling a task
         messages = self._log._read_messages(key)
@@ -3551,6 +4184,16 @@ class HistoryConsolidator:
         # Capture the gateway loop so the thread-offloaded _process_auto_skills
         # can schedule the async dedupe judge back onto it.
         self._event_loop = asyncio.get_running_loop()
+        # Flipped once the prompt actually reaches the provider, which is what
+        # makes a failure expensive: everything before that point is free to
+        # retry, everything after costs a turn that produced nothing durable.
+        billed = False
+        total = 0
+        generation_at_snapshot = 0
+        # The span identity any failure charge is stamped with. Rebuilt from the
+        # snapshot below; the zero value only ever reaches a charge if the snapshot
+        # itself raised, and that path is not billed.
+        attempted = AttemptedSpan(0, 0, 0)
         try:
             # Atomically snapshot the unconsolidated tail, the total message
             # count (the absolute offset handed to mark_consolidated below), and
@@ -3569,6 +4212,17 @@ class HistoryConsolidator:
             ) = await asyncio.to_thread(self._log.snapshot_for_consolidation, key)
             if not unconsolidated:
                 return
+            # Freeze the whole span identity from that one snapshot. The offset is
+            # derived rather than returned because the snapshot slices at it
+            # (``messages[offset:]``), so the subtraction is exact and comes from
+            # the same lock hold — no second read that a concurrent rotation could
+            # land between. A failure charge stamped with these values describes
+            # what the turn attempted even if the file changed underneath it.
+            attempted = AttemptedSpan(
+                total=total,
+                generation=generation_at_snapshot,
+                offset=total - len(unconsolidated),
+            )
 
             # Resolve workspace-scoped memory from session metadata
             meta = self._log.get_metadata(key)
@@ -3682,8 +4336,30 @@ class HistoryConsolidator:
             prompt_parts.append("\n\nRespond with ONLY valid JSON, no markdown fences.")
             prompt = "".join(prompt_parts)
 
-            result = await self._call_llm(prompt)
+            try:
+                result = await self._call_llm(prompt)
+            except _ConsolidationNotDispatched as exc:
+                # Nothing was sent, so nothing was billed. Charging this to the
+                # attempt cap would let a handful of environment failures abandon
+                # the span — writing the durable marker over messages no LLM has
+                # ever read, which is the exact false-abandonment this accounting
+                # exists to prevent. Arm the backoff only, so a broken host retries
+                # on a widening interval instead of on every 60s tick.
+                if include_history:
+                    await self._note_environment_failure(key, str(exc))
+                return
+            billed = True
             if not result:
+                # The turn reached the provider and produced nothing usable, so it
+                # was spent while the marker below stays unwritten. Returning
+                # silently would look like success to the done-callbacks, setting
+                # the in-memory throttle while the durable count still says
+                # unconsolidated: the span re-bills a full turn every idle window,
+                # and immediately after every restart. Charge the attempt.
+                if include_history:
+                    await self._note_failed_attempt(
+                        key, attempted, "empty LLM result"
+                    )
                 return
 
             if entry := result.get("history_entry"):
@@ -3773,6 +4449,15 @@ class HistoryConsolidator:
 
         except Exception:
             logger.exception("Consolidation failed for %s", key)
+            # Anything raised between the LLM call and mark_consolidated (memory
+            # writes, lesson writes, the marker write itself) re-raises, so the
+            # idle sweep's done-callback never sets its throttle and all of its
+            # skip conditions are false again on the next 60s tick. Charging the
+            # attempt here is what converts that tight loop into backoff.
+            if billed and include_history:
+                await self._note_failed_attempt(
+                    key, attempted, "exception after the LLM call"
+                )
             raise
         finally:
             self._running.discard(key)
@@ -3878,7 +4563,13 @@ class HistoryConsolidator:
             + "\n\n## Session excerpt\n" + conversation
             + "\n\nRespond with ONLY valid JSON, no markdown fences."
         )
-        result = await self._call_llm(prompt)
+        try:
+            result = await self._call_llm(prompt)
+        except _ConsolidationNotDispatched:
+            # Skill detection is best-effort and owns no retry accounting, so an
+            # unreachable provider is simply no detection this pass. The marker
+            # below is still recorded, matching the existing failed-turn path.
+            result = None
         # Record the (generation, count) marker regardless of outcome so an
         # unchanged session isn't re-evaluated on every subsequent
         # consolidation, but a rotation still forces a fresh pass.
@@ -4590,11 +5281,26 @@ class HistoryConsolidator:
         """Call LLM for consolidation via the persistent background session.
 
         Uses the shared background kiro-cli process (no spawn/teardown cost).
-        Returns parsed JSON dict or None on failure.
+        Returns the parsed JSON dict, or ``None`` when the turn reached the
+        provider but produced nothing usable (a failed or unparsable answer).
+
+        Raises :class:`_ConsolidationNotDispatched` when the prompt never reached
+        the provider at all — no session manager, or the background session could
+        not be acquired because kiro-cli is missing, not logged in, or failing to
+        start. That case is signalled separately rather than folded into ``None``
+        because the two cost different things: a spent turn costs money and must
+        consume the caller's retry budget, while a prompt that was never sent costs
+        nothing and must not, or a broken host would abandon spans it never read.
+        An exception (rather than a flag beside the result) is used so a caller
+        cannot silently drop the distinction.
+
+        Once ``stream_and_collect_json`` is entered the prompt counts as sent: a
+        failure inside it may still have been billed, so it returns ``None`` and is
+        charged rather than risk an unbounded retry loop over real spend.
         """
         if not self._sessions:
             logger.warning("LLM consolidation skipped — no session manager")
-            return None
+            raise _ConsolidationNotDispatched("no session manager")
 
         session_key = BACKGROUND_KEY
         # Timing instrumentation (_bg stall investigation): measure both the
@@ -4605,9 +5311,20 @@ class HistoryConsolidator:
         # consolidation stall.
         t_start = _time.monotonic()
         try:
-            client, _is_new, _resumed = await self._sessions.get_or_create(
-                session_key, agent="kirocrew-lite"
-            )
+            try:
+                client, _is_new, _resumed = await self._sessions.get_or_create(
+                    session_key, agent="kirocrew-lite"
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Consolidation could not acquire the background session "
+                    "after %.1fs — nothing was sent",
+                    _time.monotonic() - t_start,
+                    exc_info=True,
+                )
+                raise _ConsolidationNotDispatched(
+                    "background session unavailable"
+                ) from exc
             t_acquired = _time.monotonic()
             wait_s = t_acquired - t_start
             # Reject all tools: this is a text/JSON-only generation turn. kiro
@@ -4616,9 +5333,17 @@ class HistoryConsolidator:
             # kirocrew-core/cron toolset — without REJECT_ALL a background
             # consolidation turn could fire side-effecting tools (send_message,
             # learn_add, spawn_run). REJECT_ALL keeps both providers tool-free.
-            result = await stream_and_collect_json(
-                client, prompt, approval_policy=ToolApprovalPolicy.REJECT_ALL
-            )
+            try:
+                result = await stream_and_collect_json(
+                    client, prompt, approval_policy=ToolApprovalPolicy.REJECT_ALL
+                )
+            except Exception:
+                logger.warning(
+                    "LLM consolidation turn failed after %.1fs",
+                    _time.monotonic() - t_start,
+                    exc_info=True,
+                )
+                return None
             turn_s = _time.monotonic() - t_acquired
             logger.debug(
                 "Consolidation LLM turn: wait=%.1fs turn=%.1fs total=%.1fs ok=%s",
@@ -4628,13 +5353,6 @@ class HistoryConsolidator:
                 result is not None,
             )
             return result
-        except Exception:
-            logger.warning(
-                "LLM consolidation call failed after %.1fs",
-                _time.monotonic() - t_start,
-                exc_info=True,
-            )
-            return None
         finally:
             self._sessions.release(session_key)
             await self._sessions.recycle_background()
