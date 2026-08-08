@@ -222,7 +222,8 @@ class TestPrReadiness:
         workflow = _workflow("pr-readiness.yml")
 
         assert (
-            "--json number,state,isDraft,isCrossRepository,headRefName,"
+            "--json number,state,isDraft,isCrossRepository,baseRefName,"
+            "headRefName,"
             "headRefOid,headRepository,headRepositoryOwner,url)"
         ) in workflow
         assert "mergeStateStatus" not in workflow
