@@ -44,6 +44,24 @@ vi.mock('../pages/system/sessionRows', async importOriginal => {
   }
 })
 
+/**
+ * Captures every `options` object passed to `useReactTable` so tests can assert
+ * on resolved table configuration. The wrapper is transparent: the table still
+ * works normally, and existing tests are unaffected.
+ */
+const capturedTableOptions: Array<Record<string, unknown>> = []
+
+vi.mock('@tanstack/react-table', async importOriginal => {
+  const actual = await importOriginal<typeof import('@tanstack/react-table')>()
+  return {
+    ...actual,
+    useReactTable: (options: Record<string, unknown>) => {
+      capturedTableOptions.push(options)
+      return actual.useReactTable(options as never)
+    },
+  }
+})
+
 /** A render that never settles is the bug; anything near this is a loop. */
 const RENDER_CEILING = 25
 
@@ -67,7 +85,7 @@ function mount() {
 }
 
 describe('SessionsTab render stability', () => {
-  beforeEach(() => { renders = 0; buildTreeCalls.n = 0 })
+  beforeEach(() => { renders = 0; buildTreeCalls.n = 0; capturedTableOptions.length = 0 })
   afterEach(() => { cleanup(); vi.restoreAllMocks() })
 
   it('settles while the first fetch is still in flight', async () => {
@@ -196,5 +214,35 @@ describe('SessionsTab render stability', () => {
 
     await waitFor(() => expect(screen.getByText('No active sessions')).toBeTruthy())
     expect(renders).toBeLessThan(RENDER_CEILING)
+  })
+
+  it('disables autoResetPageIndex to prevent the pagination setState loop', async () => {
+    // This table has no paginator (no `getPaginationRowModel`) and no
+    // `onPaginationChange`, so TanStack's default `autoResetPageIndex: true`
+    // routes every data-identity change through `makeStateUpdater('pagination')`
+    // into `table.setState` — triggering a re-render that, with unstable `data`,
+    // becomes an infinite loop. The ONLY thing breaking that cycle is the explicit
+    // `autoResetPageIndex: false` in the table options.
+    //
+    // This is a configuration-level lock: it asserts the option is passed rather
+    // than reproducing the loop (which requires real RAF scheduling that jsdom
+    // cannot provide — see file header). It is the direct complement of the
+    // `buildTree` churn tests above: those prove data identity is stable, this
+    // proves the table will not self-destruct even if a future refactor
+    // accidentally reintroduces an identity change.
+    vi.spyOn(api, 'sessionsMemory').mockResolvedValue({
+      sessions: [], tasks: [], totals: { rss_mb: 0, host_mb: 1000, procs: 0, sessions: 0, tasks: 0 },
+      unattributed: null, history: [],
+    } as never)
+
+    mount()
+    await waitFor(() => expect(capturedTableOptions.length).toBeGreaterThan(0))
+
+    // Every call to useReactTable from this component must carry the guard.
+    // (There is only one table, but renders call the hook repeatedly.)
+    const withoutGuard = capturedTableOptions.filter(
+      opts => opts.autoResetPageIndex !== false,
+    )
+    expect(withoutGuard).toHaveLength(0)
   })
 })
