@@ -14,10 +14,23 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Literal
 
 from kiro_crew import platform_compat
 
 logger = logging.getLogger(__name__)
+
+#: What to do when the owner-only lockdown cannot be applied.
+#:
+#: ``"raise"`` refuses to write a secret it cannot protect. ``"warn"`` logs and
+#: writes anyway. Both are deliberate, established conventions in this codebase,
+#: which is why this is a parameter and not a fixed policy: ``webhooks.py`` and
+#: ``dashboard/token_auth.py`` let the OSError propagate, while ``sel.py`` and
+#: ``dashboard/refresh_tokens.py`` catch it and continue, because a read-only
+#: filesystem must not brick SecurityEventLog init or stop refresh-token state
+#: from being persisted. Losing reuse-detection state is a worse outcome there
+#: than a file whose permissions could not be tightened.
+RestrictErrorPolicy = Literal["raise", "warn"]
 
 _umask_lock = threading.Lock()
 _default_mode: int | None = None
@@ -121,16 +134,24 @@ def replace_with_retry(src: Path | str, dst: Path | str) -> None:
 
 def atomic_write(
     path: Path | str,
-    content: str,
+    content: str | bytes,
     *,
     fsync: bool = False,
     mode: int | None = None,
     newline: str | None = None,
+    restrict_to_owner: bool = False,
+    restrict_on_error: RestrictErrorPolicy = "raise",
 ) -> None:
     """Write *content* to *path* atomically via unique temp file + rename.
 
     Uses ``tempfile.mkstemp`` so concurrent writers never collide on the
     same temp filename.  On error the temp file is cleaned up.
+
+    *content* may be ``str`` (written UTF-8 encoded in text mode) or ``bytes``
+    (written verbatim in binary mode). Binary mode exists for callers whose
+    payload is not text at all — a compiled helper binary, an archive — which
+    previously had to hand-roll the temp-write-and-rename and so silently
+    missed the Windows rename retry above.
 
     *mode* sets explicit permissions (e.g. ``0o600`` for secrets).
     ``None`` (default) applies umask-based permissions (matching ``open()``).
@@ -139,17 +160,83 @@ def atomic_write(
     universal-newline translation, which rewrites ``\\n`` to ``\\r\\n`` on
     Windows. Pass ``""`` when the content must land on disk byte-for-byte —
     e.g. a document that is read back, edited and saved again, where
-    translation on every save would accumulate carriage returns.
+    translation on every save would accumulate carriage returns. It is
+    meaningless for ``bytes`` content, which is never translated, so passing
+    both raises rather than silently ignoring the argument.
+
+    *restrict_to_owner* locks the file down to its owner for secret-bearing
+    payloads (credentials, HMAC keys, tokens). It is NOT the same as
+    ``mode=0o600``: ``fchmod_safe`` is a documented no-op on Windows, so
+    ``mode`` alone leaves a Windows temp readable at its inherited DACL for the
+    whole write. This applies
+    :func:`platform_compat.restrict_to_owner` to the temp file BEFORE any
+    content reaches it — the ordering the hand-rolled sites already use — so
+    the secret never exists in a world-readable file. It also implies
+    ``0o600`` on POSIX, hence the conflict check below: passing a wider
+    explicit *mode* alongside it is a caller bug, and narrowing it silently
+    would hide that.
+
+    *restrict_on_error* selects what happens when that lockdown fails, and only
+    means anything alongside ``restrict_to_owner=True``. The default ``"raise"``
+    refuses to write a secret it cannot protect. ``"warn"`` logs and writes
+    anyway, for the callers whose own comments say the write matters more than
+    the permissions: ``sel.py`` must not brick SecurityEventLog init on a
+    read-only filesystem, and ``dashboard/refresh_tokens.py`` must not drop
+    refresh-token reuse-detection state. Note the asymmetry the two platforms
+    give ``"warn"``: on POSIX ``restrict_to_owner`` is ``chmod(0o600)``, which
+    the ``fchmod_safe`` below repeats, so the file still lands at ``0o600``
+    after a warn; on Windows ``fchmod_safe`` is a no-op, so a warn genuinely
+    publishes the file under its inherited ACL. That is the exposure those
+    callers accept today, stated rather than implied.
     """
+    binary = isinstance(content, bytes)
+    if binary and newline is not None:
+        raise TypeError("newline is a text-mode concept and cannot apply to bytes content")
+    if restrict_to_owner and mode is not None and mode != 0o600:
+        raise ValueError(
+            f"restrict_to_owner implies 0o600; refusing to also honour mode={mode:#o}"
+        )
+    if restrict_on_error != "raise" and not restrict_to_owner:
+        # Reject rather than ignore: a caller passing this without asking for the
+        # lockdown believes they configured a failure policy for something that
+        # never runs, which reads as "permissions are handled" at the call site.
+        raise ValueError(
+            f"restrict_on_error={restrict_on_error!r} is meaningless without "
+            "restrict_to_owner=True"
+        )
+    # restrict_to_owner wins: fchmod must not widen the file back to the umask
+    # default after the lockdown has been applied.
+    effective_mode = 0o600 if restrict_to_owner else mode
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as f:
+        if restrict_to_owner:
+            # Before fdopen, matching the shipping order in webhooks.py and
+            # mcp_gateway/rewriter.py: the DACL lands while the file is still
+            # empty, so a secret never exists in a readable file.
+            try:
+                platform_compat.restrict_to_owner(tmp)
+            except OSError:
+                if restrict_on_error == "raise":
+                    raise
+                # Logs the DESTINATION path, never the temp name and never
+                # *content*. The temp name is an internal detail an operator
+                # cannot act on; the destination is the file whose permissions
+                # they need to check.
+                logger.warning(
+                    "atomic_write: could not apply owner-only permissions to %s; "
+                    "writing it anyway per restrict_on_error='warn' — the file "
+                    "may be readable by other users",
+                    path,
+                    exc_info=True,
+                )
+        text_kwargs = {} if binary else {"encoding": "utf-8", "newline": newline}
+        with os.fdopen(fd, "wb" if binary else "w", **text_kwargs) as f:  # type: ignore[call-overload]
             fd = -1  # fdopen took ownership; prevent double-close
             # No-op on Windows (no POSIX permission bits / os.fchmod).
             platform_compat.fchmod_safe(
-                f.fileno(), mode if mode is not None else _get_default_mode()
+                f.fileno(), effective_mode if effective_mode is not None else _get_default_mode()
             )
             f.write(content)
             if fsync:
