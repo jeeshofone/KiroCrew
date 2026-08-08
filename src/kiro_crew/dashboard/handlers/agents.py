@@ -20,6 +20,7 @@ from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
 from kiro_crew.agent_discovery import (
     clear_list_agents_cache,
     list_agents,
+    project_agent_names,
     spec_model,
     spec_str,
 )
@@ -45,6 +46,8 @@ from kiro_crew.dashboard.chat_utils import (
 from kiro_crew.dashboard.handlers._shared import (
     MAX_AGENT_SKILLS,
     _capability_manager,
+    _read_session_key,
+    active_project_dir,
     agent_skill_keys,
     agent_skill_views,
     apply_skill_mapping,
@@ -228,6 +231,40 @@ async def api_default_agent(request: web.Request) -> web.Response:
         except Exception:
             return web.json_response({"error": "invalid JSON"}, status=400)
         name = body.get("agent", "")
+        # Reject non-strings before any use: a JSON list/object here would make
+        # the membership check below raise (unhashable) into a 500, and a
+        # non-string must never reach the config write either.
+        if not isinstance(name, str):
+            return web.json_response(
+                {"error": "agent must be a string", "code": "invalid_agent_type"}, status=400
+            )
+        # Only a config alias may become the default: the default is resolved
+        # from cfg.agents on every dispatch, so persisting any other name (a
+        # project-scope discovery, an app agent, a typo) writes a default that
+        # silently resolves to something else. Guarded server-side so EVERY
+        # caller is covered, not just whichever picker currently hides the
+        # action — project-scope rows carry scope="project" in /api/agents
+        # precisely so UIs can disable this, but the config file is the last
+        # line of defense.
+        try:
+            # Config load is stat/read/validation filesystem work; off-loop so
+            # slow storage cannot freeze chat and the liveness heartbeat.
+            known = set((await asyncio.to_thread(KiroCrewConfig.load)).agents.keys())
+        except Exception:
+            known = set()
+        # Fail CLOSED: an unreadable config yields an empty `known`, and that is
+        # precisely when validation is impossible — a non-empty name must be
+        # rejected, not waved through. A valid config always has at least one
+        # agent (load() guarantees default_agent exists in agents), so an empty
+        # set never rejects a legitimate alias.
+        if name and name not in known:
+            return web.json_response(
+                {
+                    "error": f"agent {name!r} is not a configured agent alias",
+                    "code": "default_agent_not_alias",
+                },
+                status=400,
+            )
         path = _h.config_path()
         try:
             data = read_config_for_update(path)
@@ -604,8 +641,17 @@ async def api_agents_installed(request: web.Request) -> web.Response:
     """GET /api/agents/installed — list all installed kiro-cli agents.
 
     kirocrew is always first; kirocrew-lite is excluded.
-    """
 
+    Deliberately GLOBAL-only (no project scope): every frontend consumer of this
+    endpoint is an agent CRUD/editor surface (Agents page, template editor) whose
+    actions persist into the global configuration — "Set as default" writes the
+    selected name into ``cfg.agents``. A project-scope row here would let that
+    action persist a name that exists only inside one checkout, producing a
+    default agent the config cannot resolve. Project-scope discovery instead
+    reaches the surfaces that DISPATCH agents: per-turn resolution
+    (``resolve_agent_bindings(..., project_dir=...)``), spawn validation, and
+    Slack — see ``agent_discovery.project_agent_names``.
+    """
     # list_agents() does glob + per-file resolve(strict=True) + read_bytes +
     # json.loads over ~/.kiro/agents — blocking filesystem work that, on a large
     # agents dir (network home, many project-registry agents), can stall the
@@ -1354,16 +1400,44 @@ async def api_capability_mcp_registry(request: web.Request) -> web.Response:
 
 
 async def api_kirocrew_agents(request: web.Request) -> web.Response:
-    """GET /api/agents — list all KiroCrew agent definitions, most-used first."""
+    """GET /api/agents — list all Kiro Crew agent definitions, most-used first.
+
+    Also surfaces the requesting session's project-scope agents
+    (``<project>/.kiro/agents``, resolved via ``X-Session-Key``) tagged
+    ``scope="project"`` — these dispatch from that slot because kiro-cli runs
+    with the slot's project as cwd, so the picker must offer them (#1684's
+    headline). A config alias of the same name is listed once, as the alias:
+    dispatch resolves aliases first, so the alias is what would answer.
+    """
     cfg = KiroCrewConfig.load()
     agents = [
-        {"name": name, **dataclasses.asdict(agent_cfg)} for name, agent_cfg in cfg.agents.items()
+        {"name": name, "scope": "global", **dataclasses.asdict(agent_cfg)}
+        for name, agent_cfg in cfg.agents.items()
     ]
+
+    state: DashboardState | None = request.app.get("state")
+
+    # Project rows come from a directory scan, so it runs on the discovery
+    # pool — same rule as every other agent listing: no filesystem I/O on the
+    # event loop. Failure costs only the project rows, never the roster.
+    project_dir = active_project_dir(state, _read_session_key(request)) if state else ""
+    if project_dir:
+        try:
+            project_names = await asyncio.get_running_loop().run_in_executor(
+                discovery_executor(), project_agent_names, project_dir
+            )
+        except Exception:
+            logger.warning("Failed to list project agents for %s", project_dir, exc_info=True)
+            project_names = frozenset()
+        base = dataclasses.asdict(KiroCrewAgentConfig())
+        agents.extend(
+            {"name": name, "scope": "project", **base}
+            for name in sorted(project_names - set(cfg.agents.keys()))
+        )
 
     # Reorder by usage frequency (most-used first). Derived read-only from chat
     # history; degrade to config-insertion order on any failure so the dropdown
     # never breaks or drops agents when history is unreadable.
-    state: DashboardState | None = request.app.get("state")
     conversation_log = state.conversation_log if state else None
     if conversation_log:
         try:

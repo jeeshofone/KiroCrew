@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider
 
 from kiro_crew import platform_compat
+from kiro_crew.agent_discovery import cached_project_agent_names, list_agents
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.constants import SUBAGENT_COMPLETION_PREFIX
 from kiro_crew.context import (
@@ -122,17 +123,34 @@ def _safe_fire(coro: Awaitable[None]) -> None:
 _MAX_CONCURRENT = 3
 
 
-def _validate_agent(requested: str) -> tuple[str, str]:
-    """Validate agent name exists in ~/.kiro/agents/.
+def _validate_agent(requested: str, project_dir: str = "") -> tuple[str, str]:
+    """Validate that an agent name is one kiro-cli can actually load.
+
+    Runs ON the event loop (``spawn`` is synchronous), so it must not add
+    filesystem work. The user-level ``list_agents()`` scan here is pre-existing —
+    callers that can validate off-loop skip it via ``_agent_prevalidated`` — and
+    this deliberately does NOT widen it: the project scope is read from
+    ``cached_project_agent_names()``, which performs no syscalls at all.
+
+    Consequence, stated plainly: a project agent is accepted only once that
+    project's cache is warm (any session that has already resolved bindings for it
+    has warmed it). A cold cache means the name is reported unknown, which is
+    fail-closed and matches this function's existing rule — refusing an unknown
+    name rather than silently running the default agent, which would be a
+    privilege escalation. Widening the on-loop scan to a second directory instead
+    would stall the gateway on a slow or network checkout.
+
+    *project_dir* must be the cwd the subagent will actually run in, because that
+    is what kiro-cli resolves ``--agent`` against.
 
     Returns (agent_name, error). If agent found, error is empty.
     If not found, agent_name is empty and error explains what happened.
     """
     if not requested:
         return "", ""
-    from kiro_crew.agent_discovery import list_agents
-
     known = {a.name for a in list_agents()}
+    if project_dir:
+        known |= set(cached_project_agent_names(project_dir) or frozenset())
     if requested in known:
         return requested, ""
     available = sorted(known - {"kirocrew", "kirocrew-conductor"})
@@ -2876,7 +2894,13 @@ class SubagentManager:
         # stalling chat and the heartbeat on a populated agents directory. Only
         # the app path sets it; every other caller still validates inline.
         if agent and not _agent_prevalidated:
-            agent, err = _validate_agent(agent)
+            # Validate against the cwd the subagent will ACTUALLY run in. When no
+            # explicit cwd was given the runtime falls back to the session pool's
+            # cwd, so validating only the explicit value refused a project agent
+            # kiro-cli would have loaded — the same interface asymmetry the project
+            # scope exists to remove, just one layer down.
+            effective_cwd = resolved_cwd or str(getattr(self._sessions, "_pool_cwd", "") or "")
+            agent, err = _validate_agent(agent, effective_cwd)
             if err:
                 info = SubagentInfo(
                     id=agent_id,

@@ -384,7 +384,7 @@ async def test_side_turn_resolves_slot_agent_to_kiro_agent(tmp_path, monkeypatch
     )
     monkeypatch.setattr(
         "kiro_crew.dashboard.handlers.side.resolve_agent_bindings",
-        lambda cfg, agent: MagicMock(kiro_agent="kirocrew"),
+        lambda cfg, agent, project_dir=None: MagicMock(kiro_agent="kirocrew"),
     )
     monkeypatch.setattr(
         "kiro_crew.dashboard.handlers.side.stream_and_collect",
@@ -395,6 +395,54 @@ async def test_side_turn_resolves_slot_agent_to_kiro_agent(tmp_path, monkeypatch
 
     assert captured["agent"] == "kirocrew", (
         f"side turn passed an unresolved agent to get_or_create: " f"{captured.get('agent')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_side_turn_runs_in_the_slot_project_dir(tmp_path, monkeypatch):
+    """The side session is created with ``cwd=slot.project``.
+
+    Regression: the side path resolved project-scope agents (via
+    resolve_agent_bindings with slot.project) but then created the session
+    without a cwd, so kiro-cli — which resolves --agent against
+    $PWD/.kiro/agents — rejected the very mode the resolver just returned.
+    """
+    state = _make_state(tmp_path)
+    _capture_broadcasts(state)
+    parent = state.get_or_create_slot("parent")
+    parent.agent = "default"
+    parent.project = str(tmp_path / "proj")
+    parent._side = SideState(open=True, created_at="2026-01-01T00:00:00Z")
+    parent._side.append_user("q")
+    parent._side.last_run_id = "run-1"
+    parent._side.is_complete = False
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_get_or_create(key, **kwargs):
+        captured["cwd"] = kwargs.get("cwd")
+        return MagicMock(), True, False
+
+    state.sessions.get_or_create = _fake_get_or_create
+    state.sessions.release = MagicMock()
+
+    monkeypatch.setattr(
+        "kiro_crew.dashboard.handlers.side.KiroCrewConfig.load",
+        lambda: MagicMock(),
+    )
+    monkeypatch.setattr(
+        "kiro_crew.dashboard.handlers.side.resolve_agent_bindings",
+        lambda cfg, agent, project_dir=None: MagicMock(kiro_agent="kirocrew"),
+    )
+    monkeypatch.setattr(
+        "kiro_crew.dashboard.handlers.side.stream_and_collect",
+        AsyncMock(return_value="ok"),
+    )
+
+    await _run_side_turn(state, parent, "run-1", "q", is_first_turn=True)
+
+    assert captured["cwd"] == parent.project, (
+        f"side session created without the slot's project cwd: {captured.get('cwd')!r}"
     )
 
 

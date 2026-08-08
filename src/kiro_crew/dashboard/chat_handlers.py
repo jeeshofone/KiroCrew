@@ -21,6 +21,7 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 
 from kiro_crew import model_registry
 from kiro_crew.acp.client import AcpModelUnavailable
+from kiro_crew.agent_discovery import cached_project_agent_names, warm_project_agent_names
 from kiro_crew.config.loader import (
     KiroCrewConfig,
     _workspace_name_for_dir,
@@ -2115,11 +2116,24 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
             # the slot had recorded the alias's workspace. A materialized agent
             # previously matched nothing here at all, so the slot kept the
             # PREVIOUS agent's project — latent until app agents could dispatch.
-            bindings = resolve_agent_bindings(cfg, agent_name)
+            # Resolve WITH the slot's project scope (warmed off-loop first) so a
+            # project agent counts as resolved rather than falling back.
+            await warm_project_agent_names(slot.project or None)
+            bindings = resolve_agent_bindings(cfg, agent_name, slot.project or None)
             ws_name = _workspace_name_for_dir(cfg, bindings.workspace_dir)
             slot.workspace = ws_name
             workspace = ws_name
-            slot.project = default_project_dir(workspace)
+            # A project-scope agent exists only inside slot.project: kiro-cli
+            # resolves --agent against $PWD/.kiro/agents, so resetting the
+            # project here would make the very agent just selected unresolvable
+            # on the next turn (slot advertises it, default answers — the
+            # silent-substitution bug #1684 exists to remove). Aliases keep the
+            # reset: their project comes from their own workspace bindings.
+            is_project_agent = agent_name not in cfg.agents and agent_name in (
+                cached_project_agent_names(slot.project or None) or frozenset()
+            )
+            if not is_project_agent:
+                slot.project = default_project_dir(workspace)
     except Exception:
         logger.warning("Failed to resolve agent bindings for %r", agent_name, exc_info=True)
 
