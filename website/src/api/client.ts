@@ -1460,7 +1460,17 @@ export const api = {
   agentPatch: (name: string, body: object) => fetch('/api/agents/detail/' + encodeURIComponent(name), { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j),
   agentDelete: (name: string) => fetch('/api/agents/detail/' + encodeURIComponent(name), { method: 'DELETE' }).then(j),
   // KiroCrew agents
-  kirocrewAgents: () => fetch('/api/agents').then(j),
+  // sessionKey identifies the CHAT SLOT whose project scope applies. The
+  // server resolves project-local agents through
+  // active_project_dir(state, session_key); with no key it falls back to
+  // "the single project shared by every slot" and fails closed when two
+  // slots sit on different projects, so project-scoped agents silently
+  // vanish from the picker. Surfaces with no slot context (Channels,
+  // Schedule) pass nothing and keep the global-only view.
+  kirocrewAgents: (sessionKey?: string) =>
+    fetch('/api/agents', {
+      headers: sessionKey ? { 'X-Session-Key': sessionKey } : { ..._sk },
+    }).then(j),
   /** The model a new session on this KiroCrew agent would run on. Empty
    *  `agent` resolves the configured default agent. */
   agentResolvedModel: (agent: string) =>

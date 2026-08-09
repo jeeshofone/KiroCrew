@@ -984,7 +984,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     return () => { window.removeEventListener('focus', reload); window.removeEventListener('mc-config-changed', reload) }
   }, [])
 
-  const { agents: installedAgents, defaultAgent } = useAgents(refreshTrigger)
+  const { agents: installedAgents, defaultAgent } = useAgents(refreshTrigger, activeSlot ?? undefined)
   const [defaultAgentFailed, setDefaultAgentFailed] = useState(false)
   // Promotes an agent to the global default. Set-only: clearing the default lives on
   // the Agent Templates page, where the control is labelled and the outcome is visible.

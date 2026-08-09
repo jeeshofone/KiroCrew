@@ -105,7 +105,7 @@ export default function ChatPane({
   // Subscribes to the store's global refresh so a default-agent write in ANY pane (or
   // in single chat) lands here too; a per-hook refresh would leave sibling pickers stale.
   const agentsRefreshTrigger = useAppSelector((s) => s.dashboard.refreshTrigger ?? 0)
-  const { agents: installedAgents, defaultAgent } = useAgents(agentsRefreshTrigger)
+  const { agents: installedAgents, defaultAgent } = useAgents(agentsRefreshTrigger, slotKey)
   const navigate = useNavigate()
   const [defaultAgentFailed, setDefaultAgentFailed] = useState(false)
   // Same contract as ChatPage: set-only, clearing lives on the Templates page.
