@@ -1301,6 +1301,7 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                                 f,
                                 state,
                                 list(patch_body["skills"]),
+                                _read_session_key(request),
                             )
                             if unknown:
                                 return web.json_response(
@@ -1309,7 +1310,12 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                                 )
                         else:
                             mapped = await loop.run_in_executor(
-                                discovery_executor(), agent_skill_keys, data, f, state
+                                discovery_executor(),
+                                agent_skill_keys,
+                                data,
+                                f,
+                                state,
+                                _read_session_key(request),
                             )
                         if "model" in patch_body:
                             # Stored verbatim (canonical key); translated to a
@@ -1341,7 +1347,12 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                 # (kiro-cli rejects unknown fields and drops the agent). One
                 # catalog walk for both, off the event loop (filesystem-heavy).
                 keys, unmanaged_uris = await asyncio.get_running_loop().run_in_executor(
-                    discovery_executor(), agent_skill_views, data, f, state
+                    discovery_executor(),
+                    agent_skill_views,
+                    data,
+                    f,
+                    state,
+                    _read_session_key(request),
                 )
                 return web.json_response(
                     {
