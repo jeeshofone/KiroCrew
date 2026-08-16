@@ -1108,22 +1108,37 @@ def _emit_mcp_oauth_request(
         )
         return
     if oauth_url_contains_credential(oauth_url):
-        # Legitimate OAuth consent URLs carry state/code_challenge/client_id —
-        # never AKIA*/Bearer/etc.  Surface this so the user can ask the server
-        # owner to fix it instead of just seeing nothing happen.
+        # Two distinct causes reach this branch and the user cannot tell them
+        # apart from the banner alone:
+        #   1. A genuinely bogus URL — legitimate OAuth consent URLs carry
+        #      state/code_challenge/client_id, never AKIA*/Bearer/etc.
+        #   2. A legitimate consent URL at an endpoint outside
+        #      ``_OAUTH_AUTHORIZATION_ENDPOINTS``. The PKCE entropy carve-out
+        #      applies only at an approved (host, path), so an unlisted
+        #      self-hosted IdP has its ``code_challenge`` scanned as a bare
+        #      secret and fails closed.
+        # Case 2 has a remedy (the ``oauth_endpoints.json`` operator keystone,
+        # see security._load_operator_oauth_endpoints) but it is agent-fenced
+        # with no dashboard writer, so naming it here is the only way the user
+        # learns it exists. Without this the failure reads as unfixable.
         logger.warning(
             "ACP: rejecting MCP OAuth URL with credential/exfil pattern for %s",
             server_name or "(unknown)",
         )
         slot.append(
             "mcp_oauth",
-            f"🚫 {label} sent an authentication URL containing a credential pattern (rejected).",
+            f"🚫 {label} sent an authentication URL containing a credential "
+            "pattern (rejected). If this is a self-hosted or otherwise "
+            "unlisted identity provider, its authorization endpoint may need "
+            "adding to oauth_endpoints.json in the Kiro Crew data home; "
+            "otherwise ask the server owner to fix the URL.",
             "msg msg-warn",
             meta={
                 "server_name": safe_name,
                 "failed": True,
                 "rejected_url": True,
                 "error": "URL contained credential or exfiltration pattern",
+                "remedy": "oauth_endpoints.json",
             },
         )
         return

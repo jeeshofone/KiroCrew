@@ -188,6 +188,34 @@ class TestEmitMcpOAuthRequest:
         assert "AKIAIOSFODNN7EXAMPLE" not in m["content"]
         assert "credential" in m["meta"].get("error", "")
 
+    def test_rejection_banner_names_the_operator_remedy(self):
+        """A rejected URL must name ``oauth_endpoints.json``.
+
+        The endpoint allowlist means a legitimate consent URL at an unlisted
+        self-hosted IdP lands in this same branch, and its remedy — the
+        operator keystone extension — is agent-fenced with no dashboard
+        writer and is documented only in an internal spec. If the banner does
+        not name it, the failure is indistinguishable from unfixable: two
+        users independently root-caused this from source (#3310) rather than
+        finding the one-line config fix.
+        """
+        slot = _ChatSlot("s1")
+        state = MagicMock()
+        _emit_mcp_oauth_request(
+            state,
+            slot,
+            "self-hosted",
+            "https://evil.com/auth?key=AKIAIOSFODNN7EXAMPLE",
+        )
+        m = slot.messages[0]
+        assert "oauth_endpoints.json" in m["content"]
+        assert m["meta"]["remedy"] == "oauth_endpoints.json"
+        # The remedy hint must not soften the rejection itself.
+        assert m["meta"]["failed"] is True
+        assert m["meta"]["rejected_url"] is True
+        assert "oauth_url" not in m["meta"]
+        assert "AKIAIOSFODNN7EXAMPLE" not in m["content"]
+
     def test_accepts_real_github_oauth_pkce_url(self):
         """Regression: a legitimate GitHub OAuth + PKCE consent URL must be
         rendered, not rejected.  These URLs carry high-entropy params
