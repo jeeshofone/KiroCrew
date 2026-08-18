@@ -214,6 +214,8 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
     new_slot.reasoning_effort = slot.reasoning_effort
     # Inherit project folder so the fork appears next to its parent in the sidebar.
     new_slot.folder_id = slot.folder_id
+    # Inherit tags (copied, so later edits to either slot's list stay independent).
+    new_slot.tags = list(slot.tags)
     parent_title = slot.title if slot._titled else "Untitled"
     parent_title, _ = redact_exfiltration_urls(parent_title)
     parent_title, _ = redact_credentials(parent_title)

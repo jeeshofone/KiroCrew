@@ -10029,6 +10029,44 @@ class TestForkSlot:
         assert new_slot.folder_id == ""
 
     @pytest.mark.asyncio
+    async def test_fork_inherits_tags(self, tmp_path):
+        """Fork must carry the source slot's assigned tag ids."""
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("src")
+        slot.tags = ["tag-a", "tag-b"]
+        slot.append("user", "hi", "msg msg-u")
+        slot.drain()
+
+        app = _make_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/chat/slots/src/fork", json={})
+            assert resp.status == 200
+            data = await resp.json()
+
+        new_slot = state._slots.get(data["key"])
+        assert new_slot is not None
+        assert new_slot.tags == ["tag-a", "tag-b"]
+        # Copied, not aliased: mutating the fork's list must not touch the parent.
+        new_slot.tags.append("tag-c")
+        assert slot.tags == ["tag-a", "tag-b"]
+
+    @pytest.mark.asyncio
+    async def test_fork_inherits_empty_tags(self, tmp_path):
+        """Fork of an untagged slot stays untagged."""
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("src")
+        slot.append("user", "hi", "msg msg-u")
+        slot.drain()
+
+        app = _make_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/chat/slots/src/fork", json={})
+            data = await resp.json()
+
+        new_slot = state._slots.get(data["key"])
+        assert new_slot.tags == []
+
+    @pytest.mark.asyncio
     async def test_fork_with_prompt(self, tmp_path):
         state = _make_state(tmp_path)
         slot = state.get_or_create_slot("src")
