@@ -11223,6 +11223,41 @@ class TestForkSlot:
         assert new_slot.folder_id == ""
 
     @pytest.mark.asyncio
+    async def test_fork_inherits_project(self, tmp_path):
+        """Fork must carry the source slot's active project directory."""
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("src")
+        slot.project = str(tmp_path / "repo")
+        slot.append("user", "hi", "msg msg-u")
+        slot.drain()
+
+        app = _make_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/chat/slots/src/fork", json={})
+            assert resp.status == 200
+            data = await resp.json()
+
+        new_slot = state._slots.get(data["key"])
+        assert new_slot is not None
+        assert new_slot.project == str(tmp_path / "repo")
+
+    @pytest.mark.asyncio
+    async def test_fork_inherits_empty_project(self, tmp_path):
+        """Fork of a projectless slot stays projectless."""
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("src")
+        slot.append("user", "hi", "msg msg-u")
+        slot.drain()
+
+        app = _make_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/chat/slots/src/fork", json={})
+            data = await resp.json()
+
+        new_slot = state._slots.get(data["key"])
+        assert new_slot.project == ""
+
+    @pytest.mark.asyncio
     async def test_fork_inherits_tags(self, tmp_path):
         """Fork must carry the source slot's assigned tag ids."""
         state = _make_state(tmp_path)
