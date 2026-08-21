@@ -1,10 +1,10 @@
+import { isValidLoopbackReturnAddress } from '../utils/loopbackReturnAddress'
 import { describe, expect, it } from 'vitest'
 import type { ChatMessage, McpServer } from '../types'
 import {
   connectionStateFor,
   disconnectFeedback,
   effectiveOAuth,
-  isValidLoopbackReturnAddress,
   latestOAuthByServer,
   mintOutcome,
   uninstallOnCancel,
@@ -302,15 +302,18 @@ describe('disconnect feedback', () => {
 })
 
 describe('loopback OAuth return-address validation', () => {
-  it('accepts only an IP-literal loopback callback with a port and code', () => {
+  it('accepts the loopback host set the backend admits, with a port and code', () => {
     expect(isValidLoopbackReturnAddress('http://127.0.0.1:43123/?code=one-time&state=s')).toBe(true)
     expect(isValidLoopbackReturnAddress('http://[::1]:43123/callback?code=one-time')).toBe(true)
+    // kiro-cli's callback URL can be localhost-shaped; the backend accepts it,
+    // so the client pre-check must not reject the exact paste the flow needs.
+    expect(isValidLoopbackReturnAddress('http://localhost:43123/?code=one-time')).toBe(true)
   })
 
   it.each([
     'https://127.0.0.1:43123/?code=x',
-    'http://localhost:43123/?code=x',
     'http://10.0.0.5:43123/?code=x',
+    'http://example.com:43123/?code=x',
     'http://127.0.0.1/?code=x',
     'http://127.0.0.1:43123/',
     'http://user@127.0.0.1:43123/?code=x',

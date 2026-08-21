@@ -7815,7 +7815,15 @@
         "authenticated": "authentifiziert.",
         "authentication_failed": "Authentifizierung fehlgeschlagen",
         "authorize": "Autorisieren",
+        "code_delivered": "Code übermittelt — Verbindung wird abgeschlossen …",
+        "complete_connection": "Verbindung abschließen",
+        "delivery_timeout": "Die Verbindung wurde nicht abgeschlossen. Klicke auf „Autorisieren“ für einen neuen Versuch.",
         "mcp_server": "MCP-Server",
+        "relay_disclosure": "Hat der Browser nach der Autorisierung einen Verbindungsfehler angezeigt?",
+        "relay_failed": "Die Verbindung konnte über diese Adresse nicht abgeschlossen werden. Prüfe, ob es die vollständige URL ist, auf der der Browser gelandet ist, und versuche es erneut.",
+        "relay_superseded": "Diese Autorisierung ist nicht mehr aktiv. Klicke auf „Autorisieren“, um neu zu beginnen.",
+        "relaying": "Wird abgeschlossen…",
+        "remote_gateway_hint": "Auf einem entfernten Gateway schlägt der localhost-Callback des Browsers fehl — das ist zu erwarten. Kopiere die vollständige Adresse, auf der der Browser gelandet ist, und füge sie hier ein, um die Autorisierung abzuschließen.",
         "requires_authentication": "erfordert Authentifizierung."
       },
       "notificationItem": {

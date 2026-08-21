@@ -7713,7 +7713,15 @@
         "authenticated": "인증되었습니다.",
         "authentication_failed": "인증에 실패했습니다",
         "authorize": "인증",
+        "code_delivered": "코드가 전달되었습니다 — 연결을 완료하는 중…",
+        "complete_connection": "연결 완료",
+        "delivery_timeout": "연결이 완료되지 않았습니다. 인증을 클릭하여 새로 시도하세요.",
         "mcp_server": "MCP 서버",
+        "relay_disclosure": "인증 후 브라우저에 연결 오류가 표시되었나요?",
+        "relay_failed": "해당 주소에서 연결을 완료할 수 없습니다. 브라우저가 도달한 전체 URL이 맞는지 확인한 후 다시 시도하세요.",
+        "relay_superseded": "이 승인은 더 이상 유효하지 않습니다. 인증을 클릭하여 다시 시작하세요.",
+        "relaying": "완료 중…",
+        "remote_gateway_hint": "원격 게이트웨이에서는 브라우저의 localhost 콜백이 실패합니다 — 정상적인 동작입니다. 브라우저가 도달한 전체 주소를 복사해 여기에 붙여넣어 인증을 완료하세요.",
         "requires_authentication": "인증이 필요합니다."
       },
       "notificationItem": {

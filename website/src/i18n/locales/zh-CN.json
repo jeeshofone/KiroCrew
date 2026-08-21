@@ -7713,7 +7713,15 @@
         "authenticated": "已认证。",
         "authentication_failed": "认证失败",
         "authorize": "授权",
+        "code_delivered": "授权码已送达——正在完成连接…",
+        "complete_connection": "完成连接",
+        "delivery_timeout": "连接未完成。请点击“授权”重新尝试。",
         "mcp_server": "MCP 服务器",
+        "relay_disclosure": "授权后浏览器显示连接错误？",
+        "relay_failed": "无法通过该地址完成连接。请确认它是浏览器最终到达的完整 URL，然后重试。",
+        "relay_superseded": "此授权已失效。请点击“授权”重新开始。",
+        "relaying": "正在完成…",
+        "remote_gateway_hint": "在远程网关上，浏览器的 localhost 回调会失败——这是预期行为。请复制浏览器最终到达的完整地址并粘贴到此处，以完成授权。",
         "requires_authentication": "需要认证。"
       },
       "notificationItem": {

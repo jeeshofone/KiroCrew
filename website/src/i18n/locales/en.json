@@ -5289,6 +5289,14 @@
         "authenticated": "authenticated.",
         "authentication_failed": "authentication failed",
         "authorize": "Authorize",
+        "code_delivered": "Code delivered — completing the connection…",
+        "complete_connection": "Complete connection",
+        "delivery_timeout": "The connection did not complete. Click Authorize to start a fresh attempt.",
+        "relay_disclosure": "Browser showed a connection error after authorizing?",
+        "relay_failed": "Could not complete the connection from that address. Check it is the full URL the browser landed on, then try again.",
+        "relay_superseded": "This authorization is no longer active. Click Authorize to start fresh.",
+        "relaying": "Completing…",
+        "remote_gateway_hint": "On a remote gateway the browser's localhost callback will fail — that is expected. Copy the full address the browser landed on and paste it here to finish authorizing.",
         "requires_authentication": "requires authentication."
       },
       "notificationItem": {

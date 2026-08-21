@@ -72,24 +72,9 @@ function safeApprovalUrl(value: string): string {
   }
 }
 
-/** Accept only the loopback redirect shape produced by the runtime callback. */
-export function isValidLoopbackReturnAddress(value: string): boolean {
-  try {
-    const url = new URL(value.trim())
-    const loopback = url.hostname === '127.0.0.1' || url.hostname === '[::1]' || url.hostname === '::1'
-    const codes = url.searchParams.getAll('code')
-    return url.protocol === 'http:'
-      && loopback
-      && url.port !== ''
-      && url.username === ''
-      && url.password === ''
-      && url.hash === ''
-      && codes.length === 1
-      && codes[0] !== ''
-  } catch {
-    return false
-  }
-}
+// The loopback pre-check lives in `utils/loopbackReturnAddress` (shared with
+// the chat banner's relay affordance).
+import { isValidLoopbackReturnAddress } from '../../utils/loopbackReturnAddress'
 
 export interface PendingConnect {
   kind: 'new' | 'reconnect'

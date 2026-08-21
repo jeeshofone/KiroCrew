@@ -7917,7 +7917,15 @@
         "authenticated": "autenticato.",
         "authentication_failed": "autenticazione non riuscita",
         "authorize": "Autorizza",
+        "code_delivered": "Codice consegnato — completamento della connessione…",
+        "complete_connection": "Completa la connessione",
+        "delivery_timeout": "La connessione non è stata completata. Fai clic su «Autorizza» per un nuovo tentativo.",
         "mcp_server": "Server MCP",
+        "relay_disclosure": "Il browser ha mostrato un errore di connessione dopo l'autorizzazione?",
+        "relay_failed": "Impossibile completare la connessione da quell'indirizzo. Verifica che sia l'URL completo su cui è arrivato il browser, poi riprova.",
+        "relay_superseded": "Questa autorizzazione non è più attiva. Fai clic su «Autorizza» per ricominciare.",
+        "relaying": "Completamento…",
+        "remote_gateway_hint": "Su un gateway remoto il callback localhost del browser fallirà: è previsto. Copia l'indirizzo completo su cui è arrivato il browser e incollalo qui per completare l'autorizzazione.",
         "requires_authentication": "richiede l'autenticazione."
       },
       "notificationItem": {

@@ -7713,7 +7713,15 @@
         "authenticated": "認証されました。",
         "authentication_failed": "認証に失敗しました",
         "authorize": "認証",
+        "code_delivered": "コードを送信しました — 接続を完了しています…",
+        "complete_connection": "接続を完了",
+        "delivery_timeout": "接続が完了しませんでした。「認証」をクリックして新しく試してください。",
         "mcp_server": "MCP サーバー",
+        "relay_disclosure": "認証後にブラウザーに接続エラーが表示されましたか？",
+        "relay_failed": "そのアドレスから接続を完了できませんでした。ブラウザーが最終的に到達した完全なURLであることを確認して、もう一度お試しください。",
+        "relay_superseded": "この承認は無効になりました。「認証」をクリックしてやり直してください。",
+        "relaying": "完了しています…",
+        "remote_gateway_hint": "リモートゲートウェイでは、ブラウザーのlocalhostコールバックは失敗します — これは想定どおりです。ブラウザーが到達した完全なアドレスをコピーしてここに貼り付け、認可を完了してください。",
         "requires_authentication": "には認証が必要です。"
       },
       "notificationItem": {

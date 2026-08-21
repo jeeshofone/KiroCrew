@@ -11,6 +11,7 @@ from aiohttp import web
 
 from kiro_crew.connections import get_provider
 from kiro_crew.connections.registry import Provider
+from kiro_crew.dashboard.handlers.mcp import _is_valid_mcp_name
 from kiro_crew.sel import sel
 
 _MAX_RETURN_ADDRESS_BYTES = 8192
@@ -163,12 +164,25 @@ async def api_mcp_oauth_relay(request: web.Request) -> web.Response:
     if not isinstance(body, dict):
         return _bad_request("request body must be an object", "invalid_request_body")
 
+    # The relay only DELIVERS an already-minted authorization code to the
+    # loopback listener that minted it; it never mints one. That listener and its
+    # PKCE verifier belong to a specific pending kiro-cli OAuth flow regardless of
+    # whether the server is a curated Connections provider or a user-added /
+    # self-hosted one (issue #4491, the #4008 population). So relay membership is
+    # NOT gated on the Connections registry — every safety property here is
+    # provider-independent: the return address must target the gateway's own
+    # loopback listener (_validated_loopback_return_address), and a port nothing is
+    # bound to is reported as a spent approval (_NoListener). The name is
+    # validated with the SAME shape user-added servers pass at add time
+    # (_is_valid_mcp_name: bounded length, safe charset, traversal rejected) so a
+    # server the add path accepted — `myServer`, `@org/tools` — can also relay,
+    # while staying a safe, bounded SEL audit label rather than
+    # attacker-controlled log content. The registry-slug shape stays on the MINT
+    # path only (_requested_provider). This is deliberately distinct from
+    # generalising the MINT to uncurated URLs, which is parked decision #4286 and
+    # untouched here.
     server = body.get("server")
-    if (
-        not isinstance(server, str)
-        or not _SERVER_SLUG_RE.fullmatch(server)
-        or get_provider(server) is None
-    ):
+    if not isinstance(server, str) or not _is_valid_mcp_name(server):
         return _bad_request("invalid server", "invalid_server")
     callback = _validated_loopback_return_address(body.get("redirect_url"))
     if callback is None:
