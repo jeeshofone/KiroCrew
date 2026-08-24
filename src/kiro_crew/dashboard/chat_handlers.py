@@ -62,6 +62,7 @@ from kiro_crew.dashboard.chat_runner import (
     schedule_eager_spawn,
 )
 from kiro_crew.dashboard.chat_summary import generate_session_summary
+from kiro_crew.dashboard.chat_tags import tags_write_lock, validate_folder_tag_ids
 from kiro_crew.dashboard.chat_title import _maybe_auto_title
 from kiro_crew.dashboard.chat_utils import (
     _MANUAL_CONTINUE_MSG,
@@ -2050,6 +2051,16 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
         except Exception:
             logger.warning("Failed to resolve bindings for slot create", exc_info=True)
 
+    # Whether this request will MINT a genuinely new slot, decided before
+    # get_or_create_slot runs. `name` can address an already-open slot (the
+    # handler is also the rehydrate/reopen path), which returns unchanged — and
+    # folder-tag inheritance must fire ONLY for a fresh chat, never re-stamp
+    # tags onto a session the user is merely re-opening inside the folder.
+    # Computed on the normalized key, which is the key the slot store is built
+    # from; an omitted (or degenerate) name is always a mint.
+    _requested_key = _normalize_slot_key(str(name)) if name else ""
+    is_new_slot = not _requested_key or _requested_key not in state._slots
+
     # Coalesce every push inside into ONE broadcast at exit, so the first frame
     # any client sees already carries the folder, title, artifact binding and
     # project. Otherwise each of those is a separate post-create correction the
@@ -2181,6 +2192,40 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                 slot._folder_changed = previous_changed
             else:
                 folder_applied = True
+                if is_new_slot:
+                    # Folder-tag inheritance, creation-only (issue #5419). A brand-new
+                    # chat filed into a folder copies that folder's tags by value onto
+                    # its own tag list — the folder's tags are an organizational
+                    # default for chats started inside it. Follows chat_fork.py's
+                    # copy-by-value style.
+                    #
+                    # Gated on is_new_slot so re-opening an existing session inside
+                    # the folder never re-stamps tags, and confirmed only after
+                    # _unhide_folder reported the folder EXISTS (its read is under the
+                    # store lock, the only race-free place to look it up). Direct
+                    # folder only: no ancestor/subfolder transitivity. Ids are
+                    # re-validated against the live vocabulary and appended only when
+                    # not already present, so a stale id on the folder is dropped
+                    # rather than written onto the slot.
+                    def _read_folder_tags(folders: list[dict[str, Any]]) -> list[str]:
+                        f = next((x for x in folders if x["id"] == folder_id), None)
+                        tags = f.get("tags") if f else None
+                        return list(tags) if isinstance(tags, list) else []
+
+                    # One shared definition of "an inheritable folder tag id"
+                    # (string, in the live vocabulary) — see validate_folder_tag_ids
+                    # for why each guard exists. The READ, the intersection AND the
+                    # apply all sit under tags_write_lock (the invariant every
+                    # consumer follows, matching the channel-filing path): a folder
+                    # PATCH or tag deletion committing after an earlier read would
+                    # otherwise stamp a stale tag set or resurrect a deleted id onto
+                    # the new slot. Lock ordering (tags_write_lock → folder-store
+                    # lock) matches the folder create/PATCH paths.
+                    async with tags_write_lock(state):
+                        inherited = await state.read_folders(_read_folder_tags)
+                        for tid in validate_folder_tag_ids(inherited, state):
+                            if tid not in slot.tags:
+                                slot.tags.append(tid)
         # A slot with no project filed into a project-linked folder inherits
         # from the nearest configured ancestor before its first broadcast. The
         # server owns this fallback because the client folder cache can be

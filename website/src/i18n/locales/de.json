@@ -5801,6 +5801,12 @@
       "save_changes": "Änderungen speichern",
       "save_failed": "Der Ordner konnte nicht gespeichert werden.",
       "set_color_to_name": "Farbe auf {{name}} setzen",
+      "tags": "Tags",
+      "tags_hint": "Werden auf jeden neuen Chat in diesem Ordner angewendet. Unterordner erben sie nicht.",
+      "tags_empty_hint": "Noch keine Tags — erstellen Sie sie über das Tag-Menü eines Chats und wählen Sie sie hier aus, um neue Chats in diesem Ordner automatisch zu taggen.",
+      "tags_loading_hint": "Tags werden geladen…",
+      "tags_error_hint": "Tags konnten nicht geladen werden.",
+      "tags_retry": "Erneut versuchen",
       "top_level": "Oberste Ebene"
     },
     "folderSuggestionCard": {

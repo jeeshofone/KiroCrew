@@ -55,6 +55,62 @@ _T = TypeVar("_T")
 _TAGS_WRITE_LOCKS: weakref.WeakKeyDictionary[Any, LoopBoundLock] = weakref.WeakKeyDictionary()
 
 
+def validate_folder_tag_ids(raw: Any, state: DashboardState) -> list[str]:
+    """Filter a folder's raw ``tags`` value down to usable tag ids.
+
+    The definition of "a folder tag id a new chat may inherit" for the
+    folder/inheritance paths, shared by the dashboard slot-create path
+    (chat_handlers), the folder create/PATCH validation (chat_folders), the
+    channel first-filing path, and the channel restore read (channel_slots)
+    so an inheritance-rule change cannot land on one path and miss the
+    others. (Three pre-existing slot-restore prunes elsewhere apply the same
+    shape guards inline, and ``api_chat_slot_tags``'s strict inline filter is
+    a fourth spelling differing only on the fail-open axis; consolidating all
+    four onto this helper — likely via a strict-mode flag — is deliberately
+    left to a follow-up. Those sites are outside this change.)
+    Callers must invoke it AT THE POINT OF APPLICATION (immediately before the
+    ids are written to a slot or persisted), never on a value resolved
+    earlier — a tag deletion between resolve and apply would otherwise
+    resurrect the deleted id.
+
+    Two guard tiers, deliberately different in when they apply:
+
+    * UNCONDITIONAL shape guards — ``raw`` must be a list (``folders.json``
+      is hand-editable; anything else yields ``[]``), and each entry must be
+      a string BEFORE the membership test (a non-string entry is unhashable
+      and the test itself would raise, turning a malformed store row into a
+      500 on every chat created in that folder). Order-preserving,
+      de-duplicated.
+    * AUTHORITY-GATED vocabulary intersection — ids are checked against the
+      live vocabulary (``state._tags``) only when it is authoritative,
+      mirroring the three sibling restore paths (``_tags_authoritative`` is
+      False when ``tags.json`` was unreadable at boot). Failing OPEN there is
+      load-bearing: intersecting with an unknown (empty) vocabulary would
+      drop every id, the next save would persist the loss, and the sticky
+      filing marker would block re-inheritance forever. A dangling id kept
+      this way is pruned by the restore paths on the next authoritative boot.
+    """
+    if not isinstance(raw, list):
+        return []
+    check_vocab = getattr(state, "_tags_authoritative", True)
+    # Only string ids enter the vocabulary set: a malformed persisted entry
+    # (e.g. a hand-edited tags.json with a list/dict id) must degrade to
+    # "unknown id" — not crash the set build with an unhashable type.
+    valid_ids = (
+        {i for t in state._tags if isinstance(i := t.get("id"), str)} if check_vocab else None
+    )
+    out: list[str] = []
+    seen: set[str] = set()
+    for tid in raw:
+        if not isinstance(tid, str) or tid in seen:
+            continue
+        if valid_ids is not None and tid not in valid_ids:
+            continue
+        seen.add(tid)
+        out.append(tid)
+    return out
+
+
 def _tags_write_lock(state: Any) -> LoopBoundLock:
     """Return (lazily create) the per-state lock for tag writes (loop-bound, #4800)."""
     lock = _TAGS_WRITE_LOCKS.get(state)
@@ -361,6 +417,33 @@ async def api_chat_tag_delete(request: web.Request) -> web.Response:
                         getattr(slot, "key", "?"),
                         exc_info=True,
                     )
+
+        # ── Best-effort cleanup: strip the deleted id from folders ───────
+        # A folder can carry tags (copied onto new chats filed into it); the
+        # deleted id must not linger there. Best-effort like the slot strip:
+        # mutate_folders takes its own store lock (distinct from the tag-write
+        # lock held here, so no re-entrancy), and a failure leaves a dangling id
+        # that the next folder load ignores. The callback returns
+        # (changed, None) so the store is rewritten only when something changed.
+        def _strip_folder_tag(folders: list[dict]) -> tuple[bool, None]:
+            changed = False
+            for f in folders:
+                tags = f.get("tags")
+                if isinstance(tags, list) and tid in tags:
+                    stripped = [t for t in tags if t != tid]
+                    if stripped:
+                        f["tags"] = stripped
+                    else:
+                        # Empty clears the key, holding "absent means no tags".
+                        f.pop("tags", None)
+                    changed = True
+            return changed, None
+
+        try:
+            await state.mutate_folders(_strip_folder_tag)
+        except Exception:
+            # Dangling folder reference — pruned on next load.
+            logger.warning("tag delete: folder strip persist failed for %s", tid, exc_info=True)
 
         # Strip from sidebar columns (flat list of column dicts).
         changed_boards = False

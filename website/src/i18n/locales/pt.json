@@ -5900,6 +5900,12 @@
       "save_changes": "Salvar alterações",
       "save_failed": "Não foi possível salvar a pasta.",
       "set_color_to_name": "Definir cor como {{name}}",
+      "tags": "Tags",
+      "tags_hint": "Aplicadas a cada novo chat criado nesta pasta. As subpastas não as herdam.",
+      "tags_empty_hint": "Ainda não há tags — crie-as no menu de tags de um chat e selecione-as aqui para marcar automaticamente os novos chats criados nesta pasta.",
+      "tags_loading_hint": "Carregando tags…",
+      "tags_error_hint": "Não foi possível carregar as tags.",
+      "tags_retry": "Tentar novamente",
       "top_level": "Nível superior"
     },
     "folderSuggestionCard": {

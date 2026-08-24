@@ -3104,12 +3104,21 @@ function ChatSidebar({
   const { data: folders = [], isSuccess: foldersLoaded } = useQuery<ChatFolder[]>({ queryKey: ['chat-folders'], queryFn: () => api.chatFolders() })
 
   // Tags via React Query (dynamic vocabulary, defaults seeded server-side).
-  // The fallback is the module-level NO_TAGS constant, NOT a `= []` literal: a
-  // destructuring default mints a fresh array on every render for as long as
-  // the query has no data (loading, error, test stores), which would rebuild
-  // `tagById` each time and hand every memoized SessionRow a changed prop —
-  // silently voiding the row memo boundary the render-probe test pins.
-  const { data: tags = NO_TAGS } = useQuery<ChatTag[]>({ queryKey: ['chat-tags'], queryFn: () => api.chatTags() })
+  // `tagsData` stays undefined until the query resolves — FolderConfigModal
+  // needs that distinction (unknown vocabulary must not be treated as empty,
+  // or a modal opened mid-load would seed a partial tag list and a save would
+  // silently delete the folder's existing tags). The resolved `tags` fallback
+  // is the module-level NO_TAGS constant, NOT a `?? []` literal: a fresh array
+  // minted on every render while the query has no data would rebuild `tagById`
+  // each time and hand every memoized SessionRow a changed prop — silently
+  // voiding the row memo boundary the render-probe test pins.
+  const { data: tagsData, isError: tagsQueryFailed, refetch: refetchTags } = useQuery<ChatTag[]>({ queryKey: ['chat-tags'], queryFn: () => api.chatTags() })
+  const tags = tagsData ?? NO_TAGS
+  // A FAILED chat-tags query never self-heals (staleTime Infinity, freshness
+  // is WS-driven), so recovery is the user-driven inline Retry in the folder
+  // modal's error line (`onRetryTags` → `refetchTags`). No automatic retry
+  // fires on modal open — a background attempt against a down endpoint only
+  // duplicates the button and needs its own loop guard to exist safely.
   const tagById = useMemo(() => {
     const m: Record<string, ChatTag> = {}
     for (const t of tags) m[t.id] = t
@@ -3894,11 +3903,12 @@ function ChatSidebar({
 
   // Folder mutations
   const createFolderMutation = useMutation({
-    mutationFn: (v: { name: string; parentId?: string; projectDir?: string; defaultAgent?: string; color?: string }) =>
+    mutationFn: (v: { name: string; parentId?: string; projectDir?: string; defaultAgent?: string; color?: string; tags?: string[] }) =>
       api.createChatFolder(v.name.trim(), v.parentId, {
         project_dir: v.projectDir || undefined,
         default_agent: v.defaultAgent || undefined,
         color: v.color || undefined,
+        tags: v.tags && v.tags.length > 0 ? v.tags : undefined,
       }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['chat-folders'] }),
   })
@@ -6483,6 +6493,9 @@ function ChatSidebar({
           folders={folders}
           installedAgents={installedAgents}
           globalDefaultAgent={defaultAgent}
+          availableTags={tagsData}
+          availableTagsFailed={tagsQueryFailed}
+          onRetryTags={() => { void refetchTags() }}
           onClose={() => setFolderModal(null)}
           onSubmit={async draft => {
             // AWAIT the mutation and only close on success. The backend rejects a
@@ -6497,6 +6510,7 @@ function ChatSidebar({
                 projectDir: draft.projectDir,
                 defaultAgent: draft.defaultAgent,
                 color: draft.color,
+                tags: draft.tags,
               })
             } else {
               // Build the PATCH from what the USER edited (draft.touched, measured
@@ -6510,6 +6524,9 @@ function ChatSidebar({
               if (touched.has('defaultAgent')) body.default_agent = draft.defaultAgent
               // '' is a legitimate color instruction: it clears back to gray.
               if (touched.has('color')) body.color = draft.color
+              // An empty array is a legitimate instruction too: it clears the
+              // folder's tags.
+              if (touched.has('tags')) body.tags = draft.tags
               if (Object.keys(body).length > 0) {
                 await updateFolderMutation.mutateAsync({ id: folderModal.folderId, body })
               }

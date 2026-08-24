@@ -5900,6 +5900,12 @@
       "save_changes": "Salva modifiche",
       "save_failed": "Impossibile salvare la cartella.",
       "set_color_to_name": "Imposta il colore su {{name}}",
+      "tags": "Tag",
+      "tags_hint": "Applicati a ogni nuova chat creata in questa cartella. Le sottocartelle non le ereditano.",
+      "tags_empty_hint": "Nessun tag ancora: creali dal menu tag di una chat, poi selezionali qui per taggare automaticamente le nuove chat create in questa cartella.",
+      "tags_loading_hint": "Caricamento dei tag…",
+      "tags_error_hint": "Impossibile caricare i tag.",
+      "tags_retry": "Riprova",
       "top_level": "Livello principale"
     },
     "folderSuggestionCard": {

@@ -5900,6 +5900,12 @@
       "save_changes": "Enregistrer les modifications",
       "save_failed": "Impossible d’enregistrer le dossier.",
       "set_color_to_name": "Définir la couleur sur {{name}}",
+      "tags": "Étiquettes",
+      "tags_hint": "Appliquées à chaque nouveau chat créé dans ce dossier. Les sous-dossiers n'en héritent pas.",
+      "tags_empty_hint": "Aucune étiquette pour l'instant — créez-les depuis le menu d'étiquettes d'un chat, puis choisissez-les ici pour étiqueter automatiquement les nouveaux chats de ce dossier.",
+      "tags_loading_hint": "Chargement des étiquettes…",
+      "tags_error_hint": "Impossible de charger les étiquettes.",
+      "tags_retry": "Réessayer",
       "top_level": "Niveau supérieur"
     },
     "folderSuggestionCard": {

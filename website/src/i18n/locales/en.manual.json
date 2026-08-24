@@ -1650,6 +1650,12 @@
       "save_changes": "Save changes",
       "save_failed": "Could not save the folder.",
       "set_color_to_name": "Set color to {{name}}",
+      "tags": "Tags",
+      "tags_hint": "Applied to every new chat created in this folder. Subfolders don't inherit.",
+      "tags_empty_hint": "No tags yet — create them from any chat's tag menu, then pick them here to auto-tag new chats created in this folder.",
+      "tags_loading_hint": "Loading tags…",
+      "tags_error_hint": "Tags couldn't load.",
+      "tags_retry": "Retry",
       "top_level": "Top level"
     },
     "folderColorNames": {
