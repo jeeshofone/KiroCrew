@@ -604,7 +604,6 @@ test/test_connections_registry.py
 test/test_connections_tool_aliases.py
 test/test_consolidate_cmd.py
 test/test_consolidation_placeholder_guard.py
-test/test_context.py
 test/test_context_marker_neutralization.py
 test/test_context_ui_language.py
 test/test_continuable_followups.py

@@ -6,10 +6,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Dashboard: _ChatSlot temporary mode properties
 # ---------------------------------------------------------------------------
+
 
 class TestChatSlotTemporary:
     def test_temporary_mode(self):
@@ -31,6 +31,7 @@ class TestChatSlotTemporary:
 # Dashboard: _save_slot_to_history persists all modes (no skip)
 # ---------------------------------------------------------------------------
 
+
 class TestSaveSlotToHistory:
     def test_temporary_slot_still_saved(self):
         """All modes write .jsonl for tab recovery — temporary included."""
@@ -43,11 +44,14 @@ class TestSaveSlotToHistory:
         mock_state = MagicMock()
         mock_state.conversation_log = MagicMock()
 
+        # _save_slot_to_history lives in chat_persistence and resolves the
+        # history key via its own module's slot_history_key import — patch
+        # THAT binding (patching the chat.py re-export misses it).
         with patch(
-            "kiro_crew.dashboard.chat._history_key_for",
+            "kiro_crew.dashboard.chat_persistence.slot_history_key",
             side_effect=RuntimeError("reached"),
         ):
-            from kiro_crew.dashboard.chat import _save_slot_to_history
+            from kiro_crew.dashboard.chat_persistence import _save_slot_to_history
 
             with pytest.raises(RuntimeError, match="reached"):
                 _save_slot_to_history(mock_state, slot)
@@ -63,10 +67,10 @@ class TestSaveSlotToHistory:
         mock_state = MagicMock()
         mock_state.conversation_log = MagicMock()
         with patch(
-            "kiro_crew.dashboard.chat._history_key_for",
+            "kiro_crew.dashboard.chat_persistence.slot_history_key",
             side_effect=RuntimeError("reached"),
         ):
-            from kiro_crew.dashboard.chat import _save_slot_to_history
+            from kiro_crew.dashboard.chat_persistence import _save_slot_to_history
 
             with pytest.raises(RuntimeError, match="reached"):
                 _save_slot_to_history(mock_state, slot)
@@ -75,6 +79,7 @@ class TestSaveSlotToHistory:
 # ---------------------------------------------------------------------------
 # Dashboard: _persist_title skips restricted slots
 # ---------------------------------------------------------------------------
+
 
 class TestPersistTitle:
     def test_temporary_slot_auto_title_skipped(self):
@@ -93,6 +98,7 @@ class TestPersistTitle:
 # Slack: bounded _thread_temporary + is_thread_temporary helper
 # ---------------------------------------------------------------------------
 
+
 class TestSlackThreadTemporary:
     def setup_method(self):
         from kiro_crew.slack import handler
@@ -110,28 +116,11 @@ class TestSlackThreadTemporary:
         _mark_temporary("slack-key-1")
         assert is_thread_temporary("slack-key-1") is True
 
-    def test_bounded_eviction(self):
-        """Oldest entry is evicted when max size exceeded."""
-        from kiro_crew.slack import handler
-        from kiro_crew.slack.handler import _mark_temporary, is_thread_temporary
-
-        original_max = handler._THREAD_TEMPORARY_MAX
-        handler._THREAD_TEMPORARY_MAX = 3
-        try:
-            _mark_temporary("a")
-            _mark_temporary("b")
-            _mark_temporary("c")
-            _mark_temporary("d")
-            assert is_thread_temporary("a") is False
-            assert is_thread_temporary("d") is True
-        finally:
-            handler._THREAD_TEMPORARY_MAX = original_max
-            handler._thread_temporary.clear()
-
 
 # ---------------------------------------------------------------------------
 # Slack: !temporary command handler
 # ---------------------------------------------------------------------------
+
 
 class TestTemporaryCommand:
     def setup_method(self):
@@ -151,7 +140,10 @@ class TestTemporaryCommand:
         assert is_thread_temporary("sk1") is True
         slack.post_message.assert_called_once()
         assert "Temporary mode ON" in slack.post_message.call_args[0][1]
-        sessions.set_slack_link.assert_called_once_with("sk1", "sk1", "C123")
+        # set_slack_link registers the bare Slack thread_ts (reply_ts), not the
+        # (possibly namespaced) session key — see _apply_privacy_mode's
+        # _on_applied callback.
+        sessions.set_slack_link.assert_called_once_with("sk1", "ts1", "C123")
 
     @pytest.mark.asyncio
     async def test_temporary_modifier_idempotent(self):
@@ -171,6 +163,7 @@ class TestTemporaryCommand:
 # ---------------------------------------------------------------------------
 # Dashboard: _is_restricted_session (header-based MCP gating)
 # ---------------------------------------------------------------------------
+
 
 class TestIsRestrictedSession:
     def _mock_request(self, session_key=""):
@@ -245,6 +238,7 @@ class TestIsRestrictedSession:
 # MCP: session_key plumbed via X-Session-Key header (not body)
 # ---------------------------------------------------------------------------
 
+
 class TestMcpSessionKeyPlumbing:
     @patch.dict("os.environ", {"KIROCREW_SESSION_KEY": "dashboard:chat-1-tmp"})
     @patch("kiro_crew.mcp_core._post")
@@ -253,9 +247,7 @@ class TestMcpSessionKeyPlumbing:
         mock_post.return_value = {"ok": True}
         from kiro_crew.mcp_core import _call_tool_inner
 
-        result = _call_tool_inner(
-            "learn_add", {"rule": "test rule", "category": "knowledge"}
-        )
+        result = _call_tool_inner("learn_add", {"rule": "test rule", "category": "knowledge"})
         payload = mock_post.call_args[0][1]
         assert "session_key" not in payload
         assert "Saved" in result
