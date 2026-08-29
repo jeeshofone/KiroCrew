@@ -678,3 +678,69 @@ describe('ChatPanel — About You and Power', () => {
     expect(await screen.findByText(/Failed to save dashboard config/)).toBeInTheDocument()
   })
 })
+
+describe('ChatPanel — optimistic model selection (#6848)', () => {
+  /** A patchConfig that stays pending until `release()` is called. */
+  function pendingPatch() {
+    let release!: () => void
+    patchConfigMock.mockImplementationOnce(
+      () => new Promise(res => { release = () => res({}) }) as never
+    )
+    return () => release()
+  }
+
+  it.each([
+    ['Default Model', 'claude-opus-4.8'],
+    ['Background Model', 'claude-opus-4.8'],
+    ['Subagent Model', 'claude-opus-4.8'],
+    ['Fallback model', 'claude-opus-4.8'],
+  ])('%s shows the picked value immediately, before the PATCH settles', async (label, model) => {
+    const release = pendingPatch()
+    wrap()
+    await waitFor(() => expect(modelsMock).toHaveBeenCalled())
+    await openSelect(label)
+    fireEvent.click(screen.getByRole('option', { name: model }))
+    // The PATCH is still in flight — the trigger must already show the choice.
+    const trigger = screen.getByRole('combobox', { name: label })
+    await waitFor(() => expect(trigger).toHaveTextContent(model))
+    expect(patchConfigMock).toHaveBeenCalledTimes(1)
+    release()
+  })
+
+  it('shows a picked reasoning effort immediately, before the PATCH settles', async () => {
+    seedMc({ agent: { model: 'claude-opus-4.8' } })
+    const release = pendingPatch()
+    wrap()
+    await waitFor(() => expect(modelsMock).toHaveBeenCalled())
+    await openSelect('Default Reasoning Effort')
+    fireEvent.click(screen.getByRole('option', { name: 'High' }))
+    const trigger = screen.getByRole('combobox', { name: 'Default Reasoning Effort' })
+    await waitFor(() => expect(trigger).toHaveTextContent('High'))
+    expect(patchConfigMock).toHaveBeenCalledTimes(1)
+    release()
+  })
+
+  it('rolls the selector back to the server value when the PATCH fails', async () => {
+    rejectOnce(patchConfigMock)
+    wrap()
+    await waitFor(() => expect(modelsMock).toHaveBeenCalled())
+    await openSelect('Default Model')
+    fireEvent.click(screen.getByRole('option', { name: 'claude-haiku-4.5' }))
+    expect(await screen.findByText(/Failed to save default model/)).toBeInTheDocument()
+    const trigger = screen.getByRole('combobox', { name: 'Default Model' })
+    await waitFor(() => expect(trigger).toHaveTextContent('Default (auto)'))
+    expect(trigger).not.toHaveTextContent('claude-haiku-4.5')
+  })
+
+  it('rolls a role model back when the PATCH fails', async () => {
+    seedMc({ agent: { role_models: { background: 'claude-opus-4.8' } } })
+    rejectOnce(patchConfigMock)
+    wrap()
+    await waitFor(() => expect(modelsMock).toHaveBeenCalled())
+    await openSelect('Background Model')
+    fireEvent.click(screen.getByRole('option', { name: 'claude-haiku-4.5' }))
+    expect(await screen.findByText(/Failed to save role model/)).toBeInTheDocument()
+    const trigger = screen.getByRole('combobox', { name: 'Background Model' })
+    await waitFor(() => expect(trigger).toHaveTextContent('claude-opus-4.8'))
+  })
+})
