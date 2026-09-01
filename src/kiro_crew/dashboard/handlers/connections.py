@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 
 _MAX_RETURN_ADDRESS_BYTES = 8192
 _MAX_REQUEST_TARGET_BYTES = 6144
+# RFC 3986 scheme followed by "://". Deliberately requires the "//": a bare
+# "host:port/..." (which urlsplit would misread as scheme + opaque path) must
+# NOT count as having a scheme, so it gets the http:// default (#7406).
+_URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 _SERVER_SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _ALLOWED_CALLBACK_QUERY_KEYS = {
     "authuser",
@@ -51,12 +55,24 @@ def _validated_loopback_return_address(value: object) -> _LoopbackCallback | Non
     The user controls only an unprivileged loopback port and an ASCII HTTP
     request-target containing a single OAuth code.  The network host is selected
     later from fixed literals, so request data can never choose a remote host.
+
+    A paste with no scheme is normalized to ``http://`` first (#7406): mobile
+    browsers — iOS Safari in particular — copy address-bar URLs without the
+    scheme, so the documented paste-back flow otherwise fails on exactly the
+    text the browser gave the user. Prepending a scheme is safe here because
+    every containment constraint below (loopback host literals, port floor,
+    query allowlist) applies to the normalized value; a scheme cannot turn a
+    non-loopback host into a loopback one. The regex also catches the
+    ``urlsplit`` gotcha where ``localhost:8976/...`` parses ``localhost`` as
+    the scheme rather than the host.
     """
     if not isinstance(value, str):
         return None
     candidate = value.strip()
     if not candidate or len(candidate.encode("utf-8")) > _MAX_RETURN_ADDRESS_BYTES:
         return None
+    if not _URL_SCHEME_RE.match(candidate):
+        candidate = f"http://{candidate}"
     try:
         parsed = urlsplit(candidate)
         port = parsed.port

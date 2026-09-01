@@ -83,7 +83,7 @@ function safeApprovalUrl(value: string): string {
 
 // The loopback pre-check lives in `utils/loopbackReturnAddress` (shared with
 // the chat banner's relay affordance).
-import { isValidLoopbackReturnAddress } from '../../utils/loopbackReturnAddress'
+import { isValidLoopbackReturnAddress, normalizeLoopbackReturnAddress } from '../../utils/loopbackReturnAddress'
 import { useImeGuard } from '../../hooks/useImeGuard'
 
 export interface PendingConnect {
@@ -414,12 +414,15 @@ function ConnectionCard({
   }
   const meta = stateMeta[state]
   const runRelay = async () => {
-    if (!isValidLoopbackReturnAddress(returnAddress)) {
+    // Normalize a scheme-less mobile paste (#7406) and submit the normalized
+    // form, mirroring the chat banner's relay affordance.
+    const normalized = normalizeLoopbackReturnAddress(returnAddress)
+    if (!isValidLoopbackReturnAddress(normalized)) {
       setInvalidReturnAddress(true)
       return
     }
     setInvalidReturnAddress(false)
-    const delivered = await onRelay(returnAddress.trim())
+    const delivered = await onRelay(normalized)
     if (delivered) setReturnAddress('')
   }
 
