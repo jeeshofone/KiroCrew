@@ -5833,6 +5833,159 @@ class TestBuildPermissionEvent:
         client._build_permission_event(msg)
         assert client._permission_options[22].get("reject") == "reject_once"
 
+    def test_plain_reject_id_without_kind_recorded(self):
+        """#7681: a deny-naming id with NO kind (plain "reject"/"deny") must be
+        classified as a per-tool reject. Missing it sent reject_tool down the
+        ``cancelled`` fallback, which the backend treats as cancelling the
+        TURN — every later tool call was auto-denied without prompting."""
+        client = AcpClient()
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        for req_id, opt_id in ((24, "reject"), (25, "deny"), (26, "Deny_Once")):
+            msg = JsonRpcMessage(
+                id=req_id,
+                method="session/requestPermission",
+                params={
+                    "toolCall": {"title": "shell"},
+                    "options": [
+                        {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": opt_id, "name": "Deny"},
+                    ],
+                },
+            )
+            client._build_permission_event(msg)
+            assert client._permission_options[req_id].get("reject") == opt_id, opt_id
+
+    def test_every_deny_vocabulary_value_round_trips(self):
+        """Every id in the shared deny table and every deny behavior must be
+        recognized by BOTH classification sites — the event builder (recorded
+        reject option) and the auto-answer path (reject_option_id). Driven by
+        the table itself so a vocabulary addition cannot ship untested."""
+        from kiro_crew.acp._dispatch import (
+            _DENY_BEHAVIORS,
+            _DENY_OPTION_IDS,
+            reject_option_id,
+        )
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        assert _DENY_OPTION_IDS, "derived deny-id table must not be empty"
+        client = AcpClient()
+        req_id = 9000
+        for opt_id in sorted(_DENY_OPTION_IDS):
+            params = {
+                "toolCall": {"title": "shell"},
+                "options": [
+                    {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                    {"optionId": opt_id, "name": "Deny"},
+                ],
+            }
+            # Site 1: auto-answer path picks the deny id.
+            assert reject_option_id(params) == opt_id, opt_id
+            # Site 2: event builder records it as the reject option.
+            req_id += 1
+            client._build_permission_event(
+                JsonRpcMessage(id=req_id, method="session/requestPermission", params=params)
+            )
+            assert client._permission_options[req_id].get("reject") == opt_id, opt_id
+        for behavior in sorted(_DENY_BEHAVIORS):
+            params = {
+                "toolCall": {"title": "shell"},
+                "options": [
+                    {"optionId": "yes", "name": "Allow", "behavior": "allow"},
+                    {"optionId": "custom-no", "name": "Deny", "behavior": behavior},
+                ],
+            }
+            assert reject_option_id(params) == "custom-no", behavior
+            req_id += 1
+            client._build_permission_event(
+                JsonRpcMessage(id=req_id, method="session/requestPermission", params=params)
+            )
+            assert client._permission_options[req_id].get("reject") == "custom-no", behavior
+
+    def test_contradictory_kind_wins_over_deny_metadata(self):
+        """A valid spec `kind` classifies the option ALONE: an option carrying
+        {kind:"allow_once"} with a contradictory deny behavior or deny-naming
+        id must never be selected as the reject — answering with an allow
+        optionId would APPROVE the tool the caller meant to deny."""
+        from kiro_crew.acp._dispatch import reject_option_id
+
+        # behavior:"deny" on an allow-kind option: not a reject candidate.
+        params = {
+            "options": [
+                {"optionId": "yes", "name": "Allow", "kind": "allow_once", "behavior": "deny"},
+            ]
+        }
+        assert reject_option_id(params) is None
+        # deny-naming id on an allow-kind option: not a reject candidate.
+        params = {
+            "options": [
+                {"optionId": "deny", "name": "Allow", "kind": "allow_always"},
+            ]
+        }
+        assert reject_option_id(params) is None
+        # A genuine reject option alongside the contradictory one still wins.
+        params = {
+            "options": [
+                {"optionId": "yes", "name": "Allow", "kind": "allow_once", "behavior": "deny"},
+                {"optionId": "no", "name": "Deny", "behavior": "deny"},
+            ]
+        }
+        assert reject_option_id(params) == "no"
+
+    def test_deny_behavior_without_kind_recorded(self):
+        """#7681: an option that speaks ``behavior: "deny"`` instead of
+        ``kind`` is a per-tool reject whatever its id is called. An allow
+        behavior must never be classified as a reject."""
+        client = AcpClient()
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        msg = JsonRpcMessage(
+            id=27,
+            method="session/requestPermission",
+            params={
+                "toolCall": {"title": "shell"},
+                "options": [
+                    {"optionId": "yes", "name": "Allow", "behavior": "allow"},
+                    {"optionId": "no", "name": "Deny", "behavior": "deny"},
+                ],
+            },
+        )
+        client._build_permission_event(msg)
+        assert client._permission_options[27].get("reject") == "no"
+        # The allow-behavior option was NOT misread as a reject.
+        assert client._permission_options[27].get("reject") != "yes"
+
+    @pytest.mark.asyncio
+    async def test_reject_with_advertised_deny_never_answers_cancelled(self):
+        """#7681 end-to-end pin: when ANY deny-shaped option was advertised,
+        reject_tool answers a per-tool ``selected`` reject — never the
+        turn-cancelling ``cancelled`` outcome."""
+        client = AcpClient()
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        msg = JsonRpcMessage(
+            id=28,
+            method="session/requestPermission",
+            params={
+                "toolCall": {"title": "shell"},
+                "options": [
+                    {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                    {"optionId": "deny", "name": "Deny"},
+                ],
+            },
+        )
+        client._build_permission_event(msg)
+        sent: list[dict] = []
+
+        async def _capture(request_id, payload):
+            sent.append(payload)
+
+        client._send_response = _capture  # type: ignore[method-assign]
+        await client.reject_tool(28)
+        assert len(sent) == 1
+        assert sent[0]["outcome"]["outcome"] != "cancelled"
+        assert sent[0]["outcome"] == {"outcome": "selected", "optionId": "deny"}
+
     def test_unknown_legacy_id_not_classified(self):
         """Unknown legacy ids do not get a synthesized kind."""
         client = AcpClient()

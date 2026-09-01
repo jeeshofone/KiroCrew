@@ -565,11 +565,16 @@ def reject_option_id(params: dict) -> str | None:
     """The least-destructive reject optionId a permission request advertises.
 
     Used when auto-answering a ``session/request_permission`` for a session
-    this client never registered (a backend-internal subagent). Prefer the
-    request's own ``reject_once``-kind option; fall back to a legacy id that
-    names reject. ``None`` means the caller must answer with the ``cancelled``
-    outcome instead — kiro-cli maps that to cancelling the child's turn, which
-    is strictly worse than a per-tool reject, so this is the last resort.
+    this client never registered (a backend-internal subagent), and by
+    :meth:`AcpClient.reject_tool` for a user's explicit deny. Prefer the
+    request's own ``reject_once``-kind option; fall back to a ``behavior``
+    that names deny, then to a legacy id that names reject. ``None`` means
+    the caller must answer with the ``cancelled`` outcome instead — kiro-cli
+    maps that to cancelling the TURN, which auto-denies every later tool call
+    in it without prompting (#7681), so recognition here is deliberately
+    broad: any deny-shaped option beats the cancelled fallback. What it must
+    never do is pick an ALLOW option, so every branch matches deny-naming
+    values exactly rather than by substring.
     """
     raw = params.get("options")
     if not isinstance(raw, list):
@@ -580,11 +585,35 @@ def reject_option_id(params: dict) -> str | None:
             opt_id = opt.get("optionId") or opt.get("id")
             if opt.get("kind") == want_kind and isinstance(opt_id, str) and opt_id:
                 return opt_id
-    # Legacy kiro payloads omit `kind` — match well-known reject ids only, so
-    # an allow option can never be picked by accident.
+    # Adapters that speak `behavior` instead of `kind`: an exact deny/reject
+    # behavior is unambiguous whatever the id is called. Same vocabulary as
+    # build_permission_event's branch (_DENY_BEHAVIORS) by construction.
+    # An option carrying a VALID spec `kind` is classified by that kind alone:
+    # a contradictory {kind:"allow_once", behavior:"deny"} must never be
+    # selected as a reject — answering with an allow optionId APPROVES the
+    # tool, the exact inversion this function exists to prevent.
     for opt in options:
         opt_id = opt.get("optionId") or opt.get("id")
-        if isinstance(opt_id, str) and opt_id in ("reject_once", "reject_always", "reject"):
+        if opt.get("kind") in _SPEC_OPTION_KINDS:
+            continue
+        behavior = opt.get("behavior")
+        if (
+            isinstance(behavior, str)
+            and behavior.lower() in _DENY_BEHAVIORS
+            and isinstance(opt_id, str)
+            and opt_id
+        ):
+            return opt_id
+    # Legacy payloads omit `kind` and `behavior` — match well-known deny ids
+    # only (exact, lowercased), so an allow option can never be picked by
+    # accident. Derived from _LEGACY_OPTION_KIND so this list and the event
+    # builder's classification cannot drift apart. Same kind-wins precedence
+    # as the behavior branch above.
+    for opt in options:
+        opt_id = opt.get("optionId") or opt.get("id")
+        if opt.get("kind") in _SPEC_OPTION_KINDS:
+            continue
+        if isinstance(opt_id, str) and opt_id.lower() in _DENY_OPTION_IDS:
             return opt_id
     return None
 
@@ -603,7 +632,36 @@ _LEGACY_OPTION_KIND: dict[str, str] = {
     OPTION_ALLOW_ALWAYS: "allow_always",
     "reject_once": "reject_once",
     "reject_always": "reject_always",
+    # Deny-naming ids without a `kind`: recognising them is what keeps a user
+    # denial on the per-tool reject path. Missing them meant reject_tool fell
+    # back to the `cancelled` outcome, which kiro-cli treats as cancelling the
+    # TURN — every later tool call in it was auto-denied unprompted (#7681).
+    "reject": "reject_once",
+    "deny": "reject_once",
+    "deny_once": "reject_once",
+    "decline": "reject_once",
+    "deny_always": "reject_always",
 }
+
+#: The four ACP-spec permission-option kinds. An option carrying one of these
+#: is classified by its kind ALONE — later deny-recognition branches
+#: (behavior, legacy id) must not override it, or a contradictory
+#: {kind:"allow_once", behavior:"deny"} could be answered as a reject with an
+#: ALLOW optionId, approving the tool the caller meant to deny.
+_SPEC_OPTION_KINDS = frozenset({"allow_once", "allow_always", "reject_once", "reject_always"})
+
+#: `behavior` values that mark an option as a deny, for adapters that speak
+#: behavior instead of kind (behavior:"deny" appears as the selection RESULT in
+#: claude-agent-acp; recognising it on an advertised option is defensive).
+#: Exact-match only — an allow option must never be classified as a reject.
+_DENY_BEHAVIORS = frozenset({"deny", "reject"})
+
+#: Deny-naming option ids, DERIVED from the one table above so the auto-answer
+#: path (`reject_option_id`) and the event builder (`build_permission_event`)
+#: cannot drift on the vocabulary a second time (#7681 was exactly that drift).
+_DENY_OPTION_IDS: frozenset[str] = frozenset(
+    k for k, v in _LEGACY_OPTION_KIND.items() if v in ("reject_once", "reject_always")
+)
 
 
 def build_permission_event(
@@ -671,6 +729,14 @@ def build_permission_event(
         options.append({"id": opt_id, "label": opt_label})
         if not opt_kind:
             opt_kind = _LEGACY_OPTION_KIND.get(opt_id.lower(), "")
+        if not opt_kind:
+            # Adapters that speak `behavior` instead of `kind`: an exact deny
+            # behavior classifies the option as a per-tool reject whatever the
+            # id is called, keeping a user denial off the turn-cancelling
+            # `cancelled` fallback (#7681).
+            behavior = o.get("behavior")
+            if isinstance(behavior, str) and behavior.lower() in _DENY_BEHAVIORS:
+                opt_kind = "reject_once"
         if opt_kind:
             kind_to_id.setdefault(opt_kind, opt_id)
     if not options:
@@ -685,8 +751,11 @@ def build_permission_event(
     # reject option (for a clean reject) was advertised. claude-agent-acp offers
     # a {kind:"reject_once", optionId:"reject"} whose selection yields
     # behavior:"deny" — far better than a "cancelled" outcome, which the adapter
-    # turns into a cryptic "Tool use aborted". kiro-cli advertises no reject
-    # option, so reject_tool falls back to "cancelled" (a clean rejection there).
+    # turns into a cryptic "Tool use aborted". A payload advertising no
+    # deny-shaped option at all leaves reject_tool on the "cancelled" fallback,
+    # which kiro-cli maps to cancelling the TURN — auto-denying every later
+    # tool call in it (#7681); that is why recognition above is deliberately
+    # broad and why both fallback sites log a warning.
     any_allow = kind_to_id.get("allow_once") or kind_to_id.get("allow_always")
     any_reject = kind_to_id.get("reject_once") or kind_to_id.get("reject_always")
     recorded: dict[str, str] | None = None

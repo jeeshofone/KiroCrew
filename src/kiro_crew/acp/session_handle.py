@@ -1177,8 +1177,9 @@ class AcpSessionHandle:
         advertised (claude-agent-acp offers ``reject`` → behavior:"deny",
         surfacing a clear "permission denied" rather than the cryptic "Tool use
         aborted" the adapter throws on a ``cancelled`` outcome). Falls back to
-        ``cancelled`` when no reject option was advertised (kiro-cli), which kiro
-        handles as an ordinary rejection.
+        ``cancelled`` when no deny-shaped option was advertised — NOT a per-tool
+        signal: kiro-cli maps it to cancelling the TURN, auto-denying every
+        later tool call in it without prompting (#7681).
         """
         recorded = self._permission_options.pop(request_id, None)
         # Answered (see approve_tool) — a rejection ends the human wait too.
@@ -1190,6 +1191,15 @@ class AcpSessionHandle:
                 {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": reject_id}},
             )
         else:
+            # Same last-resort warning as AcpClient.reject_tool — this is the
+            # second of the two ``cancelled`` fallback sites, and the silent
+            # cascade is the bug report's whole complaint (#7681).
+            logger.warning(
+                "reject_tool: no deny option advertised for req=%s; answering "
+                "'cancelled', which the backend may treat as cancelling the "
+                "remainder of the turn's tool calls",
+                request_id,
+            )
             await self._runtime.send_response(
                 request_id,
                 {"outcome": {"outcome": OUTCOME_CANCELLED}},
