@@ -692,6 +692,15 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # carries resource_limit_preexec() — routing again here would nest
         # sandboxes. The chokepoint is applied at the call sites.
         "apps/builtins/dev_fleet/runtime.py::worker",
+        # The sync runner (the module worktree_ops's sync snapshots and runs by
+        # path) executes step argvs it reads from its steps_json input -- and
+        # every one of those argvs was ALREADY wrapped through
+        # sandboxed_spawn_argv (with per-step modes) by worktree_ops at
+        # composition time, before serialization. Routing again inside the
+        # runner would nest sandboxes, exactly as the runtime.py::worker entry
+        # above records for the outer spawn; the chokepoint is applied at the
+        # composition site.
+        "apps/builtins/dev_fleet/sync_runner.py::run_step",
         # Dev Fleet builtin backend: async version routes all git/gh through
         # _run_cmd which calls sandboxed_spawn_argv (the chokepoint). Only
         # _resolve_primary_checkout uses subprocess.run directly (one-shot
