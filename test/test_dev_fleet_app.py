@@ -6439,6 +6439,36 @@ async def test_build_state_is_reported_even_where_pods_cannot_run(tmp_path):
     assert row["port"] is None
 
 
+@pytest.mark.asyncio
+async def test_main_checkout_build_state_is_probed(tmp_path):
+    """Regression (#8058): the build-state probes were gated on ``not is_main``,
+    so a fully provisioned MAIN checkout always rendered as unprovisioned —
+    during a cutover that reads as "the cutover failed". Build state is a plain
+    filesystem check and is knowable for every worktree, main included; only
+    the POD-state check legitimately skips main."""
+    main_co = tmp_path / "repo"
+    binp = main_co / ".venv" / ("Scripts" if platform_compat.IS_WINDOWS else "bin")
+    binp.mkdir(parents=True)
+    exe = binp / ("kirocrew.exe" if platform_compat.IS_WINDOWS else "kirocrew")
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    (main_co / "src" / "kiro_crew" / "static" / "dist").mkdir(parents=True)
+
+    fleet = await _fleet_with(
+        [{"path": str(main_co), "branch": "main", "is_main": True}],
+        _POD_AVAILABLE=False,
+        _POD_ERROR="pods require Linux systemd",
+        _load_cfg=lambda: None,
+    )
+    (row,) = fleet["worktrees"]
+    assert row["is_main"] is True
+    assert row["has_venv"] is True
+    assert row["has_dist"] is True
+    # Pod state still never applies to main.
+    assert row["running"] is False
+    assert row["port"] is None
+
+
 # =============================================================================
 # Regression: _find_cli must target a RUNNABLE entry point (issue #220)
 # =============================================================================
