@@ -59,6 +59,10 @@ class TestParseSessions:
             "this_month": {"sessions": 0, "messages": 0, "tool_calls": 0},
             "avg_msgs_per_session": 0,
             "avg_tools_per_session": 0,
+            # Present-and-zero in every payload since #9254; this expected
+            # dict predated that merge (#9317 — the two PRs were each green
+            # in isolation and red together).
+            "refused_transcripts": 0,
         }
         assert sessions_dir.exists() == directory_exists
 
