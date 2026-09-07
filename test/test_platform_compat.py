@@ -4491,3 +4491,77 @@ class TestPublishDirNoreplace:
             "permanently block retries"
         )
         assert (src / "f.txt").exists(), "the staged tree was consumed by a failed publish"
+
+
+class TestOpenLockFile:
+    """GH-9248: acquiring a lock must not truncate the file it locks."""
+
+    def test_preserves_existing_content(self, tmp_path):
+        # The defect shape: open(path, "w") truncates BEFORE the lock is
+        # held, so a contending process can observe an empty lock file
+        # mid-acquire. The helper must open the file without touching its
+        # bytes. Content is read while the fd is OPEN but not LOCKED, and
+        # again after release — on Windows msvcrt region locks are
+        # MANDATORY, so a read while the lock is held answers EACCES and
+        # would test the platform's locking semantics instead of the
+        # helper's non-truncation property.
+        lock = tmp_path / "x.lock"
+        lock.write_text("holder-pid 1234")
+        from kiro_crew.platform_compat import file_lock, open_lock_file
+
+        with open_lock_file(lock) as fd:
+            assert isinstance(fd, int)
+            assert lock.read_text() == "holder-pid 1234"  # open did not truncate
+            with file_lock(fd, exclusive=True):
+                pass  # lockable with content present
+        assert lock.read_text() == "holder-pid 1234"  # intact after release
+
+    def test_creates_missing_file_and_is_lockable(self, tmp_path):
+        lock = tmp_path / "sub" / "y.lock"
+        lock.parent.mkdir(parents=True)
+        from kiro_crew.platform_compat import flock_exclusive, open_lock_file
+
+        with open_lock_file(lock) as fd:
+            with flock_exclusive(fd):
+                pass
+        assert lock.exists()
+        assert lock.read_bytes() == b""
+
+    def test_no_lock_site_opens_truncating(self):
+        # CONTRACT (the work-ledger fix's test shape, applied fleet-wide): grep the source
+        # tree for a truncating open whose descriptor is handed to a
+        # file_lock-family acquire within the next two lines. Every site was
+        # converted to open_lock_file in this change; a new offender fails
+        # here with its file and line.
+        import kiro_crew
+
+        src_root = os.path.dirname(os.path.abspath(kiro_crew.__file__))
+        # deploy/pending.py and deploy/profiles.py are owned by an in-flight
+        # deploy-locks fix; drop the exemptions once it merges — the scan
+        # will then enforce those sites too.
+        exempt = {
+            os.path.join(src_root, "deploy", "pending.py"),
+            os.path.join(src_root, "deploy", "profiles.py"),
+        }
+        offenders = []
+        open_w = re.compile(r"""\bopen\([^)]*["']wb?["']\)""")
+        acquire = re.compile(r"\b(file_lock|flock_exclusive|acquire_lock)\(\s*\w+\.fileno\(\)")
+        for dirpath, _dirnames, filenames in os.walk(src_root):
+            for name in filenames:
+                if not name.endswith(".py"):
+                    continue
+                path = os.path.join(dirpath, name)
+                if path in exempt:
+                    continue
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    lines = fh.readlines()
+                for i, line in enumerate(lines):
+                    if not open_w.search(line):
+                        continue
+                    window = "".join(lines[i + 1 : i + 3])
+                    if acquire.search(window):
+                        offenders.append(f"{path}:{i + 1}")
+        assert not offenders, (
+            "lock files opened truncating before the acquire (GH-9248); "
+            "use platform_compat.open_lock_file: " + ", ".join(offenders)
+        )

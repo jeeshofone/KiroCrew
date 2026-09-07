@@ -38,7 +38,7 @@ from kiro_crew.apps.manager import app_data_dir
 from kiro_crew.artifacts import ArtifactValidationError, _validate_slug, get_default_store
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.deploy.engine import AWSError
-from kiro_crew.platform_compat import file_lock
+from kiro_crew.platform_compat import file_lock, open_lock_file
 
 logger = logging.getLogger(__name__)
 
@@ -193,8 +193,8 @@ def _update_ledger(account: str, mutate: Callable[[dict[str, Any]], bool]) -> bo
     """
     lock_path = _ledger_path().with_suffix(".lock")
     _ledger_path().parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "w") as fd:
-        with file_lock(fd.fileno(), exclusive=True, required=True):
+    with open_lock_file(lock_path) as fd:
+        with file_lock(fd, exclusive=True, required=True):
             ledger = _read_ledger_for_update()
             slugs = ledger.get(account)
             if not isinstance(slugs, dict):

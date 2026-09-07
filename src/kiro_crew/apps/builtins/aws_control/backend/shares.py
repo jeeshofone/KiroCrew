@@ -39,7 +39,7 @@ from typing import Any, Collection, Optional
 from kiro_crew.apps.builtins.aws_control.backend import storage
 from kiro_crew.apps.manager import app_data_dir
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.platform_compat import file_lock
+from kiro_crew.platform_compat import file_lock, open_lock_file
 
 logger = logging.getLogger(__name__)
 
@@ -199,8 +199,8 @@ def record_share(
     }
     lock_path = _store_path().with_suffix(".lock")
     _store_path().parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "w") as fd:
-        with file_lock(fd.fileno(), exclusive=True, required=True):
+    with open_lock_file(lock_path) as fd:
+        with file_lock(fd, exclusive=True, required=True):
             entries = _prune(_load_for_update())
             entries.append(entry)
             _save(entries[-_MAX_SHARES:])
@@ -219,8 +219,8 @@ def forget_share(share_id: str) -> Optional[dict[str, Any]]:
     """Remove one record from the ledger (the link itself lives to expiry)."""
     lock_path = _store_path().with_suffix(".lock")
     _store_path().parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "w") as fd:
-        with file_lock(fd.fileno(), exclusive=True, required=True):
+    with open_lock_file(lock_path) as fd:
+        with file_lock(fd, exclusive=True, required=True):
             entries = _prune(_load_for_update())
             kept = [e for e in entries if e.get("id") != share_id]
             removed = next((e for e in entries if e.get("id") == share_id), None)

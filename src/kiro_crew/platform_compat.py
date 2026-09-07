@@ -682,6 +682,29 @@ def flock_exclusive(fd: int) -> Iterator[None]:
         yield
 
 
+@contextlib.contextmanager
+def open_lock_file(path: "str | os.PathLike[str]") -> Iterator[int]:
+    """Open *path* for locking WITHOUT truncating it (GH-9248).
+
+    ``open(path, "w")`` truncates the file before any lock is held. On POSIX
+    that is survivable; on Windows the subsequent acquire routes to
+    ``msvcrt.locking`` on the already-truncated file, so a contending process
+    can observe or produce an empty lock file and crash out of the critical
+    section — the loss lands only on a specific interleaving, which is why it
+    read as shard flake rather than a deterministic failure.
+    ``O_RDWR | O_CREAT`` creates-or-opens in one syscall and never truncates.
+
+    Yields the raw integer fd, ready for :func:`file_lock` /
+    :func:`flock_exclusive`. The lock file's CONTENT is never meaningful to
+    the lock itself; this exists so contenders cannot watch it flicker empty.
+    """
+    fd = os.open(os.fspath(path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
 def acquire_lock(fd: int, *, exclusive: bool = True) -> None:
     """Low-level lock acquire for the acquire-now / release-later fd-handoff
     pattern (where a context manager does not fit).

@@ -50,7 +50,7 @@ from kiro_crew.apps.manager import app_data_dir
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import data_home, kiro_sessions_dir
 from kiro_crew.history import SESSIONS_DIR_NAME
-from kiro_crew.platform_compat import file_lock, is_link_or_junction
+from kiro_crew.platform_compat import file_lock, is_link_or_junction, open_lock_file
 from kiro_crew.sel import sel
 from kiro_crew.snapshot import snapshot_main
 
@@ -174,8 +174,8 @@ def _locked_state_update(mutate) -> Any:
     """
     lock_path = _state_path().with_suffix(".lock")
     _state_path().parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "w") as fd:
-        with file_lock(fd.fileno(), exclusive=True, required=True):
+    with open_lock_file(lock_path) as fd:
+        with file_lock(fd, exclusive=True, required=True):
             state = _read_state_for_update()
             result = mutate(state)
             write_state(state)
