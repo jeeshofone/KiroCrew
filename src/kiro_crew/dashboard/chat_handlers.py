@@ -108,6 +108,7 @@ from kiro_crew.dashboard.remote_relay import (
     forward_peer_stop,
     peer_is_connected,
     redact_peer_text,
+    send_peer_context,
     relay_remote_turn,
     remote_bound_refusal,
 )
@@ -2916,6 +2917,286 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
     if not slot.is_remote:
         schedule_eager_spawn(state, slot)
     return web.json_response(state.serialize_slot(slot))
+
+
+#: How many of the source session's most recent visible messages the migration
+#: digest carries. The peer session resumes from this digest as background
+#: context, not from the full transcript (v1 carries no transcript to the peer),
+#: so the cap keeps the digest inside the pending-context content ceiling while
+#: still handing the crew enough recent conversation to continue coherently.
+_MIGRATE_DIGEST_MESSAGES = 40
+
+#: Byte budget for the migration digest body, kept under the pending-context
+#: content ceiling (``_MAX_CONTEXT_CONTENT``) so the enqueue never rejects it.
+#: Older messages are dropped first and a one-line note records that the full
+#: history stays in the archived local session.
+_MIGRATE_DIGEST_MAX_CHARS = 32_768
+
+
+def _build_migration_digest(slot: "_ChatSlot") -> str:
+    """Fold the source session's recent conversation into one context block.
+
+    Takes the last ``_MIGRATE_DIGEST_MESSAGES`` visible turns, trims from the
+    OLDEST end until the body fits ``_MIGRATE_DIGEST_MAX_CHARS``, and prepends a
+    note when anything was dropped so the crew knows the full history lives in
+    the archived local session rather than being lost. Returns "" when there is
+    no visible conversation to carry.
+    """
+    visible = [
+        m for m in slot.messages if m.get("role") in ("user", "assistant") and m.get("content")
+    ]
+    if not visible:
+        return ""
+    recent = visible[-_MIGRATE_DIGEST_MESSAGES:]
+    dropped_leading = len(visible) - len(recent)
+
+    def _render(rows: list[dict], note: str) -> str:
+        lines = [note] if note else []
+        for m in rows:
+            who = "You" if m.get("role") == "user" else "Assistant"
+            lines.append(f"{who}: {m.get('content', '')}")
+        return "\n\n".join(lines)
+
+    note = (
+        "[Migrated session — earlier history remains in the archived local session.]"
+        if dropped_leading
+        else "[Migrated session — carried from the previous local session.]"
+    )
+    body = _render(recent, note)
+    # Trim oldest-first until the body fits. Each drop turns the note into the
+    # "earlier history remains" form, because dropping here means the same thing
+    # dropping by message count did.
+    while len(body) > _MIGRATE_DIGEST_MAX_CHARS and recent:
+        recent = recent[1:]
+        note = "[Migrated session — earlier history remains in the archived local session.]"
+        body = _render(recent, note)
+    # A single turn that alone exceeds the budget: keep the note and a truncated
+    # tail rather than shipping nothing.
+    if len(body) > _MIGRATE_DIGEST_MAX_CHARS:
+        body = body[:_MIGRATE_DIGEST_MAX_CHARS]
+    return body
+
+
+async def api_chat_slot_migrate_remote(request: web.Request) -> web.Response:
+    """POST /api/chat/slots/{slot}/migrate-remote — move a local session to a crew.
+
+    Body: ``{ "instance_id": "<crew>" }``.
+
+    v1 is a CONTEXT-CARRY migration with no peer-protocol change: it opens a new
+    local slot bound to the chosen crew (the same binding the crew picker mints
+    at create time), seeds it with a digest of the source session's recent
+    conversation via the pending-context channel, and archives the source
+    read-only pointing at the new slot. The full transcript stays in the archived
+    local session; the crew resumes from the digest.
+
+    Failure ordering is deliberate: nothing destructive happens until the new
+    slot exists AND the context enqueue has succeeded — the source is archived
+    LAST, so a mid-flight failure leaves the original intact. A duplicate new
+    slot is cheap; a lost original is not.
+    """
+    state: DashboardState = request.app["state"]
+    name = request.match_info["slot"]
+    slot = state._slots.get(name)
+    if not slot:
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None
+    instance_id = str(body.get("instance_id") or "")
+    if not instance_id:
+        return web.json_response(
+            {"error": "instance_id is required", "code": "migrate_instance_required"},
+            status=400,
+        )
+
+    # Binding to a crew is a human act spending the owner's tunnel credential, so
+    # the migrate route carries the SAME two-gate authorization the create path's
+    # remote binding does: an app token is refused as an indistinguishable 404
+    # (no existence oracle), and a non-owner dashboard identity is refused 403.
+    request_app = request.get("app", "")
+    if request_app:
+        sel().log_api_access(
+            caller=request_app,
+            operation="chat.slot_migrate_remote",
+            outcome="denied",
+            source="app_isolation",
+            resources=f"slot={name},instance={instance_id}",
+            error="app tokens cannot migrate a session to a remote crew",
+        )
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+
+    from kiro_crew.dashboard.handlers._shared import _owner_denial_response
+    from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+
+    if not is_owner_dashboard_request(request):
+        sel().log_api_access(
+            caller="non-owner",
+            operation="chat.slot_migrate_remote",
+            outcome="denied",
+            source="owner_only",
+            resources=f"slot={name},instance={instance_id}",
+            error="non-owner identity rejected",
+        )
+        return _owner_denial_response(request, "migrating a session to a remote crew is owner-only")
+
+    # State guards, all BEFORE the peer is touched so a refused migration never
+    # opens an orphaned crew session. Mirrors the create binding gates and the
+    # agent-switch endpoint's running/member checks.
+    if slot.executor == "remote":
+        # Already bound to (or running on) a crew: there is no local session to
+        # move. Keyed on the marker, not is_remote, so a half-open binding is
+        # refused here too rather than silently re-migrated.
+        return web.json_response(
+            {"error": "this session already runs on a crew", "code": "migrate_already_remote"},
+            status=409,
+        )
+    if slot.mode == "member":
+        # Member DM threads are pinned to their crew and are born only via the
+        # member thread endpoint; they cannot be re-homed to another crew.
+        return web.json_response(
+            {"error": "a member thread cannot be migrated", "code": "migrate_member_pinned"},
+            status=409,
+        )
+    if slot.memory_mode != "persistent":
+        # A non-persistent (incognito/temporary) session keeps nothing on disk,
+        # so there is no durable conversation to carry or archive.
+        return web.json_response(
+            {"error": "cannot migrate a non-persistent session", "code": "migrate_not_persistent"},
+            status=400,
+        )
+    session_key = effective_session_key(slot)
+    busy_provider = state.sessions.get_provider(session_key)
+    if slot.running or (isinstance(busy_provider, LLMProvider) and busy_provider.has_active_turn()):
+        # Never migrate under an in-flight turn: the digest would race the turn's
+        # own writes and the archive would tear down a session mid-response. A
+        # 409 is retryable once the turn completes.
+        return web.json_response(
+            {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
+        )
+
+    # Build the digest from the CURRENT window before anything is created, so a
+    # peer-open failure below has cost nothing. Empty is allowed — a fresh
+    # session with no visible turns migrates as a bare crew-bound slot.
+    digest = _build_migration_digest(slot)
+
+    # 1) Open the peer session and mint a NEW local slot bound to it, reusing the
+    #    exact create-path machinery. create_peer_slot spends the owner tunnel
+    #    credential; every refusal above ran first so this is reached only for an
+    #    authorized, migratable session.
+    try:
+        remote_slot_key = await create_peer_slot(state, instance_id)
+    except RemoteTurnError as exc:
+        return web.json_response({"error": str(exc), "code": "remote_bind_failed"}, status=502)
+
+    new_slot = state.get_or_create_slot(
+        name=None,
+        agent=slot.agent,
+        workspace=slot.workspace,
+        model=slot.model,
+        origin=request_slot_origin(request_app),
+        count_user_session=True,
+    )
+    # Stamp the binding after creation, exactly as the create path does: the
+    # binding is not part of a slot's identity, so every other creation path is
+    # untouched by remote execution.
+    new_slot.executor = "remote"
+    new_slot.instance_id = instance_id
+    new_slot.remote_slot = remote_slot_key
+    new_slot.reasoning_effort = slot.reasoning_effort
+    new_slot.folder_id = slot.folder_id
+    new_slot.tags = list(slot.tags)
+    source_title = slot.title if slot._titled else "Untitled"
+    source_title, _ = redact_exfiltration_urls(source_title)
+    source_title, _ = redact_credentials(source_title)
+    new_slot.title = source_title
+    new_slot._titled = True
+
+    # 2) Carry context: deliver the digest to the PEER's own context queue.
+    #    A remote-bound local slot never runs `_run_chat` (relay_remote_turn
+    #    replaces it), so a locally queued entry would never be drained — the
+    #    digest must land on the machine that runs the turn, where the crew's
+    #    slot is an ordinary local slot and its next turn drains it into the
+    #    prompt. Do this BEFORE archiving the source — if it fails, the source
+    #    is still intact and the only cost is a duplicate crew-bound slot.
+    if digest:
+        try:
+            await send_peer_context(
+                state, instance_id, remote_slot_key, digest, "session-migration"
+            )
+        except RemoteTurnError as exc:
+            # Roll the new slot back and refuse: nothing destructive has happened
+            # to the source yet. The peer session is left to the crew (the same
+            # cheaper-loss choice the create path makes on a concurrent-create
+            # collision) rather than reaching across to tear it down.
+            state._slots.pop(new_slot.key, None)
+            logger.warning(
+                "migrate-remote: peer context delivery failed for %s -> %s; source %s left intact",
+                name,
+                new_slot.key,
+                slot.key,
+            )
+            sel().log_api_access(
+                caller="dashboard",
+                operation="chat.slot_migrate_remote",
+                outcome="error",
+                source="dashboard",
+                resources=f"from={name},to={new_slot.key},instance={instance_id}",
+                error=f"peer context delivery failed: {exc}",
+            )
+            return web.json_response(
+                {
+                    "error": "could not carry the session context; nothing was changed",
+                    "code": "migrate_context_failed",
+                },
+                status=503,
+            )
+
+    # 3) Archive the source LAST. Stamp the migrated pointer so the read-only
+    #    archive shows where the work continues, then close it exactly as the tab
+    #    ✕ does — persisted closed (read-only in History), session torn down.
+    slot.migrated = {"instance_id": instance_id, "remote_key": remote_slot_key}
+    try:
+        await close_slot(state, slot, name)
+    except SlotCloseError as exc:
+        # The source could not be archived. The new crew-bound slot already
+        # exists and holds the context, but the source is still live — leaving
+        # BOTH addressable would be a duplicated session. Roll the new slot back
+        # and refuse; the source is untouched (close_slot unwinds its own partial
+        # steps), so the user can retry. Clear the migrated stamp we speculatively
+        # set so a later successful save cannot persist a pointer to a slot we
+        # just removed.
+        slot.migrated = None
+        state._slots.pop(new_slot.key, None)
+        logger.warning(
+            "migrate-remote: archiving source %s failed (%s); removed new slot %s",
+            name,
+            exc.code,
+            new_slot.key,
+        )
+        sel().log_api_access(
+            caller="dashboard",
+            operation="chat.slot_migrate_remote",
+            outcome="error",
+            source="dashboard",
+            resources=f"from={name},to={new_slot.key},instance={instance_id}",
+            error=f"source archive failed: {exc.code}",
+        )
+        return web.json_response({"error": exc.message, "code": exc.code}, status=500)
+
+    sel().log_api_access(
+        caller="dashboard",
+        operation="chat.slot_migrate_remote",
+        outcome="allowed",
+        source="dashboard",
+        resources=(
+            f"from={name},to={new_slot.key},instance={instance_id}," f"digest_chars={len(digest)}"
+        ),
+    )
+    _sync_dashboard_slots(state)
+    state.push_slots_update()
+    return web.json_response({"ok": True, "key": new_slot.key, "instance_id": instance_id})
 
 
 def _reject_pending_approvals(slot: _ChatSlot) -> None:
@@ -9197,6 +9478,31 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
             {
                 "error": "a member thread can only be resumed on its own member slot",
                 "code": "member_mode_key_mismatch",
+            },
+            status=409,
+        )
+    _migrated_meta = meta.get("migrated")
+    if isinstance(_migrated_meta, dict) and _migrated_meta.get("instance_id"):
+        # A migrated source is a read-only archive: its conversation continues
+        # on the crew named in the stamp, so resuming it here would fork the
+        # session into two live copies. The transcript stays readable through
+        # the History detail view; only reanimation is refused.
+        sel().log_api_access(
+            caller=request.remote or "",
+            operation="chat_resume",
+            outcome="denied",
+            source="migrated_archive",
+            resources=f"slot={name} key={history_key}",
+            error="session was migrated to a remote crew",
+        )
+        return web.json_response(
+            {
+                "error": "this session was migrated to a remote crew and is read-only",
+                "code": "resume_migrated",
+                "migrated": {
+                    "instance_id": str(_migrated_meta.get("instance_id", "")),
+                    "remote_key": str(_migrated_meta.get("remote_key", "")),
+                },
             },
             status=409,
         )

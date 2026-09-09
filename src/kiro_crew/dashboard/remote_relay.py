@@ -563,6 +563,50 @@ async def create_peer_slot(
     return key
 
 
+async def send_peer_context(
+    state: "DashboardState",
+    instance_id: str,
+    remote_slot: str,
+    content: str,
+    source: str,
+) -> None:
+    """Inject background context into the PEER's own queue for *remote_slot*.
+
+    Context for a crew-bound session must reach the machine that RUNS the
+    turn: the pending-context drain lives inside ``_run_chat``, and a
+    remote-bound local slot never runs ``_run_chat`` (``relay_remote_turn``
+    replaces it), so an entry queued on the local mirror would sit undelivered
+    forever. Posting to the peer's ``/context`` endpoint targets the slot
+    where it IS an ordinary local slot — the peer's next turn drains it into
+    the prompt like any other background context.
+
+    Raises :class:`RemoteTurnError` on any refusal or transport failure, so a
+    caller sequencing destructive steps can keep them strictly after delivery.
+    """
+    mgr = await _require_manager(state)
+    body = {"content": content, "source": source, "ephemeral": False}
+    try:
+        async with mgr.proxy_request(
+            instance_id,
+            "POST",
+            f"api/chat/slots/{remote_slot}/context",
+            data=json.dumps(body).encode(),
+            content_type="application/json",
+        ) as upstream:
+            await upstream.content.read(_MAX_PEER_SLOT_REPLY_BYTES + 1)
+            if not 200 <= upstream.status < 300:
+                raise RemoteTurnError(
+                    f"The crew refused the carried context (HTTP {upstream.status})."
+                )
+    except RemoteTurnError:
+        raise
+    except Exception as e:
+        logger.info("Peer context send to %s failed (%s)", instance_id, type(e).__name__)
+        raise RemoteTurnError(
+            "Could not deliver the session context to that crew. Nothing was changed."
+        ) from None
+
+
 async def forward_peer_stop(state: "DashboardState", slot: "_ChatSlot", force: bool) -> bool:
     """Ask the peer to stop the turn it is running for *slot*.
 
