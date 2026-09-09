@@ -230,7 +230,11 @@ export const FOLLOW_REENGAGE_PX = 16
  *      absorbs the layout engine's clamp: a mid-stream content SHRINK drops
  *      scrollTop (which reads as an upward move) but lands exactly at the new
  *      bottom — releasing there froze streaming follow for the rest of the
- *      turn.
+ *      turn. The exception is a non-downward landing under a confirmed UPWARD
+ *      user input inside the settle window (`upwardInputWithinSettle`): that
+ *      shrink coincided with the reader's own scroll-up, so it belongs to the
+ *      user and releases follow. A downward or directionless input keeps the
+ *      clamp absorbed.
  *   2. Any other upward move → release, regardless of distance from the
  *      bottom. The scroll position now belongs to the user; only returning to
  *      the bottom (3) re-engages.
@@ -264,6 +268,29 @@ export function resolveUserScrollStick(args: {
    *  shrink moves `scrollHeight`, not `clientHeight` — so the two are
    *  distinguishable, and this is the delta that tells them apart. */
   viewportGrowth?: number
+  /** A hardware user input whose own direction was UPWARD (wheel up / upward
+   *  key / upward touch drag) landed within the scroll-settle window before
+   *  this scroll event.
+   *
+   *  The bottom-epsilon branch below treats a scroll landing within
+   *  `atBottomEpsilon` of the true bottom as the layout engine's clamp and
+   *  keeps `stick` as it was. But a genuine user scroll-UP that happens to
+   *  coincide with a mid-turn content shrink terminates within epsilon of the
+   *  NEW bottom too, so it wears the same signature — and keeping `stick` armed
+   *  there pins the reader back to the end on the next streaming resize. The
+   *  intent listeners stamp the input's direction BEFORE its scroll event
+   *  dispatches, so a fresh UPWARD stamp is proof the reader scrolled up: a
+   *  non-downward landing at the bottom under it is the reader, not the
+   *  engine, and releases follow.
+   *
+   *  The direction requirement is load-bearing: a wheel-DOWN at the bottom is
+   *  an ordinary input during streaming, and a content-shrink clamp landing
+   *  inside its settle window must NOT release follow — the reader asked to
+   *  stay at the end. Directionless inputs (a scrollbar grab, a first touch
+   *  move) are treated the same conservative way: only confirmed upward
+   *  intent disables the clamp guard. A genuine clamp carries no upward
+   *  input, so it still keeps `stick`. */
+  upwardInputWithinSettle?: boolean
 }): boolean {
   const { stick, followOutput, scrollTop, prevScrollTop, geom } = args
   if (!followOutput) return false
@@ -276,7 +303,17 @@ export function resolveUserScrollStick(args: {
   // closes is refused their re-engagement.
   const clampedByViewport =
     (args.viewportGrowth ?? 0) > atBottomEpsilon() && scrollTop <= prevScrollTop + atBottomEpsilon()
-  if (dist <= atBottomEpsilon()) return clampedByViewport ? stick : true
+  if (dist <= atBottomEpsilon()) {
+    // A clamp only ever lowers scrollTop, so a downward move here is the user's
+    // own and re-engages. A non-downward landing at the bottom is ambiguous
+    // between the engine's clamp and a user scroll-up that coincided with a
+    // content shrink -- and an UPWARD hard input within the settle window is
+    // the evidence the reader scrolled up, so the landing belongs to them:
+    // release. Direction-blind or downward input keeps the clamp guard.
+    const movedDown = prevScrollTop >= 0 && scrollTop > prevScrollTop + atBottomEpsilon()
+    if (args.upwardInputWithinSettle && !movedDown) return false
+    return clampedByViewport ? stick : true
+  }
   if (prevScrollTop < 0) return dist <= FOLLOW_REENGAGE_PX
   if (scrollTop < prevScrollTop - 0.5) return false
   // Re-engagement requires a genuine DOWNWARD move, not merely a non-upward

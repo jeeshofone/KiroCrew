@@ -733,6 +733,14 @@ export function useVirtualChat<T>(
   // hardware events and by the smooth-pin grab interrupts, never by scroll
   // events themselves.
   const lastHardInputAtRef = useRef<number>(Number.NEGATIVE_INFINITY)
+  // UPWARD-only sibling of lastHardInputAtRef: stamped when the input's own
+  // direction was up (wheel up / upward key / upward touch drag), or when a
+  // smooth-glide grab moved scrollTop backward (confirmed upward by motion).
+  // resolveUserScrollStick's clamp branch keys its release on THIS stamp, not
+  // the direction-blind one: a wheel-down at the bottom is an ordinary input
+  // during streaming, and a content-shrink clamp inside its settle window must
+  // keep follow armed rather than releasing the reader who asked for the end.
+  const lastUpwardInputAtRef = useRef<number>(Number.NEGATIVE_INFINITY)
   // When WE last established the reader's bottom position: a pin write, or a
   // re-baseline of `lastWriteTopRef` onto a layout clamp / an already-at-bottom
   // observation. Compared against the hard-input stamp above it answers "has the
@@ -2287,6 +2295,9 @@ export function useVirtualChat<T>(
           smoothPinActiveRef.current = false
           lastUserScrollAtRef.current = performance.now()
           lastHardInputAtRef.current = lastUserScrollAtRef.current
+          // scrollTop moving backward against the animation IS a confirmed
+          // upward gesture, so it also arms the clamp-release stamp.
+          lastUpwardInputAtRef.current = lastUserScrollAtRef.current
           stickRef.current = false
           detachSmoothAbort()
         }
@@ -2320,6 +2331,15 @@ export function useVirtualChat<T>(
             lastScrollClientHRef.current > 0
               ? geom.clientHeight - lastScrollClientHRef.current
               : 0,
+          // An UPWARD hardware input stamped within the settle window is proof
+          // the reader scrolled up. The intent listeners stamp its direction
+          // BEFORE this scroll event dispatches, so a landing at the bottom
+          // under a fresh upward stamp is the reader's own scroll-up coinciding
+          // with a content shrink, not the engine's clamp — release follow
+          // instead of holding the reader at the end. A downward or
+          // directionless input leaves the clamp guard in place.
+          upwardInputWithinSettle:
+            performance.now() - lastUpwardInputAtRef.current < SCROLL_SETTLE_MS,
         })
         if (wasStick && !stickRef.current) releaseFollowBaseline()
         const layoutClamp = stickRef.current && clampedAtBottom
@@ -2392,9 +2412,13 @@ export function useVirtualChat<T>(
     // the gesture (fighting a trackpad fling frame by frame). Suppression is
     // harmless when the input does not scroll (a click, a wheel at the bottom):
     // follow resumes SCROLL_SETTLE_MS later.
-    const detachIntent = attachUserScrollIntent(el, () => {
+    const detachIntent = attachUserScrollIntent(el, (dir) => {
       lastUserScrollAtRef.current = performance.now()
       lastHardInputAtRef.current = performance.now()
+      // Only a confirmed upward input arms the clamp-release stamp — a
+      // directionless grab or a downward input must not disable the clamp
+      // guard (see lastUpwardInputAtRef).
+      if (dir === 'up') lastUpwardInputAtRef.current = performance.now()
     })
     onScroll()
     return () => {
