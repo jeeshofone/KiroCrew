@@ -1009,6 +1009,11 @@ class SessionCatalogProjection:
                 meta["memory_mode"] = d.get("memory_mode", "persistent")
                 if d.get("folder_id"):
                     meta["folder_id"] = d["folder_id"]
+                if d.get("migrated"):
+                    # The migrate-remote stamp: a row carrying it is a read-only
+                    # archive of a conversation that lives on another crew, and
+                    # every picker that offers rows for RESUME must skip it.
+                    meta["migrated"] = d["migrated"]
             else:
                 # Read only the first line for metadata
                 try:
@@ -1026,6 +1031,8 @@ class SessionCatalogProjection:
                             meta["memory_mode"] = d.get("memory_mode", "persistent")
                             if d.get("folder_id"):
                                 meta["folder_id"] = d["folder_id"]
+                            if d.get("migrated"):
+                                meta["migrated"] = d["migrated"]
                             # Guarded publish — discard the fill if a write
                             # invalidated this key inside the stat → read
                             # window (see the generation snapshot above).

@@ -793,6 +793,21 @@ def is_incognito_transcript(memory_mode: object) -> bool:
     return str(memory_mode or "").lower() in INCOGNITO_MEMORY_MODES
 
 
+def is_migrated_transcript(migrated: object) -> bool:
+    """True when a metadata ``migrated`` value marks a transcript as a read-only
+    archive of a conversation that now lives on another crew.
+
+    The stamp is the migrate-remote endpoint's ``{"instance_id", "remote_key"}``
+    pointer, written only as part of the confirmed closed save. The single
+    shared predicate for it, so the dashboard's mint gate and every channel
+    resume picker agree on what "migrated" means: a dict naming an
+    ``instance_id``. Absent, ``None`` and junk read as not migrated — callers
+    that must fail closed on an UNREADABLE record decide that before this test
+    applies (the mint gate does, via the metadata status form).
+    """
+    return isinstance(migrated, dict) and bool(migrated.get("instance_id"))
+
+
 # The fields that record where a message came from: the session key it arrived
 # on (``source_thread``, e.g. ``slack:1785861252.833429``) and the platform user
 # who sent it (``source_user``). Written by :meth:`ConversationLog.append`, read

@@ -1639,6 +1639,11 @@ class SessionManager:
         self._compaction_state = CompactionState()
         self._background_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
         self._session_map = SessionMap()
+        # Keys whose conversation is being migrated to a remote crew, held from
+        # admission until the closed+migrated stamp is durable. Every binder
+        # that would attach a channel to a key BY NAME consults it (see
+        # ``is_migrating``); the dashboard owns the admission and release.
+        self._migrating_keys: set[str] = set()
 
         self._pool = WarmSessionPool(
             cast(Any, self),
@@ -2685,6 +2690,26 @@ class SessionManager:
         """Return a session's outbound mirror target as a channel-neutral link,
         or None. Legacy Slack sessions surface as a Slack ``ChannelLink``."""
         return self._session_map.get_mirror_link(key)
+
+    def mark_migrating(self, key: str) -> None:
+        """Reserve *key* for a migration to a remote crew (admission).
+
+        Held until :meth:`unmark_migrating`, which the migrate endpoint calls
+        once the closed+migrated stamp is durable, or on any failure. While held,
+        a channel bind of *key* is refused: ``close_slot`` pops the source before
+        the stamp lands, and in that window the key is neither live nor stamped,
+        so a mirror link set then would attach the channel to a conversation
+        that the crew is already carrying forward — a fork with no recovery.
+        """
+        self._migrating_keys.add(key)
+
+    def unmark_migrating(self, key: str) -> None:
+        """Release the reservation taken by :meth:`mark_migrating`."""
+        self._migrating_keys.discard(key)
+
+    def is_migrating(self, key: str) -> bool:
+        """True while a migration of *key* is admitted and not yet durable."""
+        return key in self._migrating_keys
 
     def mirror_accepts_inbound(self, key: str) -> bool:
         """True iff this session's mirror is a session-resume (two-way) binding."""

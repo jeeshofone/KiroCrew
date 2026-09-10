@@ -255,6 +255,27 @@ class TestConversationLog:
         assert "t-kms" in results
         assert results["t-kms"].get("folder_id") == "folder-cpb"
 
+    def test_list_and_search_surface_the_migrated_pointer(self, tmp_path):
+        """The migrate-remote stamp rides on the catalog row so every resume
+        picker can skip the read-only archive without a metadata read per row;
+        the cached second call must project it the same way as the cold read."""
+        from kiro_crew.history import is_migrated_transcript
+
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("t-moved", "user", "investigate the kms rollback")
+        pointer = {"instance_id": "crew-a", "remote_key": "dashboard:x"}
+        log.update_metadata("t-moved", {"closed": True, "migrated": pointer})
+        log.append("t-here", "user", "investigate the kms rollback too")
+        for _ in range(2):  # cold read, then the metadata cache
+            by_key = {s["key"]: s for s in log.list_sessions()}
+            assert by_key["t-moved"].get("migrated") == pointer
+            assert "migrated" not in by_key["t-here"]
+        results = {s["key"]: s for s in log.search_sessions("kms")}
+        assert results["t-moved"].get("migrated") == pointer
+        assert is_migrated_transcript(results["t-moved"]["migrated"])
+        assert not is_migrated_transcript(results["t-here"].get("migrated"))
+        assert not is_migrated_transcript({"remote_key": "dashboard:x"})
+
 
 class TestRewriteSession:
     def test_rewrite_replaces_content(self, tmp_path):

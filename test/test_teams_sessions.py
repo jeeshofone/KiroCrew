@@ -393,6 +393,94 @@ class TestThePicker:
         assert titles == ["1. Launch plan"], "resuming it would persist an unpersisted chat"
 
     @pytest.mark.asyncio
+    async def test_a_migrated_session_is_never_offered(self) -> None:
+        """The archive of a conversation that moved to another crew is read-only;
+        binding a channel to it would fork the conversation the crew carries."""
+        rows = _rows("Launch plan")
+        rows.append(
+            {
+                "key": "dashboard:moved",
+                "title": "Moved",
+                "memory_mode": "persistent",
+                "migrated": {"instance_id": "crew-a", "remote_key": "dashboard:x"},
+            }
+        )
+        client = _Client()
+        d = _dispatcher(_Sessions(), client, _ConversationLog(rows))
+
+        await d.handle_message(_inbound("/sessions"))
+
+        titles = [a["title"] for a in client.cards[0]["content"]["actions"]]
+        assert titles == ["1. Launch plan"]
+
+    @pytest.mark.asyncio
+    async def test_a_session_migrated_after_the_listing_is_refused_at_the_press(self) -> None:
+        """The listing is a snapshot: a migration that lands before the press
+        turns the chosen key into a read-only archive, so the bind re-reads the
+        record and refuses rather than forking the moved conversation."""
+        client, sessions = _Client(), _Sessions()
+        rows = _rows("Launch plan")
+        log = _ConversationLog(rows, {"dashboard:chat-1": [{"role": "assistant", "content": "x"}]})
+        d = _dispatcher(sessions, client, log)
+        await d.handle_message(_inbound("/sessions"))
+        log.metadata["dashboard:chat-1"] = {
+            "title": "Launch plan",
+            "migrated": {"instance_id": "crew-a", "remote_key": "dashboard:x"},
+        }
+
+        await d.handle_message(_inbound("", value=_press(client.cards[0], 0)))
+
+        assert sessions.mirror_links == {}
+        assert sessions.inbound_keys == set()
+        assert any("no longer available" in str(card) for _a, card in client.updated)
+
+    @pytest.mark.asyncio
+    async def test_a_migration_admitted_but_not_yet_durable_refuses_the_bind(self) -> None:
+        """Between the migrate endpoint's admission and its durable stamp the key
+        is neither live nor stamped; the endpoint reserves it on the shared
+        session manager for exactly that window, and the bind honours the
+        reservation instead of attaching the channel to a moving conversation."""
+        client, sessions = _Client(), _Sessions()
+        log = _ConversationLog(_rows("Launch plan"), {"dashboard:chat-1": []})
+        d = _dispatcher(sessions, client, log)
+        await d.handle_message(_inbound("/sessions"))
+        sessions.is_migrating = lambda key: key == "dashboard:chat-1"  # type: ignore[attr-defined]
+
+        await d.handle_message(_inbound("", value=_press(client.cards[0], 0)))
+
+        assert sessions.mirror_links == {}
+        assert sessions.inbound_keys == set()
+        assert any("no longer available" in str(card) for _a, card in client.updated)
+
+    @pytest.mark.asyncio
+    async def test_a_migration_landing_inside_the_press_is_refused_under_the_lock(self) -> None:
+        """The early re-read passes, then the migration stamps the archive while
+        the press awaits its card update; the gate re-run inside the commit
+        batch — with no await before ``set_mirror_link`` — refuses, the
+        expectation written for the pick is retired, and nothing is bound."""
+        sessions = _Sessions()
+        log = _ConversationLog(_rows("Launch plan"), {"dashboard:chat-1": []})
+
+        class _MigratesMidPress(_Client):
+            async def update_card(self, conversation_id, activity_id, card, service_url) -> bool:
+                if "Launch plan" in str(card) and "dashboard:chat-1" not in log.metadata:
+                    # The success card is the last await before the commit batch.
+                    log.metadata["dashboard:chat-1"] = {
+                        "migrated": {"instance_id": "crew-a", "remote_key": "dashboard:x"}
+                    }
+                return await super().update_card(conversation_id, activity_id, card, service_url)
+
+        client = _MigratesMidPress()
+        d = _dispatcher(sessions, client, log)
+        await d.handle_message(_inbound("/sessions"))
+
+        await d.handle_message(_inbound("", value=_press(client.cards[0], 0)))
+
+        assert sessions.mirror_links == {}
+        assert sessions.inbound_keys == set()
+        assert any("no longer available" in str(card) for _a, card in client.updated)
+
+    @pytest.mark.asyncio
     async def test_no_matches_says_so_and_points_back(self) -> None:
         client = _Client()
         d = _dispatcher(_Sessions(), client, _ConversationLog(_rows("Launch plan")))

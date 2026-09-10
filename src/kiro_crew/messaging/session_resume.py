@@ -35,6 +35,7 @@ from typing import Any, Awaitable, Callable, Protocol
 
 from kiro_crew.history import (
     is_incognito_transcript,
+    is_migrated_transcript,
     needles_match_text,
     parse_search_query,
     transcript_stem,
@@ -413,6 +414,14 @@ async def resolve_session_choices(
         # An incognito transcript is never offered: resuming it would copy a
         # deliberately unpersisted conversation into a channel that does persist.
         if is_incognito_transcript(row.get("memory_mode")):
+            continue
+        # A migrated transcript is never offered either: it is the read-only
+        # archive of a conversation that lives on another crew, and binding a
+        # channel to it would fork that conversation — the crew carries its copy
+        # forward while the channel writes into the archive. The dashboard's
+        # own mint gate refuses the same key; the picker must not offer what the
+        # bind would have to refuse.
+        if is_migrated_transcript(row.get("migrated")):
             continue
         if sessions is not None and native_key:
             key = resumable_history_key(row, sessions=sessions, native_key=native_key)
@@ -858,6 +867,34 @@ class SessionResumeController:
         self.binder.title_display = title_display
         self.dashboard_state: object | None = None
 
+    def _migrated_or_unreadable(self, key: str) -> bool:
+        """True when *key* must not be bound: its migration is admitted and not
+        yet durable, its record carries the migrated stamp, or the record could
+        not be read (unknown reads as refused — a stamp that reads as absent
+        would bind the channel to a conversation the crew already carries).
+
+        Synchronous on purpose: ``commit_binding`` calls it inside the map lock
+        with no await before ``set_mirror_link``. The metadata read is the same
+        small first-line probe the dashboard's mint gate performs inline.
+        """
+        is_migrating = getattr(self.sessions, "is_migrating", None)
+        if callable(is_migrating) and is_migrating(key):
+            return True
+        if self.conv_log is None:
+            return False
+        status = getattr(self.conv_log, "get_metadata_status", None)
+        try:
+            if callable(status):
+                meta, readable = status(key)
+                if not readable:
+                    return True
+            else:
+                meta = self.conv_log.get_metadata(key)
+        except Exception:
+            logger.debug("resume: could not read metadata for %s", key, exc_info=True)
+            return True
+        return is_migrated_transcript((meta or {}).get("migrated"))
+
     def push_slots(self) -> None:
         state = self.dashboard_state
         if state is None:
@@ -974,6 +1011,16 @@ class SessionResumeController:
             self.conv_log.has_log,
             choice.key,
         ):
+            await surface.settle_picker(message_id, surface.choice_missing)
+            return None
+        # Re-read at the bind, not only at the listing: a migration that lands
+        # between the picker being shown and the press turns the chosen key
+        # into a read-only archive, and binding to it would fork the
+        # conversation the crew now carries. The "not available" report is
+        # the accurate one — the session moved. This early read gives the
+        # ordinary case its answer before any store write; the authoritative
+        # gate is the synchronous one inside ``commit_binding`` below.
+        if await asyncio.to_thread(self._migrated_or_unreadable, choice.key):
             await surface.settle_picker(message_id, surface.choice_missing)
             return None
 
@@ -1117,6 +1164,17 @@ class SessionResumeController:
                     conflict_now, displaced_now = conflict_and_displaced()
                     if conflict_now is not None:
                         late_conflict = conflict_now
+                        return
+                    # The migration gate, re-run HERE with no await between it
+                    # and ``set_mirror_link``. The migrate endpoint reserves the
+                    # key at admission and stamps the archive before releasing
+                    # it, and its own commit-point check refuses a key that
+                    # already carries a mirror link; both sides run on the loop
+                    # thread, so whichever commits first is the one the other
+                    # sees. The awaits above (expectation record, card update)
+                    # are exactly where a migration could land unseen.
+                    if self._migrated_or_unreadable(choice.key):
+                        late_conflict = surface.choice_missing
                         return
                     selected_original = self.sessions.get_mirror_link(choice.key)
                     selected_was_inbound = choice.key in self.sessions.find_mirror_sessions(
