@@ -2728,6 +2728,7 @@ def _save_slot_to_history(
     expected_history_key: str | None = None,
     expected_disk_older_count: int | None = None,
     rows_only: bool = False,
+    migrated: dict | None = None,
 ) -> bool:
     """Persist slot messages to JSONL history (append-safe).
 
@@ -2805,6 +2806,15 @@ def _save_slot_to_history(
     ``expected_disk_older_count`` drifted — the in-memory window was NOT
     persisted and must not be treated as durable. Every other completion
     (including the benign no-op skips) returns ``True``.
+
+    *migrated* stamps the metadata line with where the conversation moved
+    (``{"instance_id", "remote_key"}``) as PART OF THIS WRITE. The migrate
+    endpoint passes it with its confirmed ``closed=True`` save and never sets
+    it on the live slot first: ``migrated`` is carried-forward (unowned)
+    metadata, so a speculative marker flushed by a periodic save during the
+    close would survive a rollback and refuse every later resume of a session
+    that is still live. Absent, the stamp a rehydrated archive already carries
+    on ``slot.migrated`` is preserved.
     """
     if not state.conversation_log:
         return True
@@ -3039,7 +3049,9 @@ def _save_slot_to_history(
                         # "crashed mid-turn" on reload. Nested under the binding
                         # because it is meaningless without one.
                         fields["relay_in_flight"] = True
-                _migrated_merge = getattr(slot, "migrated", None)
+                _migrated_merge = (
+                    migrated if migrated is not None else getattr(slot, "migrated", None)
+                )
                 if isinstance(_migrated_merge, dict) and _migrated_merge.get("instance_id"):
                     # The archived source can carry no window at all (the migrate
                     # endpoint closes it with only its history on disk), so the
@@ -3340,7 +3352,7 @@ def _save_slot_to_history(
                     # in-flight, so a True read back on reload is the crash signal
                     # that triggers the interrupted-turn row.
                     meta_line["relay_in_flight"] = True
-            _migrated = getattr(slot, "migrated", None)
+            _migrated = migrated if migrated is not None else getattr(slot, "migrated", None)
             if isinstance(_migrated, dict) and _migrated.get("instance_id"):
                 # Stamp on a session the migrate-remote endpoint archived: it
                 # names the crew the work moved to and the new local slot bound
@@ -3866,6 +3878,7 @@ async def save_slot_off_loop(
     best_effort: bool = True,
     expected_history_key: str | None = None,
     rows_only: bool = False,
+    migrated: dict | None = None,
 ) -> bool:
     """Persist a slot from the event loop without blocking or dropping the save.
 
@@ -3927,6 +3940,7 @@ async def save_slot_off_loop(
             rewrite=rewrite,
             expected_history_key=expected_history_key,
             rows_only=rows_only,
+            migrated=migrated,
         )
 
     def _begin_guarded_metadata_write() -> None:

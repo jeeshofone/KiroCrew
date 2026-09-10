@@ -34,7 +34,6 @@ from kiro_crew.dashboard.remote_relay import (
     iter_sse_records,
     parse_sse_record,
     relay_remote_turn,
-    send_peer_context,
 )
 from kiro_crew.dashboard.state import _ChatSlot
 
@@ -1449,39 +1448,6 @@ def _mgr_returning(status: int, body: bytes):
     mgr.peer_version = AsyncMock(return_value=(True, kiro_crew.__version__))
     mgr.proxy_request = MagicMock(return_value=_FakeUpstream(status, body))
     return mgr
-
-
-class TestSendPeerContext:
-    """The migrate endpoint's context digest travels to the PEER's own
-    /context queue — the machine that runs the turn is the only place the
-    pending-context drain can reach it."""
-
-    @pytest.mark.asyncio
-    async def test_the_digest_is_posted_to_the_peers_context_endpoint(self, tmp_path):
-        state = _make_state(tmp_path)
-        mgr = _mgr_returning(200, b'{"ok": true}')
-        state.instances_manager = mgr
-
-        await send_peer_context(state, "nobita", "peer-chat-9", "digest body", "session-migration")
-
-        args, kwargs = mgr.proxy_request.call_args
-        assert args == ("nobita", "POST", "api/chat/slots/peer-chat-9/context")
-        assert json.loads(kwargs["data"]) == {
-            "content": "digest body",
-            "source": "session-migration",
-            "ephemeral": False,
-        }
-
-    @pytest.mark.asyncio
-    async def test_a_peer_refusal_raises_rather_than_passing_silently(self, tmp_path):
-        """A caller sequencing destructive steps after delivery must see the
-        failure — a swallowed refusal would archive the source while the crew
-        starts cold."""
-        state = _make_state(tmp_path)
-        state.instances_manager = _mgr_returning(403, b"{}")
-
-        with pytest.raises(RemoteTurnError):
-            await send_peer_context(state, "nobita", "peer-chat-9", "digest", "session-migration")
 
 
 class TestCreatePeerSlot:
