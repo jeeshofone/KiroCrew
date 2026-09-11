@@ -1046,6 +1046,17 @@ class TestFormatSchedule:
         s = CronSchedule(kind="every", every_secs=7200)
         assert format_schedule(s) == "every 2h"
 
+    def test_every_non_whole_hours_is_not_truncated(self) -> None:
+        """A 90-minute job reads back as 90 minutes, not as the hour floor: the
+        list is how a user checks that a job was saved as asked, and a floored
+        interval looks like a job that was silently changed."""
+        from kiro_crew.cron import CronSchedule, format_schedule
+
+        assert format_schedule(CronSchedule(kind="every", every_secs=5400)) == "every 90m"
+        assert format_schedule(CronSchedule(kind="every", every_secs=3660)) == "every 61m"
+        # Not a whole minute either: seconds, still exact.
+        assert format_schedule(CronSchedule(kind="every", every_secs=3661)) == "every 3661s"
+
     def test_at_timestamp_today(self, monkeypatch, _utc_tz) -> None:
         from kiro_crew.cron import CronSchedule, format_schedule
 

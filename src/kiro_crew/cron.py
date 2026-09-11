@@ -981,8 +981,14 @@ def format_schedule(schedule: CronSchedule, tz_name: str = "") -> str:
         return _humanize_cron(schedule.cron_expr, tz_name)
     if schedule.kind == "every" and schedule.every_secs:
         secs = schedule.every_secs
-        if secs >= 3600:
+        # Exact, never truncated: a saved interval must read back as what was
+        # saved, or the list cannot tell a wrong job from a right one. Whole
+        # hours as hours, whole minutes above the hour as minutes, everything
+        # else in seconds (sub-hour intervals keep their seconds spelling).
+        if secs >= 3600 and secs % 3600 == 0:
             return f"every {secs // 3600}h"
+        if secs >= 3600 and secs % 60 == 0:
+            return f"every {secs // 60}m"
         return f"every {secs}s"
     if schedule.kind == "at" and schedule.at_ts:
         tz = ZoneInfo(tz_name) if tz_name else None
