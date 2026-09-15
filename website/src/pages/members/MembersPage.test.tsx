@@ -1603,6 +1603,17 @@ describe('MembersPage auto patrol (monitor loop status)', () => {
     expect(screen.queryByText(/no patrol scheduled/i)).toBeNull()
   })
 
+  it('an interrupted patrol (armed at restart, no live loop) shows a sentence, not the raw token', async () => {
+    // `interrupted` is synthesised by the event-log reader at gateway startup
+    // (eventlog_hooks.reconcile_members_at_startup), so it is a normal
+    // post-restart state. On the previous head the reason map had no entry
+    // for it and the drawer fell back to the untranslated enum string.
+    await openDrawerWith({ loops: [loop({ active: false, stopped_reason: 'interrupted' })] })
+    expect(screen.getByTestId('member-patrol')).toHaveAttribute('data-state', 'stopped')
+    expect(screen.getByTestId('member-patrol-reason')).toHaveTextContent(/gateway restart/i)
+    expect(screen.getByTestId('member-patrol-reason')).not.toHaveTextContent(/^interrupted$/)
+  })
+
   it('an active patrol is listed under Wake sources, so the card cannot say "nothing wakes this member" above a live one', async () => {
     await openDrawerWith({ loops: [loop()] })
     await waitFor(() => expect(screen.queryByTestId('member-wake-loading')).toBeNull())
