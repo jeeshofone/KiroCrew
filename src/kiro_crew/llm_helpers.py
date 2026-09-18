@@ -137,6 +137,10 @@ _TRANSIENT_MARKERS = (
     # straight and typographic quotes both match the substring.
     "selected is temporarily unavailable",
     "transient error (http 5xx)",  # _format_acp_error's generic-5xx message
+    # kiro-cli's post-stream wrapper ("The service failed to process the
+    # request (request_id: ...)"). Matches the raw provider text and
+    # _format_acp_error's rewrite alike, since the rewrite keeps the phrase.
+    "failed to process the request",
     # IAM credential-propagation race, matched against _format_acp_error's
     # rewritten wording. The RAW provider sentence ("The security token included
     # in the request is invalid") is matched structurally instead — see the
@@ -2194,15 +2198,13 @@ async def stream_and_collect(
         m.strip() for m in (fallback_models or ()) if isinstance(m, str) and m.strip()
     )
     _fb_state = FallbackState(_fb_chain) if _fb_chain else None
-    # Cross-attempt tool-activity flag for the fallback chain ONLY. Case 2's
-    # same-model retry keys off ``result_text`` alone (pre-existing behavior,
-    # pinned byte-for-byte by the empty-chain regression tests), but the chain
-    # replays the ORIGINAL prompt up to FALLBACK_CANDIDATE_ATTEMPTS × len(chain)
-    # more times — a tool that completed an external mutation before any text
-    # streamed would be re-run on every one of them. Same activity predicate as
-    # the sub-agent ladder and the dashboard's ``_turn_emitted``: any fired
-    # tool call blocks the replay, text or no text.
-    _fb_tool_activity = False
+    # Cross-attempt tool activity for every retry that replays the ORIGINAL
+    # prompt. A tool can complete an external mutation before any text streams,
+    # so both the same-model retry (Case 2) and fallback chain (Case 2.75) stop
+    # once any attempt fires a tool call. Prompt-busy keeps its separate retry
+    # contract, but activity from that attempt remains sticky for a later
+    # transient error.
+    _turn_tool_activity = False
     # Sticky-restore probe (§restore policy): if an earlier turn on this
     # provider fell back, try ONCE to move back to the primary before this
     # turn streams. Quiet on success (log only); a still-throttled primary
@@ -2274,9 +2276,9 @@ async def stream_and_collect(
                 elif event.kind == EVENT_TOOL_CALL:
                     tool_call_count += 1
                     # Sticky across attempts (never reset in the retry loop):
-                    # once ANY attempt fired a tool, the fallback chain must
-                    # not replay the original prompt — see _fb_tool_activity.
-                    _fb_tool_activity = True
+                    # once ANY attempt fired a tool, a transient path must not
+                    # replay the original prompt — see _turn_tool_activity.
+                    _turn_tool_activity = True
                     if on_tool_gate:
                         executed_calls.append((event.tool_call_id or "", event.title or ""))
                     if max_turns is not None and tool_call_count > max_turns:
@@ -2366,9 +2368,12 @@ async def stream_and_collect(
             #   - `not result_text`: only retry if NO tokens have streamed yet.
             #     A partial response must not be retried — the re-run would
             #     duplicate the already-emitted output.
+            #   - `not _turn_tool_activity`: only retry if no attempt fired a
+            #     tool call. A textless tool can already have mutated state.
             if (
                 retry_transient
                 and not result_text
+                and not _turn_tool_activity
                 and acp_error_is_transient(exc)
                 and transient_attempts < _TRANSIENT_RETRIES
             ):
@@ -2399,18 +2404,14 @@ async def stream_and_collect(
             # Empty chain ⇒ this block is inert and Case 3 surfaces the error
             # exactly as before this feature existed.
             #
-            # ``not _fb_tool_activity`` is load-bearing over and above
+            # ``not _turn_tool_activity`` is load-bearing over and above
             # ``not result_text``: a tool call can complete an EXTERNAL
-            # MUTATION before any text streams, and unlike Case 2's bounded
-            # same-model retry (pre-existing semantics, deliberately
-            # untouched), the chain replays the original prompt on every
-            # candidate — re-running that mutation each time. Any fired tool
-            # across ANY attempt disables the chain for this call; the error
-            # then surfaces exactly as it did before this feature.
+            # MUTATION before any text streams. Any fired tool across ANY
+            # attempt disables every original-prompt replay for this call.
             if (
                 retry_transient
                 and not result_text
-                and not _fb_tool_activity
+                and not _turn_tool_activity
                 and _fb_state is not None
                 and acp_error_is_transient(exc)
                 and transient_attempts >= _TRANSIENT_RETRIES
