@@ -553,17 +553,23 @@ class TestSpecModelCoercion:
         assert info.skills == ["good", "also-good"]
         assert info.mcp_servers == ["srv"]
 
-    def test_non_string_name_falls_back_to_filename_stem(self, tmp_path: Path) -> None:
-        """A structured `name` must degrade the row, not silently DROP it.
-
-        The package-detection branch does `stem.endswith(agent_name)`, which
-        raised TypeError on a non-string name; the loop's broad `except` then
-        swallowed it and the agent vanished from the listing entirely.
-        """
+    @pytest.mark.parametrize(
+        "data",
+        [
+            pytest.param({}, id="absent"),
+            pytest.param({"name": ""}, id="empty"),
+            pytest.param({"name": None}, id="null"),
+            pytest.param({"name": {"id": "nope"}}, id="non-string"),
+        ],
+    )
+    def test_unusable_name_falls_back_to_filename_stem(
+        self, tmp_path: Path, data: dict[str, object]
+    ) -> None:
+        """An unusable `name` must degrade the row, not silently DROP it."""
         d = tmp_path / "agents"
         d.mkdir()
         (d / "weird.json").write_text(
-            json.dumps({"name": {"id": "nope"}, "model": "auto"}), encoding="utf-8"
+            json.dumps({**data, "model": "auto"}), encoding="utf-8"
         )
         clear_list_agents_cache()
         (agent,) = list_agents(agents_dir=d)

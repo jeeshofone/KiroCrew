@@ -20,8 +20,10 @@ from kiro_crew.effort import (
 )
 from kiro_crew.providers.acp import (
     _clear_cli_overlay_effort,
+    _compare_and_swap_cli_overlay_effort,
     _read_cli_overlay,
     _write_cli_overlay,
+    _write_tool_search_overlay,
 )
 
 
@@ -202,6 +204,16 @@ class TestCliOverlay:
         _clear_cli_overlay_effort(tmp_path, "claude-opus-4.7")  # must not raise
         assert _read_cli_overlay(tmp_path) == {}
 
+    def test_clear_lock_failure_propagates(self, tmp_path):
+        with (
+            patch(
+                "kiro_crew.providers.acp.workspace_cli_settings_lock",
+                side_effect=OSError("settings lock held"),
+            ),
+            pytest.raises(OSError, match="settings lock held"),
+        ):
+            _clear_cli_overlay_effort(tmp_path, "claude-opus-4.7")
+
     def test_gpt_write_uses_reasoning_key_and_roundtrips(self, tmp_path):
         # kiro-cli persists GPT effort under `reasoning`, not `output_config`;
         # the wrong key is silently ignored, so the on-disk shape must match.
@@ -259,6 +271,66 @@ class TestCliOverlay:
         cli = tmp_path / ".kiro" / "settings" / "cli.json"
         data = json.loads(cli.read_text(encoding="utf-8"))
         assert "gpt-5.6-luna" not in data.get("chat.modelDefaults", {})
+
+    @pytest.mark.parametrize("replacement", [None, "medium"])
+    def test_generation_cas_rolls_back_without_an_intervening_write(
+        self, tmp_path, replacement: str | None
+    ):
+        model = "gpt-5.6-luna"
+        generation = _write_cli_overlay(tmp_path, model, "high")
+
+        assert _compare_and_swap_cli_overlay_effort(
+            tmp_path, model, generation.generation, "high", replacement
+        )
+        assert _read_cli_overlay(tmp_path).get(model) == replacement
+
+    def test_generation_cas_rejects_same_value_peer_generation(self, tmp_path):
+        model = "gpt-5.6-luna"
+        first_generation = _write_cli_overlay(tmp_path, model, "high")
+        peer_generation = _write_cli_overlay(tmp_path, model, "high")
+
+        assert peer_generation != first_generation
+        assert not _compare_and_swap_cli_overlay_effort(
+            tmp_path, model, first_generation, "high", "medium"
+        )
+        assert _read_cli_overlay(tmp_path)[model] == "high"
+
+    def test_generation_cas_rejects_unrelated_settings_generation(self, tmp_path):
+        model = "gpt-5.6-luna"
+        generation = _write_cli_overlay(tmp_path, model, "high")
+        _write_tool_search_overlay(tmp_path, True, 12, 1234)
+
+        assert not _compare_and_swap_cli_overlay_effort(
+            tmp_path, model, generation, "high", "medium"
+        )
+        cli = tmp_path / ".kiro" / "settings" / "cli.json"
+        persisted = json.loads(cli.read_text(encoding="utf-8"))
+        assert persisted["chat.modelDefaults"][model]["reasoning"]["effort"] == "high"
+        assert persisted["toolSearch.enabled"] is True
+        assert persisted["toolSearch.minPct"] == 12
+        assert persisted["toolSearch.minTokens"] == 1234
+
+    def test_generation_cas_rejects_unrelated_model_generation(self, tmp_path):
+        model = "gpt-5.6-luna"
+        generation = _write_cli_overlay(tmp_path, model, "high")
+        _write_cli_overlay(tmp_path, "claude-opus-4.7", "xhigh")
+
+        assert not _compare_and_swap_cli_overlay_effort(
+            tmp_path, model, generation, "high", "medium"
+        )
+        assert _read_cli_overlay(tmp_path) == {
+            model: "high",
+            "claude-opus-4.7": "xhigh",
+        }
+
+    def test_generation_cas_also_requires_attempted_value(self, tmp_path):
+        model = "gpt-5.6-luna"
+        generation = _write_cli_overlay(tmp_path, model, "high")
+
+        assert not _compare_and_swap_cli_overlay_effort(
+            tmp_path, model, generation, "max", "medium"
+        )
+        assert _read_cli_overlay(tmp_path)[model] == "high"
 
 
 class TestFactoryEffortThreading:

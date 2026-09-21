@@ -50,6 +50,15 @@ IS_POSIX: bool = not IS_WINDOWS
 IS_LINUX: bool = sys.platform == "linux"
 IS_MACOS: bool = sys.platform == "darwin"
 
+# Lock semantics may be simulated by tests and callers, but choosing an OS open
+# primitive must follow the actual host. Capture both that fact and the native
+# ctypes entry points at import so replacing the public compatibility globals
+# cannot route a POSIX host into WinDLL or weaken a Windows no-follow open.
+_REAL_HOST_IS_WINDOWS: bool = sys.platform == "win32"
+_NATIVE_WIN_DLL: Any = getattr(ctypes, "WinDLL", None)
+_NATIVE_WIN_ERROR: Any = getattr(ctypes, "WinError", None)
+_NATIVE_GET_LAST_ERROR: Any = getattr(ctypes, "get_last_error", None)
+
 
 _UTF8_PROCESS_ENV = {
     "PYTHONUTF8": "1",
@@ -691,6 +700,21 @@ _LOCK_TIMEOUT_SECS = 300.0
 _WIN_LOCK_POLL_SECS = _LOCK_POLL_SECS
 _WIN_LOCK_TIMEOUT_SECS = _LOCK_TIMEOUT_SECS
 
+# CreateFileW flags shared by the Windows no-follow file and directory openers.
+# OPEN_REPARSE_POINT is the Windows equivalent of a final-component O_NOFOLLOW:
+# it opens a link/junction itself so fstat can reject it without touching its
+# target. Lock files also need OPEN_ALWAYS and write access because msvcrt's
+# byte-range lock requires a writable descriptor.
+_WIN_GENERIC_READ = 0x80000000
+_WIN_GENERIC_WRITE = 0x40000000
+_WIN_FILE_SHARE_READ_WRITE = 0x00000001 | 0x00000002
+_WIN_OPEN_EXISTING = 3
+_WIN_OPEN_ALWAYS = 4
+_WIN_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_WIN_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_WIN_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+_WIN_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+
 
 def _lock_timeout_message(timeout: float, *, exclusive: bool = True) -> str:
     """The one refusal string both platforms raise when the ceiling is hit.
@@ -943,9 +967,58 @@ def flock_exclusive(fd: int) -> Iterator[None]:
         yield
 
 
+def _win_open_lock_file_without_following(path: "str | os.PathLike[str]", *, create: bool) -> int:
+    """Open a Windows lock file without following a reparse point."""
+    if _NATIVE_WIN_DLL is None:
+        raise OSError("native Windows file APIs are unavailable on this host")
+    kernel32 = _NATIVE_WIN_DLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.CreateFileW(
+        os.fspath(path),
+        _WIN_GENERIC_READ | _WIN_GENERIC_WRITE,
+        _WIN_FILE_SHARE_READ_WRITE,
+        None,
+        _WIN_OPEN_ALWAYS if create else _WIN_OPEN_EXISTING,
+        _WIN_FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle is None or handle == wintypes.HANDLE(-1).value:
+        if _NATIVE_WIN_ERROR is None or _NATIVE_GET_LAST_ERROR is None:
+            raise OSError("native Windows error APIs are unavailable on this host")
+        raise _NATIVE_WIN_ERROR(_NATIVE_GET_LAST_ERROR())
+    try:
+        fd = msvcrt.open_osfhandle(  # type: ignore[attr-defined]
+            handle, os.O_RDWR | getattr(os, "O_BINARY", 0)
+        )
+    except BaseException:
+        kernel32.CloseHandle(handle)
+        raise
+    try:
+        attrs = getattr(os.fstat(fd), "st_file_attributes", 0)
+        if attrs & _WIN_FILE_ATTRIBUTE_REPARSE_POINT:
+            raise OSError(errno.ELOOP, "reparse point at the lock-file name", os.fspath(path))
+        if attrs & _WIN_FILE_ATTRIBUTE_DIRECTORY:
+            raise IsADirectoryError(errno.EISDIR, "lock-file name is a directory", os.fspath(path))
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 @contextlib.contextmanager
-def open_lock_file(path: "str | os.PathLike[str]") -> Iterator[int]:
-    """Open *path* for locking WITHOUT truncating it (GH-9248).
+def open_lock_file(path: "str | os.PathLike[str]", *, create: bool = True) -> Iterator[int]:
+    """Open *path* for locking without truncating or following its final name.
 
     ``open(path, "w")`` truncates the file before any lock is held. On POSIX
     that is survivable; on Windows the subsequent acquire routes to
@@ -953,13 +1026,24 @@ def open_lock_file(path: "str | os.PathLike[str]") -> Iterator[int]:
     can observe or produce an empty lock file and crash out of the critical
     section — the loss lands only on a specific interleaving, which is why it
     read as shard flake rather than a deterministic failure.
-    ``O_RDWR | O_CREAT`` creates-or-opens in one syscall and never truncates.
+    POSIX uses ``O_RDWR | O_CREAT | O_NOFOLLOW``. Windows uses
+    ``CreateFileW(OPEN_ALWAYS, FILE_FLAG_OPEN_REPARSE_POINT)`` and rejects a
+    reparse-point handle before returning its CRT descriptor. The refusal is
+    therefore part of the open on both platforms, not a check that a raced swap
+    can invalidate.
 
-    Yields the raw integer fd, ready for :func:`file_lock` /
+    Set *create* to false when absence is meaningful and must not be repaired
+    by a reader. Yields the raw integer fd, ready for :func:`file_lock` /
     :func:`flock_exclusive`. The lock file's CONTENT is never meaningful to
     the lock itself; this exists so contenders cannot watch it flicker empty.
     """
-    fd = os.open(os.fspath(path), os.O_RDWR | os.O_CREAT, 0o644)
+    if not _REAL_HOST_IS_WINDOWS:
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        if create:
+            flags |= os.O_CREAT
+        fd = os.open(os.fspath(path), flags, 0o644)
+    else:
+        fd = _win_open_lock_file_without_following(path, create=create)
     try:
         yield fd
     finally:
@@ -6748,15 +6832,6 @@ def unlink_link_or_junction(path: str | os.PathLike) -> None:
 #: reparse point ITSELF instead of following it, so a junction planted at the
 #: name is seen for what it is rather than silently traversed. The share mode
 #: deliberately omits ``FILE_SHARE_DELETE``: that omission is the pin.
-_WIN_GENERIC_READ = 0x80000000
-_WIN_FILE_SHARE_READ_WRITE = 0x00000001 | 0x00000002
-_WIN_OPEN_EXISTING = 3
-_WIN_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
-_WIN_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
-_WIN_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
-_WIN_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
-
-
 def pin_directory(path: str | os.PathLike) -> int:
     """Open *path* as a directory and return a descriptor that PINS it.
 

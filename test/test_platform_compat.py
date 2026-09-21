@@ -6616,6 +6616,91 @@ class TestOpenLockFile:
         assert lock.exists()
         assert lock.read_bytes() == b""
 
+    def test_windows_dispatch_uses_the_native_no_follow_opener(self, tmp_path, monkeypatch):
+        lock = tmp_path / "windows-dispatch.lock"
+        calls = []
+        real_fd = os.open(os.devnull, os.O_RDWR)
+
+        def native_open(path, *, create):
+            calls.append((path, create))
+            return real_fd
+
+        monkeypatch.setattr(pc, "_REAL_HOST_IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        monkeypatch.setattr(pc, "_win_open_lock_file_without_following", native_open, raising=False)
+        with pc.open_lock_file(lock) as fd:
+            assert fd == real_fd
+
+        assert calls == [(lock, True)]
+        assert not lock.exists()
+        with pytest.raises(OSError):
+            os.fstat(real_fd)
+
+    @pytest.mark.skipif(os.name == "nt", reason="simulates Windows lock semantics on POSIX")
+    def test_simulated_windows_locking_keeps_the_real_posix_no_follow_open(
+        self, tmp_path, monkeypatch
+    ):
+        lock = tmp_path / "simulated-windows.lock"
+        opened_flags = []
+        real_open = os.open
+
+        def recording_open(path, flags, mode=0o777, *, dir_fd=None):
+            if os.fspath(path) == os.fspath(lock):
+                opened_flags.append(flags)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "IS_POSIX", False)
+        monkeypatch.setattr(pc, "ctypes", types.SimpleNamespace())
+        monkeypatch.setattr(pc.os, "open", recording_open)
+
+        with pc.open_lock_file(lock) as fd:
+            assert os.fstat(fd).st_size == 0
+
+        assert opened_flags
+        assert opened_flags[0] & os.O_NOFOLLOW
+        assert lock.exists()
+
+    def test_refuses_a_planted_link_without_opening_its_target(self, tmp_path):
+        target = tmp_path / "target.lock"
+        target.write_text("do not open through the link", encoding="utf-8")
+        lock = tmp_path / "planted.lock"
+        try:
+            lock.symlink_to(target)
+        except OSError as exc:
+            pytest.skip(f"file symlinks unavailable: {exc}")
+
+        with pytest.raises(OSError):
+            with pc.open_lock_file(lock):
+                pytest.fail("a lock-file link was followed")
+
+        assert target.read_text(encoding="utf-8") == "do not open through the link"
+
+    @pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="POSIX race injection")
+    def test_refuses_a_link_swapped_in_during_the_open(self, tmp_path, monkeypatch):
+        target = tmp_path / "target.lock"
+        target.write_text("local target", encoding="utf-8")
+        lock = tmp_path / "raced.lock"
+        lock.write_text("original", encoding="utf-8")
+        real_open = os.open
+        swapped = False
+
+        def swap_then_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal swapped
+            if not swapped and os.fspath(path) == os.fspath(lock):
+                swapped = True
+                lock.unlink()
+                lock.symlink_to(target)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(pc.os, "open", swap_then_open)
+        with pytest.raises(OSError):
+            with pc.open_lock_file(lock):
+                pytest.fail("the lock open followed a raced link")
+
+        assert swapped
+        assert target.read_text(encoding="utf-8") == "local target"
+
     def test_no_lock_site_opens_truncating(self):
         # CONTRACT (the work-ledger fix's test shape, applied fleet-wide): grep the source
         # tree for a truncating open whose descriptor is handed to a

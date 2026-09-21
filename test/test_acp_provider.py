@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -660,6 +661,54 @@ class TestEffortControl:
         provider._client.send_command.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_kiro_clear_effort_commit_failure_restores_override(self):
+        provider = self._effort_provider(backend="", model="claude-opus-4.7")
+        provider._effort_per_model = {"claude-opus-4.7": "high"}
+        with (
+            patch(
+                "kiro_crew.providers.acp._clear_cli_overlay_effort",
+                side_effect=OSError("settings lock held"),
+            ),
+            pytest.raises(OSError, match="settings lock held"),
+        ):
+            await provider.clear_effort()
+
+        assert provider._effort_per_model == {"claude-opus-4.7": "high"}
+        provider._client.send_command.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_kiro_change_effort_overlay_failure_rolls_back_before_live_push(self):
+        provider = self._effort_provider(backend="", model="claude-opus-4.7")
+        with (
+            patch(
+                "kiro_crew.providers.acp._write_cli_overlay",
+                side_effect=OSError("settings lock held"),
+            ),
+            pytest.raises(OSError, match="settings lock held"),
+        ):
+            await provider.change_effort("high")
+
+        assert "claude-opus-4.7" not in provider._effort_per_model
+        provider._client.send_command.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_kiro_clear_to_workspace_default_write_failure_restores_override(self):
+        provider = self._effort_provider(backend="", model="claude-opus-4.7")
+        provider._effort_per_model = {"claude-opus-4.7": "high"}
+        provider._effort_defaults = {"claude-opus-4.7": "medium"}
+        with (
+            patch(
+                "kiro_crew.providers.acp._write_cli_overlay",
+                side_effect=OSError("settings lock held"),
+            ),
+            pytest.raises(OSError, match="settings lock held"),
+        ):
+            await provider.clear_effort()
+
+        assert provider._effort_per_model == {"claude-opus-4.7": "high"}
+        provider._client.send_command.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_claude_clear_effort_returns_false_for_reset(self):
         # claude-agent-acp has no "reset to default" config value, so clearing
         # must return False to trigger a session reset; it must NOT push.
@@ -680,6 +729,327 @@ class TestEffortControl:
             await provider.change_effort("xhigh")
         # Override rolled back to unset.
         assert "claude-opus-4.7" not in provider._effort_per_model
+
+    @pytest.mark.asyncio
+    async def test_kiro_failed_effort_change_rolls_back_disk_without_peer(self, tmp_path):
+        from kiro_crew.providers.acp import _read_cli_overlay, _write_cli_overlay
+
+        model = "gpt-5.6-luna"
+        provider = self._effort_provider(backend="", model=model)
+        provider._client._work_dir = tmp_path
+        provider._effort_per_model = {model: "medium"}
+        _write_cli_overlay(tmp_path, model, "medium")
+        provider._client.send_command = AsyncMock(side_effect=RuntimeError("live push failed"))
+
+        with pytest.raises(RuntimeError, match="live push failed"):
+            await provider.change_effort("high")
+
+        assert provider._effort_per_model == {model: "medium"}
+        assert _read_cli_overlay(tmp_path) == {model: "medium"}
+
+    @pytest.mark.asyncio
+    async def test_kiro_failed_effort_clear_rolls_back_disk_without_peer(self, tmp_path):
+        from kiro_crew.providers.acp import _read_cli_overlay, _write_cli_overlay
+
+        model = "gpt-5.6-luna"
+        provider = self._effort_provider(backend="", model=model)
+        provider._client._work_dir = tmp_path
+        provider._effort_per_model = {model: "high"}
+        provider._effort_defaults = {model: "medium"}
+        _write_cli_overlay(tmp_path, model, "high")
+        provider._client.send_command = AsyncMock(side_effect=RuntimeError("live push failed"))
+
+        with pytest.raises(RuntimeError, match="live push failed"):
+            await provider.clear_effort()
+
+        assert provider._effort_per_model == {model: "high"}
+        assert _read_cli_overlay(tmp_path) == {model: "high"}
+
+    @staticmethod
+    def _seed_divergent_persisted_effort(tmp_path, model: str, key: str | None):
+        settings_dir = tmp_path / ".kiro" / "settings"
+        settings_dir.mkdir(parents=True)
+        model_cfg: dict[str, object] = {"peerModelSetting": True}
+        if key is not None:
+            model_cfg[key] = {"effort": "low", "peerEffortSetting": True}
+        cli_json = settings_dir / "cli.json"
+        cli_json.write_text(
+            json.dumps(
+                {
+                    "chat.enableNotifications": True,
+                    "chat.modelDefaults": {
+                        model: model_cfg,
+                        "claude-opus-4.7": {"output_config": {"effort": "xhigh"}},
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return cli_json
+
+    @staticmethod
+    def _assert_divergent_persisted_effort(persisted: dict, model: str, key: str | None):
+        persisted_model = persisted["chat.modelDefaults"][model]
+        if key is None:
+            assert "reasoning" not in persisted_model
+        elif key == "reasoning":
+            assert persisted_model["reasoning"] == {
+                "effort": "low",
+                "peerEffortSetting": True,
+            }
+        else:
+            assert persisted_model["reasoning"] == {"effort": "low"}
+            assert persisted_model["output_config"] == {"peerEffortSetting": True}
+        assert persisted_model["peerModelSetting"] is True
+        assert persisted["chat.enableNotifications"] is True
+        assert persisted["chat.modelDefaults"]["claude-opus-4.7"] == {
+            "output_config": {"effort": "xhigh"}
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("persisted_key", [None, "reasoning", "output_config"])
+    async def test_kiro_failed_effort_change_restores_persisted_value_not_provider_memory(
+        self, tmp_path, persisted_key: str | None
+    ):
+        model = "gpt-5.6-luna"
+        cli_json = self._seed_divergent_persisted_effort(tmp_path, model, persisted_key)
+        provider = self._effort_provider(backend="", model=model)
+        provider._client._work_dir = tmp_path
+        provider._effort_per_model = {model: "medium"}
+
+        with (
+            patch.object(
+                provider._client,
+                "send_command",
+                AsyncMock(side_effect=RuntimeError("live push failed")),
+            ),
+            pytest.raises(RuntimeError, match="live push failed"),
+        ):
+            await provider.change_effort("high")
+
+        assert provider._effort_per_model == {model: "medium"}
+        persisted = json.loads(cli_json.read_text(encoding="utf-8"))
+        self._assert_divergent_persisted_effort(persisted, model, persisted_key)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("persisted_key", [None, "reasoning", "output_config"])
+    async def test_kiro_failed_effort_clear_restores_persisted_value_not_provider_memory(
+        self, tmp_path, persisted_key: str | None
+    ):
+        model = "gpt-5.6-luna"
+        cli_json = self._seed_divergent_persisted_effort(tmp_path, model, persisted_key)
+        provider = self._effort_provider(backend="", model=model)
+        provider._client._work_dir = tmp_path
+        provider._effort_per_model = {model: "high"}
+        provider._effort_defaults = {model: "medium"}
+
+        with (
+            patch.object(
+                provider._client,
+                "send_command",
+                AsyncMock(side_effect=RuntimeError("live push failed")),
+            ),
+            pytest.raises(RuntimeError, match="live push failed"),
+        ):
+            await provider.clear_effort()
+
+        assert provider._effort_per_model == {model: "high"}
+        persisted = json.loads(cli_json.read_text(encoding="utf-8"))
+        self._assert_divergent_persisted_effort(persisted, model, persisted_key)
+
+    async def _overlap_failed_kiro_effort_change(
+        self, tmp_path, *, previous: str | None, peer_level: str = "max"
+    ) -> tuple[AcpProvider, AcpProvider, dict]:
+        from kiro_crew.providers.acp import _read_cli_overlay, _write_cli_overlay
+
+        model = "gpt-5.6-luna"
+        peer_model = "claude-opus-4.7"
+        _write_cli_overlay(tmp_path, peer_model, "medium")
+        if previous is not None:
+            _write_cli_overlay(tmp_path, model, previous)
+
+        cli_json = tmp_path / ".kiro" / "settings" / "cli.json"
+        initial = json.loads(cli_json.read_text(encoding="utf-8"))
+        initial["chat.enableNotifications"] = True
+        cli_json.write_text(json.dumps(initial, indent=2), encoding="utf-8")
+
+        first = self._effort_provider(backend="", model=model)
+        peer = self._effort_provider(backend="", model=model)
+        first._client._work_dir = tmp_path
+        peer._client._work_dir = tmp_path
+        if previous is not None:
+            first._effort_per_model = {model: previous}
+
+        live_push_started = asyncio.Event()
+        allow_failure = asyncio.Event()
+
+        async def fail_after_peer_write(command, *, args):
+            assert command == "/effort"
+            assert args == {"level": "high"}
+            live_push_started.set()
+            await allow_failure.wait()
+            raise RuntimeError("first live push failed")
+
+        first._client.send_command = AsyncMock(side_effect=fail_after_peer_write)
+        first_change = asyncio.create_task(first.change_effort("high"))
+        try:
+            await asyncio.wait_for(live_push_started.wait(), timeout=5)
+            assert _read_cli_overlay(tmp_path)[model] == "high"
+            assert await peer.change_effort(peer_level) is True
+            assert _read_cli_overlay(tmp_path)[model] == peer_level
+            peer_info = cli_json.stat()
+            peer_generation = (
+                peer_info.st_dev,
+                peer_info.st_ino,
+                peer_info.st_ctime_ns,
+                peer_info.st_mtime_ns,
+                peer_info.st_size,
+            )
+            allow_failure.set()
+            with pytest.raises(RuntimeError, match="first live push failed"):
+                await asyncio.wait_for(first_change, timeout=5)
+            current_info = cli_json.stat()
+            assert (
+                current_info.st_dev,
+                current_info.st_ino,
+                current_info.st_ctime_ns,
+                current_info.st_mtime_ns,
+                current_info.st_size,
+            ) == peer_generation
+        finally:
+            allow_failure.set()
+            await asyncio.gather(first_change, return_exceptions=True)
+
+        return first, peer, json.loads(cli_json.read_text(encoding="utf-8"))
+
+    @pytest.mark.asyncio
+    async def test_kiro_failed_effort_change_does_not_clear_newer_peer_value(self, tmp_path):
+        first, peer, persisted = await self._overlap_failed_kiro_effort_change(
+            tmp_path, previous=None
+        )
+
+        model_defaults = persisted["chat.modelDefaults"]
+        assert "gpt-5.6-luna" not in first._effort_per_model
+        assert peer._effort_per_model["gpt-5.6-luna"] == "max"
+        assert model_defaults["gpt-5.6-luna"]["reasoning"]["effort"] == "max"
+        assert model_defaults["claude-opus-4.7"]["output_config"]["effort"] == "medium"
+        assert persisted["chat.enableNotifications"] is True
+
+    @pytest.mark.asyncio
+    async def test_kiro_failed_effort_change_does_not_restore_over_newer_peer_value(self, tmp_path):
+        first, peer, persisted = await self._overlap_failed_kiro_effort_change(
+            tmp_path, previous="medium"
+        )
+
+        model_defaults = persisted["chat.modelDefaults"]
+        assert first._effort_per_model["gpt-5.6-luna"] == "medium"
+        assert peer._effort_per_model["gpt-5.6-luna"] == "max"
+        assert model_defaults["gpt-5.6-luna"]["reasoning"]["effort"] == "max"
+        assert model_defaults["claude-opus-4.7"]["output_config"]["effort"] == "medium"
+        assert persisted["chat.enableNotifications"] is True
+
+    @pytest.mark.asyncio
+    async def test_kiro_failed_effort_change_preserves_same_value_peer_generation(self, tmp_path):
+        first, peer, persisted = await self._overlap_failed_kiro_effort_change(
+            tmp_path, previous="medium", peer_level="high"
+        )
+
+        model_defaults = persisted["chat.modelDefaults"]
+        assert first._effort_per_model["gpt-5.6-luna"] == "medium"
+        assert peer._effort_per_model["gpt-5.6-luna"] == "high"
+        assert model_defaults["gpt-5.6-luna"]["reasoning"]["effort"] == "high"
+        assert model_defaults["claude-opus-4.7"]["output_config"]["effort"] == "medium"
+        assert persisted["chat.enableNotifications"] is True
+
+    async def _overlap_failed_kiro_effort_clear(
+        self, tmp_path, *, peer_level: str
+    ) -> tuple[AcpProvider, AcpProvider, dict]:
+        from kiro_crew.providers.acp import _read_cli_overlay, _write_cli_overlay
+
+        model = "gpt-5.6-luna"
+        peer_model = "claude-opus-4.7"
+        _write_cli_overlay(tmp_path, peer_model, "xhigh")
+        _write_cli_overlay(tmp_path, model, "high")
+        cli_json = tmp_path / ".kiro" / "settings" / "cli.json"
+        initial = json.loads(cli_json.read_text(encoding="utf-8"))
+        initial["chat.enableNotifications"] = True
+        cli_json.write_text(json.dumps(initial, indent=2), encoding="utf-8")
+
+        first = self._effort_provider(backend="", model=model)
+        peer = self._effort_provider(backend="", model=model)
+        first._client._work_dir = tmp_path
+        peer._client._work_dir = tmp_path
+        first._effort_per_model = {model: "high"}
+        first._effort_defaults = {model: "medium"}
+
+        live_push_started = asyncio.Event()
+        allow_failure = asyncio.Event()
+
+        async def fail_after_peer_write(command, *, args):
+            assert command == "/effort"
+            assert args == {"level": "medium"}
+            live_push_started.set()
+            await allow_failure.wait()
+            raise RuntimeError("first live clear failed")
+
+        first._client.send_command = AsyncMock(side_effect=fail_after_peer_write)
+        first_clear = asyncio.create_task(first.clear_effort())
+        try:
+            await asyncio.wait_for(live_push_started.wait(), timeout=5)
+            assert _read_cli_overlay(tmp_path)[model] == "medium"
+            assert await peer.change_effort(peer_level) is True
+            assert _read_cli_overlay(tmp_path)[model] == peer_level
+            peer_info = cli_json.stat()
+            peer_generation = (
+                peer_info.st_dev,
+                peer_info.st_ino,
+                peer_info.st_ctime_ns,
+                peer_info.st_mtime_ns,
+                peer_info.st_size,
+            )
+            allow_failure.set()
+            with pytest.raises(RuntimeError, match="first live clear failed"):
+                await asyncio.wait_for(first_clear, timeout=5)
+            current_info = cli_json.stat()
+            assert (
+                current_info.st_dev,
+                current_info.st_ino,
+                current_info.st_ctime_ns,
+                current_info.st_mtime_ns,
+                current_info.st_size,
+            ) == peer_generation
+        finally:
+            allow_failure.set()
+            await asyncio.gather(first_clear, return_exceptions=True)
+
+        return first, peer, json.loads(cli_json.read_text(encoding="utf-8"))
+
+    @pytest.mark.asyncio
+    async def test_kiro_failed_effort_clear_preserves_newer_peer_value(self, tmp_path):
+        first, peer, persisted = await self._overlap_failed_kiro_effort_clear(
+            tmp_path, peer_level="max"
+        )
+
+        model_defaults = persisted["chat.modelDefaults"]
+        assert first._effort_per_model["gpt-5.6-luna"] == "high"
+        assert peer._effort_per_model["gpt-5.6-luna"] == "max"
+        assert model_defaults["gpt-5.6-luna"]["reasoning"]["effort"] == "max"
+        assert model_defaults["claude-opus-4.7"]["output_config"]["effort"] == "xhigh"
+        assert persisted["chat.enableNotifications"] is True
+
+    @pytest.mark.asyncio
+    async def test_kiro_failed_effort_clear_preserves_same_default_peer_generation(self, tmp_path):
+        first, peer, persisted = await self._overlap_failed_kiro_effort_clear(
+            tmp_path, peer_level="medium"
+        )
+
+        model_defaults = persisted["chat.modelDefaults"]
+        assert first._effort_per_model["gpt-5.6-luna"] == "high"
+        assert peer._effort_per_model["gpt-5.6-luna"] == "medium"
+        assert model_defaults["gpt-5.6-luna"]["reasoning"]["effort"] == "medium"
+        assert model_defaults["claude-opus-4.7"]["output_config"]["effort"] == "xhigh"
+        assert persisted["chat.enableNotifications"] is True
 
     @pytest.mark.asyncio
     async def test_kiro_change_effort_gpt_uses_reasoning_overlay_key(self):

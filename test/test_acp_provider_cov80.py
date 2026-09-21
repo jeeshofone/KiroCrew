@@ -211,9 +211,15 @@ class TestClearEffort:
         provider._client.send_command = AsyncMock()
         monkeypatch.setattr(acp_mod, "model_supports_effort", lambda _m: True)
         monkeypatch.setattr(provider, "_resolve_effort", lambda: "high")
-        monkeypatch.setattr(provider, "_apply_effort_overlay", lambda: None)
+        strict_calls = []
+
+        def apply_effort_overlay(*, strict=False):
+            strict_calls.append(strict)
+
+        monkeypatch.setattr(provider, "_apply_effort_overlay", apply_effort_overlay)
 
         assert await provider.clear_effort() is True
+        assert strict_calls == [True]
         provider._client.send_command.assert_awaited_once_with("/effort", args={"level": "high"})
 
     @pytest.mark.asyncio

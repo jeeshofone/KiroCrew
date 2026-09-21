@@ -555,6 +555,20 @@ def _project_agent_fallback_name(spec: Path) -> str:
     return spec_stem(fallback)
 
 
+def agent_spec_effective_name(
+    spec: Path, data: dict[str, Any], *, strip_legacy_suffix: bool = False
+) -> str:
+    """Return the declared name or canonical filename fallback for parsed *data*.
+
+    The caller supplies an already-admitted parse so lifecycle checks can reuse
+    discovery semantics without reopening a user-writable source. Empty and
+    non-string names fall back like an absent name. Project discovery sets
+    *strip_legacy_suffix* for its supported ``.agent-spec.json`` spelling.
+    """
+    fallback = _project_agent_fallback_name(spec) if strip_legacy_suffix else spec_stem(spec.name)
+    return spec_str(data, "name", fallback) or fallback
+
+
 def _declared_project_agent_name(spec: Path) -> str | None:
     """The dispatchable name *spec* declares, or ``None`` when it does not parse.
 
@@ -566,7 +580,7 @@ def _declared_project_agent_name(spec: Path) -> str | None:
     data = _read_agent_spec(spec, operation="resolve_project_agent_name", source="unknown")
     if data is None:
         return None
-    return spec_str(data, "name", _project_agent_fallback_name(spec))
+    return agent_spec_effective_name(spec, data, strip_legacy_suffix=True)
 
 
 def project_agent_name(spec: Path) -> str:
@@ -1313,7 +1327,7 @@ def _global_agent_info(f: Path, data: dict[str, Any]) -> AgentInfo:
     # the broad ``except`` around the caller's loop turned that into a silently
     # DROPPED agent rather than a degraded one. Falling back to the filename stem
     # keeps the row selectable under the name its file already implies.
-    agent_name = spec_str(data, "name", f.stem)
+    agent_name = agent_spec_effective_name(f, data)
     stem = f.stem
 
     package = ""

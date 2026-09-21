@@ -8,10 +8,11 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from contextlib import aclosing
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from kiro_crew import model_scope
+from kiro_crew import model_scope, pinned_fs
 from kiro_crew.acp.client import (
     DEFAULT_MODEL,
     AcpAuthRequired,
@@ -89,11 +90,29 @@ from kiro_crew.providers.base import (
 )
 from kiro_crew.providers.cleanup import _is_safe_path
 from kiro_crew.recovery.ladder import InfraError
+from kiro_crew.workspace_cli_settings import workspace_cli_settings_lock
 
 logger = logging.getLogger(__name__)
 
 
-def _write_cli_overlay(work_dir: Path, model: str, effort: str) -> None:
+_CliSettingsGeneration = tuple[int, int, int, int, int]
+
+
+@dataclass(frozen=True)
+class _CliEffortOverlayWrite:
+    generation: _CliSettingsGeneration
+    persisted_effort: str | None
+
+
+def _cli_settings_generation(cli_json: Path) -> _CliSettingsGeneration:
+    """Return the identity of one published ``cli.json`` generation."""
+    info = pinned_fs.lstat_by_name(cli_json)
+    if info is None:
+        raise OSError(f"workspace CLI settings generation is unavailable: {cli_json}")
+    return (info.st_dev, info.st_ino, info.st_ctime_ns, info.st_mtime_ns, info.st_size)
+
+
+def _write_cli_overlay(work_dir: Path, model: str, effort: str) -> _CliEffortOverlayWrite:
     """Write a workspace cli.json overlay so kiro-cli applies effort at spawn.
 
     Path: ``<work_dir>/.kiro/settings/cli.json``. Workspace settings override
@@ -108,40 +127,53 @@ def _write_cli_overlay(work_dir: Path, model: str, effort: str) -> None:
 
         {"chat.modelDefaults": {"<model>": {"<key>": {"effort": "<level>"}}}}
     """
-    settings_dir = work_dir / ".kiro" / "settings"
-    settings_dir.mkdir(parents=True, exist_ok=True)
-    cli_json = settings_dir / "cli.json"
-    try:
-        existing = json.loads(cli_json.read_text(encoding="utf-8")) if cli_json.exists() else {}
-    except (json.JSONDecodeError, OSError):
-        existing = {}
-    if not isinstance(existing, dict):
-        existing = {}
-    model_defaults = existing.get("chat.modelDefaults")
-    if not isinstance(model_defaults, dict):
-        model_defaults = {}
-    model_cfg = model_defaults.get(model)
-    if not isinstance(model_cfg, dict):
-        model_cfg = {}
-    key = effort_settings_key(model)
-    effort_cfg = model_cfg.get(key)
-    if not isinstance(effort_cfg, dict):
-        effort_cfg = {}
-    effort_cfg["effort"] = effort
-    model_cfg[key] = effort_cfg
-    # Recovery checks output_config first, so leaving effort under both family
-    # keys can resurrect a stale value after restart.
-    other_key = "reasoning" if key == "output_config" else "output_config"
-    other_effort_cfg = model_cfg.get(other_key)
-    if isinstance(other_effort_cfg, dict) and "effort" in other_effort_cfg:
-        other_effort_cfg.pop("effort")
-        if not other_effort_cfg:
-            model_cfg.pop(other_key, None)
-    model_defaults[model] = model_cfg
-    existing["chat.modelDefaults"] = model_defaults
-    atomic_write(
-        cli_json, json.dumps(existing, indent=2)
-    )  # atomic: readers never see a partial file
+    with workspace_cli_settings_lock(work_dir) as cli_json:
+        try:
+            existing = json.loads(cli_json.read_text(encoding="utf-8")) if cli_json.exists() else {}
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+        if not isinstance(existing, dict):
+            existing = {}
+        model_defaults = existing.get("chat.modelDefaults")
+        if not isinstance(model_defaults, dict):
+            model_defaults = {}
+        model_cfg = model_defaults.get(model)
+        if not isinstance(model_cfg, dict):
+            model_cfg = {}
+        key = effort_settings_key(model)
+        other_key = "reasoning" if key == "output_config" else "output_config"
+        persisted_effort: str | None = None
+        for persisted_key in (key, other_key):
+            persisted_cfg = model_cfg.get(persisted_key)
+            if not isinstance(persisted_cfg, dict):
+                continue
+            persisted_value = persisted_cfg.get("effort")
+            if isinstance(persisted_value, str):
+                persisted_effort = persisted_value
+                break
+        effort_cfg = model_cfg.get(key)
+        if not isinstance(effort_cfg, dict):
+            effort_cfg = {}
+        effort_cfg["effort"] = effort
+        model_cfg[key] = effort_cfg
+        # Recovery checks output_config first, so leaving effort under both family
+        # keys can resurrect a stale value after restart.
+        other_effort_cfg = model_cfg.get(other_key)
+        if isinstance(other_effort_cfg, dict) and "effort" in other_effort_cfg:
+            other_effort_cfg.pop("effort")
+            if not other_effort_cfg:
+                model_cfg.pop(other_key, None)
+        model_defaults[model] = model_cfg
+        existing["chat.modelDefaults"] = model_defaults
+        atomic_write(
+            cli_json, json.dumps(existing, indent=2)
+        )  # atomic: readers never see a partial file
+        # The lock keeps both snapshots adjacent to the write: the prior value
+        # belongs to the input generation, and the identity to the published one.
+        return _CliEffortOverlayWrite(
+            generation=_cli_settings_generation(cli_json),
+            persisted_effort=persisted_effort,
+        )
 
 
 # The thresholds and their clamps live in ``agent_sdk.tool_search`` so the
@@ -194,64 +226,108 @@ def _write_tool_search_overlay(
     (e.g. ``"chat.modelDefaults"``), so the Tool Search keys are written flat to
     match.
     """
-    settings_dir = work_dir / ".kiro" / "settings"
-    settings_dir.mkdir(parents=True, exist_ok=True)
-    cli_json = settings_dir / "cli.json"
-    try:
-        existing = json.loads(cli_json.read_text(encoding="utf-8")) if cli_json.exists() else {}
-    except (json.JSONDecodeError, OSError):
-        existing = {}
-    if not isinstance(existing, dict):
-        existing = {}
-    existing["toolSearch.enabled"] = bool(enabled)
-    if enabled:
-        existing["toolSearch.minPct"] = _clamp_min_pct(min_pct)
-        existing["toolSearch.minTokens"] = _clamp_min_tokens(min_tokens)
-    else:
-        # Drop the thresholds when disabling so nothing is left behind that
-        # would take effect if a later build flips the global default on.
-        existing.pop("toolSearch.minPct", None)
-        existing.pop("toolSearch.minTokens", None)
-    atomic_write(
-        cli_json, json.dumps(existing, indent=2)
-    )  # atomic: readers never see a partial file
+    with workspace_cli_settings_lock(work_dir) as cli_json:
+        try:
+            existing = json.loads(cli_json.read_text(encoding="utf-8")) if cli_json.exists() else {}
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+        if not isinstance(existing, dict):
+            existing = {}
+        existing["toolSearch.enabled"] = bool(enabled)
+        if enabled:
+            existing["toolSearch.minPct"] = _clamp_min_pct(min_pct)
+            existing["toolSearch.minTokens"] = _clamp_min_tokens(min_tokens)
+        else:
+            # Drop the thresholds when disabling so nothing is left behind that
+            # would take effect if a later build flips the global default on.
+            existing.pop("toolSearch.minPct", None)
+            existing.pop("toolSearch.minTokens", None)
+        atomic_write(
+            cli_json, json.dumps(existing, indent=2)
+        )  # atomic: readers never see a partial file
 
 
 def _clear_cli_overlay_effort(work_dir: Path, model: str) -> None:
     """Remove the effort entry for *model* from the workspace cli.json overlay.
 
     Merge-safe: leaves other models' settings intact and drops now-empty
-    containers. No-op when the file or entry is absent.
+    containers. No-op when the file or entry is absent. Lock, read, and write
+    failures propagate so callers do not reset into a stale on-disk effort.
     """
-    cli_json = work_dir / ".kiro" / "settings" / "cli.json"
-    if not cli_json.exists():
-        return
-    try:
-        data = json.loads(cli_json.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return
-    if not isinstance(data, dict):
-        return
-    model_defaults = data.get("chat.modelDefaults")
-    if not isinstance(model_defaults, dict):
-        return
-    model_cfg = model_defaults.get(model)
-    if isinstance(model_cfg, dict):
-        # Clear whichever sub-key holds effort. Sweep both known shapes so a
-        # model whose family key changed (or an overlay written by an older
-        # build) is fully cleaned up, not just the current-family key.
-        for key in ("output_config", "reasoning"):
-            effort_cfg = model_cfg.get(key)
-            if isinstance(effort_cfg, dict):
-                effort_cfg.pop("effort", None)
-                if not effort_cfg:
-                    model_cfg.pop(key, None)
-        if not model_cfg:
-            model_defaults.pop(model, None)
-    try:
+    with workspace_cli_settings_lock(work_dir) as cli_json:
+        if not cli_json.exists():
+            return
+        try:
+            data = json.loads(cli_json.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return
+        if not isinstance(data, dict):
+            return
+        model_defaults = data.get("chat.modelDefaults")
+        if not isinstance(model_defaults, dict):
+            return
+        model_cfg = model_defaults.get(model)
+        if isinstance(model_cfg, dict):
+            # Clear whichever sub-key holds effort. Sweep both known shapes so a
+            # model whose family key changed (or an overlay written by an older
+            # build) is fully cleaned up, not just the current-family key.
+            for key in ("output_config", "reasoning"):
+                effort_cfg = model_cfg.get(key)
+                if isinstance(effort_cfg, dict):
+                    effort_cfg.pop("effort", None)
+                    if not effort_cfg:
+                        model_cfg.pop(key, None)
+            if not model_cfg:
+                model_defaults.pop(model, None)
         atomic_write(cli_json, json.dumps(data, indent=2))  # atomic
-    except OSError:
-        logger.debug("ACP effort overlay clear failed", exc_info=True)
+
+
+def _compare_and_swap_cli_overlay_effort(
+    work_dir: Path,
+    model: str,
+    expected_generation: _CliSettingsGeneration,
+    expected: str,
+    replacement: str | None,
+) -> bool:
+    """Replace one persisted effort only in the transaction's file generation.
+
+    The workspace lock makes the generation/read/compare/write one transaction.
+    Every cooperating cli.json writer publishes through ``atomic_write``, so an
+    intervening write has a different file identity even when it writes the same
+    effort value or restores byte-identical content. Returning ``False`` leaves
+    that newer generation and every unrelated setting untouched.
+    """
+    with workspace_cli_settings_lock(work_dir) as cli_json:
+        if not cli_json.exists():
+            return False
+        try:
+            if _cli_settings_generation(cli_json) != expected_generation:
+                return False
+            data = json.loads(cli_json.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return False
+        if not isinstance(data, dict):
+            return False
+        model_defaults = data.get("chat.modelDefaults")
+        if not isinstance(model_defaults, dict):
+            return False
+        model_cfg = model_defaults.get(model)
+        if not isinstance(model_cfg, dict):
+            return False
+        key = effort_settings_key(model)
+        effort_cfg = model_cfg.get(key)
+        if not isinstance(effort_cfg, dict) or effort_cfg.get("effort") != expected:
+            return False
+        if replacement is None:
+            effort_cfg.pop("effort")
+            if not effort_cfg:
+                model_cfg.pop(key)
+            if not model_cfg:
+                model_defaults.pop(model)
+        else:
+            effort_cfg["effort"] = replacement
+        atomic_write(cli_json, json.dumps(data, indent=2))
+        return True
 
 
 def _read_cli_overlay(work_dir: Path) -> dict[str, str]:
@@ -1372,8 +1448,12 @@ class AcpProvider(LLMProvider):
             defaults=self._effort_defaults,
         )
 
-    def _apply_effort_overlay(self) -> None:
+    def _apply_effort_overlay(self, *, strict: bool = False) -> _CliEffortOverlayWrite | None:
         """Write the kiro workspace cli.json overlay for (current model, effort).
+
+        Startup replay is best-effort. User-driven effort transactions pass
+        ``strict=True`` so a lock/write failure aborts the UI mutation instead
+        of committing an in-memory value that disagrees with the next spawn.
 
         Written only for the harnesses that READ it
         (``ACP_BACKENDS_KIRO_SLASH_COMMANDS`` — the kiro family takes effort from
@@ -1388,16 +1468,20 @@ class AcpProvider(LLMProvider):
         clear will never reach — a stale file left in the user's workspace.
         """
         if self._client.backend not in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
-            return
+            return None
         model = self._client._model
         level = self._resolve_effort()
         if not model or not level:
-            return
+            return None
         try:
-            _write_cli_overlay(self._client._work_dir, model, level)
+            overlay_write = _write_cli_overlay(self._client._work_dir, model, level)
             logger.debug("ACP effort overlay applied: model=%s effort=%s", model, level)
+            return overlay_write
         except Exception:
+            if strict:
+                raise
             logger.warning("ACP effort overlay write failed", exc_info=True)
+            return None
 
     @property
     def tool_search_settings(self) -> ToolSearchSettings | None:
@@ -1578,21 +1662,42 @@ class AcpProvider(LLMProvider):
         # overlay that would re-push the rejected level on every respawn.
         _prev = self._effort_per_model.get(model)
         self._effort_per_model[model] = level
-        self._apply_effort_overlay()
+        overlay_write: _CliEffortOverlayWrite | None = None
         try:
+            overlay_write = self._apply_effort_overlay(strict=True)
             if via_config_option:
                 await self._set_effort_config_option(level)
             else:
                 await self._client.send_command("/effort", args={"level": level})
         except Exception:
-            # Roll back to the prior state before propagating to the caller.
+            # Always restore this provider's in-memory view. The persisted view
+            # is shared by slots, so replace it only if this transaction's value
+            # is still current; a newer peer write owns the disk state.
             if _prev is None:
                 self._effort_per_model.pop(model, None)
-                if self._client.backend in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
-                    _clear_cli_overlay_effort(self._client._work_dir, model)
             else:
                 self._effort_per_model[model] = _prev
-                self._apply_effort_overlay()
+            if (
+                overlay_write is not None
+                and self._client.backend in ACP_BACKENDS_KIRO_SLASH_COMMANDS
+            ):
+                try:
+                    rolled_back = _compare_and_swap_cli_overlay_effort(
+                        self._client._work_dir,
+                        model,
+                        overlay_write.generation,
+                        level,
+                        overlay_write.persisted_effort,
+                    )
+                    if not rolled_back:
+                        logger.debug(
+                            "ACP effort overlay rollback skipped; persisted effort changed "
+                            "(model=%s attempted=%s)",
+                            model,
+                            level,
+                        )
+                except Exception:
+                    logger.warning("ACP effort overlay rollback failed", exc_info=True)
             logger.warning(
                 "ACP effort live push failed (model=%s effort=%s) — rolled back", model, level
             )
@@ -1630,7 +1735,7 @@ class AcpProvider(LLMProvider):
         model = self._client._model
         if not model_supports_effort(model):
             return False
-        self._effort_per_model.pop(model, None)
+        previous = self._effort_per_model.pop(model, None)
         if self._client.backend not in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
             # No live "reset to default" — caller must reset the session. Scoped
             # by membership so a harness that reads neither the overlay nor the
@@ -1644,13 +1749,54 @@ class AcpProvider(LLMProvider):
         # kiro family: clear/rewrite the overlay so a respawn doesn't re-apply it.
         level = self._resolve_effort()  # workspace default, or None
         if level:
-            self._apply_effort_overlay()
-            await self._client.send_command("/effort", args={"level": level})
+            overlay_write: _CliEffortOverlayWrite | None = None
+            try:
+                overlay_write = self._apply_effort_overlay(strict=True)
+                await self._client.send_command("/effort", args={"level": level})
+            except Exception:
+                if previous is None:
+                    self._effort_per_model.pop(model, None)
+                else:
+                    self._effort_per_model[model] = previous
+                if overlay_write is not None:
+                    try:
+                        rolled_back = _compare_and_swap_cli_overlay_effort(
+                            self._client._work_dir,
+                            model,
+                            overlay_write.generation,
+                            level,
+                            overlay_write.persisted_effort,
+                        )
+                        if not rolled_back:
+                            logger.debug(
+                                "ACP effort clear rollback skipped; persisted generation changed "
+                                "(model=%s attempted=%s)",
+                                model,
+                                level,
+                            )
+                    except Exception:
+                        logger.warning("ACP effort clear overlay rollback failed", exc_info=True)
+                logger.warning(
+                    "ACP effort clear-to-default failed (model=%s); keeping the override",
+                    model,
+                    exc_info=True,
+                )
+                raise
             logger.info("ACP effort cleared to workspace default %s (kiro)", level)
             return True
         # No default to push live — clear the overlay and let the caller reset
         # so kiro respawns at the model's built-in default.
-        _clear_cli_overlay_effort(self._client._work_dir, model)
+        try:
+            _clear_cli_overlay_effort(self._client._work_dir, model)
+        except Exception:
+            if previous is not None:
+                self._effort_per_model[model] = previous
+            logger.warning(
+                "ACP effort clear could not commit (model=%s); keeping the active override",
+                model,
+                exc_info=True,
+            )
+            raise
         logger.info("ACP effort cleared (kiro); session reset needed for built-in default")
         return False
 
