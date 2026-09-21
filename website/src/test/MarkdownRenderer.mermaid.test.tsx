@@ -35,6 +35,32 @@ describe('MarkdownRenderer mermaid config', () => {
     await vi.waitFor(() => expect(mermaid.render).toHaveBeenCalled())
   })
 
+  it('loads the rendered label glyphs and waits for fonts before measuring the diagram', async () => {
+    let releaseReady!: () => void
+    const ready = new Promise<void>(resolve => { releaseReady = resolve })
+    const load = vi.fn().mockResolvedValue([])
+    const original = Object.getOwnPropertyDescriptor(document, 'fonts')
+    Object.defineProperty(document, 'fonts', {
+      configurable: true,
+      value: { load, ready },
+    })
+    try {
+      render(<MarkdownRenderer content={'```mermaid\ngraph TD;A["節点 label"]-->B\n```'} />)
+      await vi.waitFor(() => expect(load).toHaveBeenCalled())
+      expect(mermaid.render).not.toHaveBeenCalled()
+
+      releaseReady()
+      await vi.waitFor(() => expect(mermaid.render).toHaveBeenCalledTimes(1))
+      expect(load.mock.calls[0][1]).toContain('節点 label')
+      expect(mermaid.initialize).toHaveBeenCalledWith(
+        expect.objectContaining({ fontFamily: expect.not.stringMatching(/^inherit$/i) })
+      )
+    } finally {
+      if (original) Object.defineProperty(document, 'fonts', original)
+      else delete (document as Document & { fonts?: FontFaceSet }).fonts
+    }
+  })
+
   it('does NOT touch mermaid for content without a diagram', async () => {
     // The point of the dynamic import: mermaid must not be pulled in — nor
     // initialized — just because a chat message rendered.

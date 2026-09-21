@@ -467,7 +467,27 @@ function loadMermaid(): Promise<MermaidApi> {
   return mermaidLoad
 }
 
-function initMermaid(mermaid: MermaidApi): void {
+async function readyMermaidFont(host: HTMLElement, text: string): Promise<string> {
+  const view = host.ownerDocument.defaultView
+  const style = view?.getComputedStyle(host)
+  const family = style?.fontFamily || 'sans-serif'
+  const size = style?.fontSize || '16px'
+  const fonts = host.ownerDocument.fonts
+  if (fonts) {
+    try {
+      // load(..., text) activates every fallback needed by the actual labels;
+      // ready then waits for the resulting layout/font work to settle.
+      await fonts.load(`${size} ${family}`, text)
+      await fonts.ready
+    } catch {
+      // FontFaceSet is an enhancement. Rendering with the computed family still
+      // matches measurement and paint better than Mermaid's inherited default.
+    }
+  }
+  return family
+}
+
+function initMermaid(mermaid: MermaidApi, fontFamily: string): void {
   const dark = isDarkTheme()
   mermaid.initialize({
     startOnLoad: false,
@@ -488,7 +508,7 @@ function initMermaid(mermaid: MermaidApi): void {
       tertiaryColor: '#f5f5f5',
     },
     securityLevel: 'strict',
-    fontFamily: 'inherit',
+    fontFamily,
     // Throw on parse errors instead of injecting mermaid's error diagram into
     // a temp <div id="dmermaid-*"> on document.body. That temp node is leaked
     // when render() throws (cleanup only runs on success), so failed blocks
@@ -725,7 +745,7 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
     // loop.
     const attempt = (mermaid: MermaidApi): Promise<{ svg: string } | null> =>
       whenBoxed()
-        .then(() => {
+        .then(async () => {
           if (!live) return null
           let lostBox = false
           if (typeof ResizeObserver === 'function') {
@@ -734,15 +754,21 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
             })
             watch.observe(host)
           }
-          // Re-initialized per render so a theme switch between two diagrams is
-          // picked up; initialize() is cheap and idempotent.
-          initMermaid(mermaid)
-          return mermaid.render(`mermaid-${id}`, code)
-            .then(result => ({ result, lostBox }))
-            .finally(() => {
-              watch?.disconnect()
-              watch = undefined
-            })
+          try {
+            // Mermaid measures labels in a scratch node. Load the exact
+            // computed family and every glyph before that measurement, while
+            // continuing to watch for a pane that goes hidden during the wait.
+            const fontFamily = await readyMermaidFont(host, code)
+            if (!live) return null
+            // Re-initialized per render so theme and accessibility-font changes
+            // between diagrams are picked up; initialize() is idempotent.
+            initMermaid(mermaid, fontFamily)
+            const result = await mermaid.render(`mermaid-${id}`, code)
+            return { result, lostBox }
+          } finally {
+            watch?.disconnect()
+            watch = undefined
+          }
         })
         .then(step => {
           if (!step || !live) return null
