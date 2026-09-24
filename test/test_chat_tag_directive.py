@@ -66,6 +66,17 @@ class TestChatTagTool:
         descriptor = next(t for t in mcp_core._list_tools() if t["name"] == "chat_tag")
         assert descriptor["inputSchema"]["type"] == "object"
 
+    def test_unprotected_status_recovery_names_owner_adoption(self):
+        """The description is what an agent relays when set_state is refused
+        status_identity_unprotected. A rowless tag's status toggle is disabled
+        in the tag manager and a status PATCH answers tag_id_not_grantable, so
+        the only working remedy is the owner's "Set up agent permissions"."""
+        descriptor = next(t for t in mcp_core._list_tools() if t["name"] == "chat_tag")
+        text = descriptor["description"]
+        assert "Set up agent permissions" in text
+        assert "PATCH with an explicit status" not in text
+        assert "toggling that tag's status off and on" not in text
+
 
 # ───────────────────────────── the policy helper ─────────────────────────────
 
@@ -378,6 +389,7 @@ def _no_disk(monkeypatch, tmp_path):
     chat_tag_grants._cache = None
     chat_tag_grants._degraded = None
     chat_tag_grants._quarantined_this_boot = False
+    chat_tag_grants._quarantine_repaired = False
     _seed_grants(_VOCAB)
 
     async def _save(state, slot, force=False, expected_history_key=None):
@@ -391,6 +403,7 @@ def _no_disk(monkeypatch, tmp_path):
     chat_tag_grants._cache = None
     chat_tag_grants._degraded = None
     chat_tag_grants._quarantined_this_boot = False
+    chat_tag_grants._quarantine_repaired = False
 
 
 def _seed_grants(vocab):

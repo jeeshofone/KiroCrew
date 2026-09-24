@@ -1369,8 +1369,9 @@ async def _apply_chat_tag(state: Any, slot: Any, session_key: str, args: dict[st
                     # treating it as a plain label would leave two exclusive
                     # states on the session. The vocabulary bit is agent-writable
                     # and grants nothing here — it is only ever a reason to
-                    # REFUSE. Recovery is one authenticated PATCH with an
-                    # explicit ``status``.
+                    # REFUSE. Recovery is owner adoption
+                    # (``POST /api/chat/tags/{id}/adopt``); a status PATCH on a
+                    # rowless tag answers ``tag_id_not_grantable``.
                     _sel_self_tag("denied", et["id"])
                     return _store_refusal("status_identity_unprotected", str(et["id"]))
                 if et_is_status and et["id"] != state_id:
