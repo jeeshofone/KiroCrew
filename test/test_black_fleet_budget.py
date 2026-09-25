@@ -626,7 +626,8 @@ def test_memory_budget_fits_every_address_space_ceiling(meminfo, expected):
     budget = launcher.memory_worker_budget(meminfo)
     assert budget == expected
     if expected is not None and expected > 1:
-        available = int(meminfo.split()[1]) * 1024
+        (line,) = [line for line in meminfo.splitlines() if line.startswith("MemAvailable:")]
+        available = int(line.split()[1]) * 1024
         assert (budget + 1) * launcher.MEMORY_BYTES <= available
 
 
@@ -737,5 +738,36 @@ def test_own_memory_current_reads_the_process_cgroup():
         "/sys/fs/cgroup/system.slice/runner.service/memory.current": "123456\n",
     }.get(str(path), "")
     assert diagnostics.own_memory_current() == "123456"
+    # A leaf that hides memory.current falls back to its nearest readable ancestor.
+    diagnostics.read = lambda path, limit=4096: {
+        "/proc/self/cgroup": "0::/system.slice/runner.service\n",
+        "/proc/self/mountinfo": "20 1 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+        "/sys/fs/cgroup/system.slice/memory.current": "654321\n",
+    }.get(str(path), "")
+    assert diagnostics.own_memory_current() == "654321"
     diagnostics.read = lambda path, limit=4096: ""
     assert diagnostics.own_memory_current() == ""
+
+
+def test_sampler_that_cannot_start_still_runs_the_gate(monkeypatch, capsys):
+    import threading
+
+    diagnostics = _diagnostics()
+    diagnostics.snapshot = lambda phase: None
+
+    def refuse(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", refuse)
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 1)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert diagnostics.main("scripts/check_black_formatting.py") == 1
+    assert len(calls) == 1
+    output = capsys.readouterr().out
+    assert "black memory sampler unavailable: RuntimeError" in output
+    assert "can't start new thread" not in output

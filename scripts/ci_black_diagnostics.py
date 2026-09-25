@@ -20,14 +20,14 @@ def read(path, limit=4096):
         return ""
 
 
-def snapshot(phase):
-    print(f"black resources {phase}", flush=True)
-    # Host meminfo is context, not the container's memory quota.
-    for line in read("/proc/meminfo").splitlines():
-        if line.startswith(("MemTotal:", "MemAvailable:", "SwapFree:")):
-            print(f"host {line}", flush=True)
+def memory_cgroups():
+    """Return ``(kind, directories)`` per visible memory cgroup mount.
+
+    Each directory list starts at the mount, then walks this process's own group
+    from its leaf up to the mount.
+    """
+    found = []
     groups = [line.split(":", 2) for line in read("/proc/self/cgroup", 16384).splitlines()[:64]]
-    seen: set[Path] = set()
     for line in read("/proc/self/mountinfo", 65536).splitlines()[:512]:
         fields = line.split()
         if "-" not in fields:
@@ -57,6 +57,18 @@ def snapshot(phase):
                 if current == mount:
                     break
                 current = current.parent
+        found.append((kind, candidates))
+    return found
+
+
+def snapshot(phase):
+    print(f"black resources {phase}", flush=True)
+    # Host meminfo is context, not the container's memory quota.
+    for line in read("/proc/meminfo").splitlines():
+        if line.startswith(("MemTotal:", "MemAvailable:", "SwapFree:")):
+            print(f"host {line}", flush=True)
+    seen: set[Path] = set()
+    for kind, candidates in memory_cgroups():
         names = (
             (
                 "memory.current",
@@ -108,29 +120,14 @@ SAMPLE_SECONDS = 30.0
 
 
 def own_memory_current():
-    """This process's cgroup v2 ``memory.current``, or "" when it is not readable."""
-    group = next(
-        (
-            line[3:]
-            for line in read("/proc/self/cgroup", 16384).splitlines()
-            if line.startswith("0::")
-        ),
-        None,
-    )
-    if group is None:
-        return ""
-    for line in read("/proc/self/mountinfo", 65536).splitlines()[:512]:
-        fields = line.split()
-        sep = fields.index("-") if "-" in fields else len(fields)
-        if fields[sep + 1 : sep + 2] != ["cgroup2"]:
+    """The nearest readable cgroup v2 ``memory.current`` to this process, or ""."""
+    for kind, candidates in memory_cgroups():
+        if kind != "cgroup2":
             continue
-        try:
-            relative = Path(group).relative_to(Path(fields[3]))
-        except ValueError:
-            continue
-        if ".." in relative.parts:
-            continue
-        return read(Path(fields[4]) / relative / "memory.current").strip()
+        for directory in candidates[1:] + candidates[:1]:
+            value = read(directory / "memory.current").strip()
+            if value:
+                return value
     return ""
 
 
@@ -149,14 +146,13 @@ def sample(elapsed):
     )
 
 
-def start_sampler(interval=None):
-    """Print a memory sample every ``interval`` seconds until the returned event is set."""
+def start_sampler():
+    """Print a memory sample every ``SAMPLE_SECONDS`` until the returned event is set."""
     stop = threading.Event()
-    period = SAMPLE_SECONDS if interval is None else interval
     started = time.monotonic()
 
     def loop():
-        while not stop.wait(period):
+        while not stop.wait(SAMPLE_SECONDS):
             try:
                 sample(time.monotonic() - started)
             except Exception as exc:
@@ -177,12 +173,19 @@ def main(gate: str) -> int:
     except importlib.metadata.PackageNotFoundError:
         print("Black distribution unavailable", flush=True)
     diagnose("before")
-    stop, sampler = start_sampler()
+    sampler = None
+    try:
+        sampler = start_sampler()
+    except Exception as exc:
+        # Same rule as diagnose(): no sampler is better than no gate.
+        print(f"black memory sampler unavailable: {type(exc).__name__}", flush=True)
     try:
         result = subprocess.run([sys.executable, gate])
     finally:
-        stop.set()
-        sampler.join(timeout=5)
+        if sampler is not None:
+            stop, thread = sampler
+            stop.set()
+            thread.join(timeout=5)
     diagnose("after")
     print(f"black gate returncode={result.returncode}", flush=True)
     return result.returncode if result.returncode >= 0 else 128 - result.returncode
