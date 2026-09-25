@@ -515,13 +515,21 @@ All eight `backend-test` shards use `linux_runner_large`; all eight
 `backend-test-windows` shards and `backend-test-windows-fail-closed` use the
 centrally resolved large Windows label. `e2e-boot-matrix` maps its Linux and
 Windows legs to those outputs without changing `matrix.os`, names, timeouts or
-artifact names. `backend-lint` uses large on the fleet. The formatter gate keeps
-Black's original native CLI and default worker selection when `RUNNER_ENVIRONMENT`
-is explicitly `github-hosted`; the CI step does not set `BLACK_NUM_WORKERS`.
-Fleet and local checks use `scripts/bounded_black.py`, with at most eight workers
-regardless of the native pool size. `scripts/ci_black_diagnostics.py` runs the gate
+artifact names. `backend-lint` uses large on the fleet. Every runner runs the
+formatter gate through `scripts/bounded_black.py`; the CI step does not set
+`BLACK_NUM_WORKERS`. Fleet and local checks keep Black's worker selection, with at
+most eight workers regardless of the native pool size. When `RUNNER_ENVIRONMENT` is
+explicitly `github-hosted` the gate also passes `--workers`, the smallest of the
+CPU count, that ceiling, and the number of 2 GiB ceilings (plus the coordinator's)
+that fit in `MemAvailable` at start. Hosted fork runners have no job cgroup limit,
+and the native default-worker command there exhausted the VM itself: the runner
+service died mid-step with exit 143 on every fork head
+([#13386](https://github.com/kirodotdev/KiroCrew/issues/13386)).
+`scripts/ci_black_diagnostics.py` runs the gate
 once, preserves its failure status and stderr, and records bounded cgroup readings
-and child peak RSS. Worker count alone does not bound retained formatting trees:
+and child peak RSS. While the gate runs it prints a `black memory sample` line
+(`MemAvailable`, `SwapFree`, own cgroup `memory.current`) every 30 seconds, so a
+runner killed mid-step still leaves its last memory reading in the log. Worker count alone does not bound retained formatting trees:
 [the env-only two-worker fleet run](https://github.com/kirodotdev/KiroCrew/actions/runs/35417525930/job/105829161045)
 reached its 15,032,385,536-byte cgroup limit and incremented `oom_kill` from zero
 to one before the recycling wrapper existed. Retirement after one file is what

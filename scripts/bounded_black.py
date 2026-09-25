@@ -18,6 +18,36 @@ MAX_WORKERS = 8
 MEMORY_BYTES = 2 * 1024**3
 
 
+def memory_worker_budget(meminfo: str) -> int | None:
+    """Workers whose address-space ceilings, plus the coordinator's, fit in MemAvailable.
+
+    Hosted runners have no job cgroup limit (``memory.max: max``), so the only
+    ceiling is the VM: exhausting it stops the runner service itself, which shows
+    as exit 143 with "runner has received a shutdown signal". Sizing
+    the pool so every capped process fits at once keeps the whole walk inside what
+    the VM had free when it started. ``None`` means the reading is unavailable.
+    """
+    for line in meminfo.splitlines():
+        name, _, value = line.partition(":")
+        if name != "MemAvailable":
+            continue
+        fields = value.split()
+        if len(fields) != 2 or fields[1] != "kB" or not fields[0].isdigit():
+            return None
+        available = int(fields[0]) * 1024
+        # One ceiling is reserved for the coordinator, which is capped too.
+        return max(1, available // MEMORY_BYTES - 1)
+    return None
+
+
+def hosted_worker_count(cpus: int | None, meminfo: str) -> int:
+    """Worker count for a GitHub-hosted runner: CPUs, the pool ceiling, and free memory."""
+    budget = memory_worker_budget(meminfo)
+    # An unreadable meminfo must not reopen the unbounded path: fall back to two
+    # recycled workers rather than to the CPU count.
+    return max(1, min(cpus or 1, MAX_WORKERS, 2 if budget is None else budget))
+
+
 def limit_memory() -> None:
     # This standalone build tool must not import the application's runtime.
     # RLIMIT_AS is enforceable on Linux; macOS/Windows retain recycling only.

@@ -7,6 +7,8 @@ import importlib.metadata
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 
@@ -100,6 +102,71 @@ def diagnose(phase):
         print(f"black resources unavailable: {type(exc).__name__}", flush=True)
 
 
+# The "after" snapshot never runs when the runner itself is killed mid-step. A
+# periodic line means the last one printed before death is the evidence.
+SAMPLE_SECONDS = 30.0
+
+
+def own_memory_current():
+    """This process's cgroup v2 ``memory.current``, or "" when it is not readable."""
+    group = next(
+        (
+            line[3:]
+            for line in read("/proc/self/cgroup", 16384).splitlines()
+            if line.startswith("0::")
+        ),
+        None,
+    )
+    if group is None:
+        return ""
+    for line in read("/proc/self/mountinfo", 65536).splitlines()[:512]:
+        fields = line.split()
+        sep = fields.index("-") if "-" in fields else len(fields)
+        if fields[sep + 1 : sep + 2] != ["cgroup2"]:
+            continue
+        try:
+            relative = Path(group).relative_to(Path(fields[3]))
+        except ValueError:
+            continue
+        if ".." in relative.parts:
+            continue
+        return read(Path(fields[4]) / relative / "memory.current").strip()
+    return ""
+
+
+def sample(elapsed):
+    meminfo = {
+        name: value.strip()
+        for name, _, value in (line.partition(":") for line in read("/proc/meminfo").splitlines())
+        if name in ("MemAvailable", "SwapFree")
+    }
+    print(
+        f"black memory sample t={elapsed:.0f}s "
+        f"MemAvailable={meminfo.get('MemAvailable', '?')} "
+        f"SwapFree={meminfo.get('SwapFree', '?')} "
+        f"cgroup_memory_current={own_memory_current() or '?'}",
+        flush=True,
+    )
+
+
+def start_sampler(interval=None):
+    """Print a memory sample every ``interval`` seconds until the returned event is set."""
+    stop = threading.Event()
+    period = SAMPLE_SECONDS if interval is None else interval
+    started = time.monotonic()
+
+    def loop():
+        while not stop.wait(period):
+            try:
+                sample(time.monotonic() - started)
+            except Exception as exc:
+                print(f"black memory sample unavailable: {type(exc).__name__}", flush=True)
+
+    thread = threading.Thread(target=loop, name="black-memory-sampler", daemon=True)
+    thread.start()
+    return stop, thread
+
+
 def main(gate: str) -> int:
     print(
         f"Python {sys.version.split()[0]}; BLACK_NUM_WORKERS={os.getenv('BLACK_NUM_WORKERS')}",
@@ -110,7 +177,12 @@ def main(gate: str) -> int:
     except importlib.metadata.PackageNotFoundError:
         print("Black distribution unavailable", flush=True)
     diagnose("before")
-    result = subprocess.run([sys.executable, gate])
+    stop, sampler = start_sampler()
+    try:
+        result = subprocess.run([sys.executable, gate])
+    finally:
+        stop.set()
+        sampler.join(timeout=5)
     diagnose("after")
     print(f"black gate returncode={result.returncode}", flush=True)
     return result.returncode if result.returncode >= 0 else 128 - result.returncode

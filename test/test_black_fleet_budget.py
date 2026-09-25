@@ -18,6 +18,10 @@ CI = ROOT / ".github" / "workflows" / "ci.yml"
 SCRIPT = ROOT / "scripts" / "check_black_formatting.py"
 
 
+# A hosted fork runner's pre-step snapshot: 16 GB VM, no cgroup cap.
+HOSTED_MEMINFO = "MemTotal:       16373444 kB\nMemAvailable:   14950508 kB\n"
+
+
 def _step():
     steps = yaml.safe_load(CI.read_text(encoding="utf-8"))["jobs"]["backend-lint"]["steps"]
     return next(step for step in steps if step.get("name") == "Check formatting (black, baselined)")
@@ -152,15 +156,16 @@ def test_gate_preserves_scope_workers_and_baseline_on_black_result(
     original = "# unchanged\nsrc/known.py\n"
     baseline.write_text(original, encoding="utf-8")
     monkeypatch.setenv("BLACK_NUM_WORKERS", "2")
+    monkeypatch.setattr(os, "cpu_count", lambda: 4)
+    monkeypatch.setattr(gate, "_read_text", lambda path: HOSTED_MEMINFO)
     calls = []
 
     def black_run(argv, **kwargs):
         calls.append(argv)
-        launcher = (
-            ["-m", "black"]
-            if runner == "github-hosted"
-            else [str(ROOT / "scripts" / "bounded_black.py")]
-        )
+        # Every runner recycles; only hosted also sizes the pool to free memory.
+        launcher = [str(ROOT / "scripts" / "bounded_black.py")]
+        if runner == "github-hosted":
+            launcher += ["--workers", "4"]
         assert argv == [
             sys.executable,
             *launcher,
@@ -602,3 +607,135 @@ def test_empty_native_discovery_and_invalid_cli(tmp_path):
     for args, expected in [(["--check", "src"], 0), (["--unknown-option", "src"], 123)]:
         result = _black_run(tmp_path, args)
         assert result.returncode == expected, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("meminfo", "expected"),
+    [
+        (HOSTED_MEMINFO, 6),  # 14.3 GiB free: six 2 GiB workers plus the coordinator.
+        ("MemAvailable:    3145728 kB\n", 1),  # Tight VM still runs, one worker.
+        ("MemAvailable:   33554432 kB\n", 15),
+        ("MemTotal: 1 kB\n", None),
+        ("MemAvailable: lots\n", None),
+        ("MemAvailable: 1 MB\n", None),
+        ("", None),
+    ],
+)
+def test_memory_budget_fits_every_address_space_ceiling(meminfo, expected):
+    launcher = _launcher()
+    budget = launcher.memory_worker_budget(meminfo)
+    assert budget == expected
+    if expected is not None and expected > 1:
+        available = int(meminfo.split()[1]) * 1024
+        assert (budget + 1) * launcher.MEMORY_BYTES <= available
+
+
+@pytest.mark.parametrize(
+    ("cpus", "meminfo", "expected"),
+    [
+        (4, HOSTED_MEMINFO, 4),  # ubuntu-latest: CPU-bound, memory has headroom.
+        (64, HOSTED_MEMINFO, 6),  # Memory, not CPUs, bounds a large VM.
+        (64, "MemAvailable:   67108864 kB\n", 8),  # The launcher ceiling still holds.
+        (4, "MemAvailable:    3145728 kB\n", 1),
+        (4, "", 2),  # Unreadable meminfo never falls back to the CPU count.
+        (None, HOSTED_MEMINFO, 1),
+    ],
+)
+def test_hosted_worker_count_is_bounded(cpus, meminfo, expected):
+    launcher = _launcher()
+    assert launcher.hosted_worker_count(cpus, meminfo) == expected
+    assert 1 <= expected <= launcher.MAX_WORKERS
+
+
+def test_hosted_gate_never_runs_native_black(monkeypatch, tmp_path):
+    # The native, default-worker command exhausts a hosted VM mid-walk.
+    monkeypatch.setenv("RUNNER_ENVIRONMENT", "github-hosted")
+    spec = importlib.util.spec_from_file_location("black_hosted_gate", SCRIPT)
+    assert spec and spec.loader
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    monkeypatch.setattr(gate, "ROOT", tmp_path)
+    (tmp_path / "src").mkdir()
+    monkeypatch.setattr(os, "cpu_count", lambda: 64)
+    monkeypatch.setattr(gate, "_read_text", lambda path: HOSTED_MEMINFO)
+    calls = []
+
+    def black_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", black_run)
+    assert gate._unformatted(gate.DEFAULT_TARGETS) == set()
+    (argv,) = calls
+    assert "-m" not in argv
+    assert argv[1] == str(ROOT / "scripts" / "bounded_black.py")
+    assert argv[2:4] == ["--workers", "6"]
+
+
+def test_sampler_records_memory_while_the_gate_runs(monkeypatch, tmp_path):
+    # A killed runner never reaches the "after" snapshot, so samples must print
+    # during the gate, flushed, from the diagnostic process itself.
+    gate = tmp_path / "gate.py"
+    gate.write_text("import time, sys\ntime.sleep(1.5)\nsys.exit(1)\n", encoding="utf-8")
+    driver = tmp_path / "driver.py"
+    driver.write_text(
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('d', {str(ROOT / 'scripts' / 'ci_black_diagnostics.py')!r})\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(module)\n"
+        "module.SAMPLE_SECONDS = 0.2\n"
+        "raise SystemExit(module.main(sys.argv[1]))\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [sys.executable, str(driver), str(gate)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    assert result.returncode == 1
+    samples = [line for line in result.stdout.splitlines() if "black memory sample t=" in line]
+    assert len(samples) >= 2, result.stdout
+    if sys.platform == "linux":
+        assert "MemAvailable=?" not in samples[0]
+    # Sampling stops with the gate: nothing prints after its verdict line.
+    tail = result.stdout.split("black gate returncode=1")[1]
+    assert "black memory sample" not in tail
+
+
+def test_sampler_failure_cannot_change_the_verdict(monkeypatch, capsys):
+    diagnostics = _diagnostics()
+    diagnostics.snapshot = lambda phase: None
+
+    def broken(elapsed):
+        raise PermissionError("must not print exception payload")
+
+    diagnostics.sample = broken
+    diagnostics.SAMPLE_SECONDS = 0.05
+
+    def run(argv, **kwargs):
+        import time
+
+        time.sleep(0.3)
+        return subprocess.CompletedProcess(argv, 1)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert diagnostics.main("scripts/check_black_formatting.py") == 1
+    output = capsys.readouterr().out
+    assert "black memory sample unavailable: PermissionError" in output
+    assert "must not print exception payload" not in output
+
+
+def test_own_memory_current_reads_the_process_cgroup():
+    diagnostics = _diagnostics()
+    diagnostics.Path = PurePosixPath
+    diagnostics.read = lambda path, limit=4096: {
+        "/proc/self/cgroup": "0::/system.slice/runner.service\n",
+        "/proc/self/mountinfo": "20 1 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+        "/sys/fs/cgroup/system.slice/runner.service/memory.current": "123456\n",
+    }.get(str(path), "")
+    assert diagnostics.own_memory_current() == "123456"
+    diagnostics.read = lambda path, limit=4096: ""
+    assert diagnostics.own_memory_current() == ""

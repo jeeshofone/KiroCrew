@@ -87,18 +87,42 @@ HEADER = """\
 """
 
 
+def _read_text(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as stream:
+            return stream.read(65536)
+    except OSError:
+        return ""
+
+
+def _load_bounded_black():
+    """The launcher module, loaded by path for the same reason as ``_load_scope``."""
+    script = Path(__file__).with_name("bounded_black.py")
+    spec = importlib.util.spec_from_file_location("bounded_black", script)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"cannot load {script}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _unformatted(targets: tuple[str, ...]) -> set[str]:
     """Return repo-relative paths black would reformat, via one black run."""
     existing = [name for name in targets if (ROOT / name).exists()]
     if not existing:
         raise SystemExit(f"none of the targets {targets} exist under {ROOT}")
-    # Hosted CI retains its native command and worker selection. Fleet and local
-    # checks use recycling for the measured compiled-Black retention failure.
-    launcher = (
-        ["-m", "black"]
-        if os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
-        else [str(Path(__file__).with_name("bounded_black.py"))]
-    )
+    launcher = [str(Path(__file__).with_name("bounded_black.py"))]
+    # Every runner recycles workers under the per-process ceiling. Hosted runners
+    # set no job cgroup limit, so an unbounded walk exhausts the VM itself and the
+    # runner service dies mid-step with exit 143. Hosted therefore also sizes the
+    # pool to the memory free at start; fleet runners keep their selection
+    # (BLACK_NUM_WORKERS or CPUs, capped by the launcher).
+    if os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted":
+        workers = _load_bounded_black().hosted_worker_count(
+            os.cpu_count(), _read_text("/proc/meminfo")
+        )
+        launcher += ["--workers", str(workers)]
+        print(f"black hosted workers: {workers} (cpus={os.cpu_count()})", flush=True)
     proc = subprocess.run(
         [
             sys.executable,
