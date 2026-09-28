@@ -3,6 +3,7 @@ import { whenScrollQuiet } from '../lib/scrollQuiet'
 import { emitSlotRead } from '../lib/slotReadRelay'
 import { nextActiveAfterClose } from '../lib/sessionTabs'
 import { api } from '../api/client'
+import { isNotFoundError } from '../api/apiError'
 import { resolveDefaultMemoryMode } from '../api/queryClient'
 import { devLog, inspectorOn } from '../dev/scrollInspector'
 import { addSlotOptimistic, updateSlot, removeSlotOptimistic, releaseCloseHold, confirmCloseHold, armConfirmedCloseHold, markSlotRead, fetchSlots, slotSurfaceKey, slotIsRemoteBound, sseSlots, sseSlotPatch, sseConnected } from './dashboardSlice'
@@ -3685,9 +3686,16 @@ export const createSlot = createAsyncThunk<
   },
 )
 
-export const deleteSlot = createAsyncThunk(
+export const deleteSlot = createAsyncThunk<
+  string,
+  string,
+  // `alreadyGone` marks a close the server answered with 404: this request
+  // closed nothing, so `deleteSlot.fulfilled` must not tear down the tab's
+  // view state for a slot the close that did pop it may still restore.
+  { fulfilledMeta: { alreadyGone: boolean } }
+>(
   'chat/deleteSlot',
-  async (key: string, { dispatch, getState, requestId }) => {
+  async (key: string, { dispatch, getState, requestId, fulfillWithValue }) => {
     const root = getState() as RootState
     const deletedSlot = root.dashboard.slots.find(s => s.key === key)
     // Use the surface key (forward-compat alias for `mode`) so a future
@@ -3734,13 +3742,34 @@ export const deleteSlot = createAsyncThunk(
       }
     }
     dispatch(removeSlotOptimistic(key))
+    // A 404 means the server no longer has this slot (a second tab or a
+    // repeat close got there first): that is the end state being asked for,
+    // so it completes the close instead of failing it.
+    let alreadyGone = false
     try {
-      await api.deleteChatSlot(key)
-      // Confirm the close hold NOW, not on `fulfilled`: that action trails the
-      // `await navigation` below, and a peer transcript load that outlasts the
-      // in-flight cap would otherwise expire a hold whose close succeeded.
-      dispatch(confirmCloseHold({ key, requestId }))
-      gcSessionStorage(key)
+      await api.deleteChatSlot(key).catch((err: unknown) => {
+        if (!isNotFoundError(err)) throw err
+        alreadyGone = true
+      })
+      if (alreadyGone) {
+        // This request closed nothing: another close popped the key, and that
+        // close can still fail and put the slot back. Drop the hold rather than
+        // confirm it, so the next authoritative list decides, and a restored
+        // row shows again instead of staying hidden behind this tombstone.
+        // A slot list serialized before the server popped the key may still be
+        // in flight, and with the hold gone nothing else would stop its reply
+        // re-adding the row: `distrustInFlight` pairs those requests with the
+        // key before the release. The refetch after it is the post-pop list
+        // that shows the row again if the popping close restored it.
+        dispatch(releaseCloseHold({ key, requestId, distrustInFlight: true }))
+        dispatch(fetchSlots())
+      } else {
+        // Confirm the close hold NOW, not on `fulfilled`: that action trails the
+        // `await navigation` below, and a peer transcript load that outlasts the
+        // in-flight cap would otherwise expire a hold whose close succeeded.
+        dispatch(confirmCloseHold({ key, requestId }))
+        gcSessionStorage(key)
+      }
     } catch {
       // Release the close hold BEFORE refetching: this thunk's `rejected` (which
       // also releases it) fires only after the `await navigation` below, and
@@ -3758,7 +3787,7 @@ export const deleteSlot = createAsyncThunk(
       // the error being propagated.
       await navigation
     }
-    return key
+    return fulfillWithValue(key, { alreadyGone })
   },
 )
 
@@ -7480,6 +7509,10 @@ const chatSlice = createSlice({
         setPagingCursor(state, false, 0)
       })
       .addCase(deleteSlot.fulfilled, (state, action) => {
+        // A 404 close closed nothing: the close that did pop the key can still
+        // fail and restore the slot, so its caches stay until an authoritative
+        // slot list (`reconcileSlotResidue`) or a `removed` frame evicts them.
+        if (action.meta?.alreadyGone) return
         evictSlotState(state, action.payload)
         if (state.activeSlot === action.payload) {
           state.activeSlot = null
