@@ -236,6 +236,25 @@ class TestWrappedSpawnApproval:
 # ── (c) the Telegram delivery hook ──────────────────────────────────────────
 
 
+@pytest.fixture
+def _press_lands_inside_the_window(
+    _short_prompt_wait: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Give an arm that EXPECTS a press a lost-run window, not the refusal bound.
+
+    The class-level ``_short_prompt_wait`` (0.2s) bounds the arms that never await a press. An arm whose press
+    resolves the wait would otherwise also be asserting that ``on_callback``
+    finishes inside 0.2s of wall clock, and that path includes the governance
+    ``run_in_executor`` hop in ``channel_inbound_permitted``, which a loaded
+    runner can stall past it: the wait expires, the future is popped, and the
+    press resolves nothing. A press that lands returns at once, so this costs no
+    time; one that never resolves still fails by name well inside ``--timeout``.
+    """
+    import kiro_crew.telegram.renderer as renderer_mod
+
+    monkeypatch.setattr(renderer_mod, "_APPROVAL_TIMEOUT_S", 30.0)
+
+
 async def _press(dispatcher, session_key: str, request_id: str, flag: str) -> None:  # type: ignore[no-untyped-def]
     """Simulate the user pressing an Approve/Deny/Trust button in the DM.
 
@@ -595,6 +614,7 @@ class TestASilentSendFailureFallsThroughAtOnce:
         assert result is None
         assert len(calls) == 1
 
+    @pytest.mark.usefixtures("_press_lands_inside_the_window")
     def test_a_real_message_id_still_arms_the_wait_and_honors_the_press(self) -> None:
         # The other side of the same branch: a truthy id is a delivered prompt, so
         # the gate still awaits it and returns the press verbatim.
@@ -762,6 +782,7 @@ class TestTheDestinationIsReauthorizedBeforeTheSend:
         assert result is None
         assert cli.sent == []
 
+    @pytest.mark.usefixtures("_press_lands_inside_the_window")
     def test_an_authorized_destination_still_posts_through_the_transport_gate(self) -> None:
         # The gate is consulted with the destination it will actually send to, and a
         # grant is not turned into a refusal.
@@ -786,6 +807,37 @@ class TestTheDestinationIsReauthorizedBeforeTheSend:
         assert asyncio.run(_go()) is True
         assert len(cli.sent) == 1
         assert seen == [("7", None)]
+
+    @pytest.mark.usefixtures("_press_lands_inside_the_window")
+    def test_a_press_slower_than_the_refusal_bound_still_resolves(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Price the press path's governance hop past the class's 0.2s refusal
+        # bound, as a loaded runner's executor does. The arm that expects a press
+        # must still read it, rather than time out and report a denial.
+        import time
+
+        import kiro_crew.messaging.identity as identity_mod
+
+        real = identity_mod._channel_inbound_permitted_sync
+
+        def _slow(channel_type: str) -> bool:
+            time.sleep(0.3)
+            return bool(real(channel_type))
+
+        monkeypatch.setattr(identity_mod, "_channel_inbound_permitted_sync", _slow)
+        d, cli, _sess = _dispatcher({7})
+        session_key = d._session_key(("direct", "7"))
+
+        async def _go() -> bool | None:
+            task = asyncio.ensure_future(
+                d.deliver_spawn_approval("spawn:abc", "spawn_run(build)", session_key)
+            )
+            await _press(d, session_key, "spawn:abc", "1")
+            return await asyncio.wait_for(task, 10.0)
+
+        assert asyncio.run(_go()) is True
+        assert len(cli.sent) == 1
 
 
 class TestAnOverlappingRestartKeepsItsReplacementHook:

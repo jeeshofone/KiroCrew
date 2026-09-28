@@ -80,6 +80,25 @@ def _short_prompt_wait(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def _press_lands_inside_the_window(
+    _short_prompt_wait: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Give an arm that EXPECTS a press a lost-run window, not the refusal bound.
+
+    The 0.2s above bounds the arms that never await a press. An arm whose press
+    resolves the wait would otherwise also be asserting that ``on_callback``
+    finishes inside 0.2s of wall clock, and that path includes the governance
+    ``run_in_executor`` hop in ``channel_inbound_permitted``, which a loaded
+    runner can stall past it: the wait expires, the future is popped, and the
+    press resolves nothing. A press that lands returns at once, so this costs no
+    time; one that never resolves still fails by name well inside ``--timeout``.
+    """
+    import kiro_crew.telegram.renderer as renderer_mod
+
+    monkeypatch.setattr(renderer_mod, "_APPROVAL_TIMEOUT_S", 30.0)
+
+
+@pytest.fixture
 def _ceiling(monkeypatch: pytest.MonkeyPatch):
     """Substitute the ceiling predicate, defaulting to PERMIT.
 
@@ -235,6 +254,7 @@ class TestAMidWaitDenyFallsThrough:
         assert key not in TelegramApprovalDecider._REGISTRY
         assert _ceiling.calls == ["telegram"]
 
+    @pytest.mark.usefixtures("_press_lands_inside_the_window")
     def test_an_approve_press_is_unaffected(self, _ceiling) -> None:
         # The permitted path is untouched: a press still resolves, and the ceiling
         # is asked once (before the post) and never behind a wait that never
