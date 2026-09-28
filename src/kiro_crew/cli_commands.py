@@ -2217,6 +2217,9 @@ def _cron_preview(args: argparse.Namespace) -> None:
         print(f"Error: cannot load {script_path}")
         sys.exit(1)
     module = importlib.util.module_from_spec(spec)
+    # Registered before exec, as the production child does: dataclasses resolves
+    # a postponed annotation through sys.modules[cls.__module__].
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     func = getattr(module, func_name, None)
     if func is None:

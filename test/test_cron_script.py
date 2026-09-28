@@ -626,6 +626,28 @@ def run(ctx):
             result = run_script_sandboxed(script_path + ":run", "test-job-id", "hello-world")
         assert result["status"] == "ok"
 
+    def test_dataclass_with_postponed_annotations_loads(self, tmp_path):
+        """A script that runs under plain Python must also load in the child.
+
+        ``dataclasses`` resolves a string annotation through
+        ``sys.modules[cls.__module__]``, so a script module the launcher never
+        registers there fails at import under ``from __future__ import annotations``.
+        """
+        script_path = self._write_script(
+            tmp_path,
+            "from __future__ import annotations\n"
+            "from dataclasses import dataclass\n"
+            "@dataclass\n"
+            "class Item:\n"
+            "    name: str\n"
+            "def run(ctx):\n"
+            "    if Item('x').name != 'x':\n"
+            "        raise RuntimeError('dataclass field lost')\n",
+        )
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = run_script_sandboxed(script_path + ":run", "test-job-id", "")
+        assert result["status"] == "ok", result
+
 
 class TestScriptContext:
     """Tests for ScriptContext properties."""

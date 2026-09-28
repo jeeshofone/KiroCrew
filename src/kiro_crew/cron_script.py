@@ -1932,6 +1932,10 @@ def run_script_sandboxed(
         f"sys.path.insert(0, {import_dir_str!r})\n"
         f"mod = types.ModuleType('_cron_script')\n"
         f"mod.__file__ = {file_path_str!r}\n"
+        # Registered before exec: dataclasses, typing.get_type_hints and pickle
+        # resolve a class's names through sys.modules[cls.__module__], which a
+        # postponed-annotations script needs at class-definition time.
+        "sys.modules['_cron_script'] = mod\n"
         # The compile filename stays the original so tracebacks point at the
         # file the operator knows.
         "if _payload:\n"

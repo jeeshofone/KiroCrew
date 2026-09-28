@@ -98,6 +98,24 @@ class TestCronPreviewDone:
         assert "finished" in out
 
 
+class TestCronPreviewPostponedAnnotations:
+    def test_dataclass_with_postponed_annotations_loads(self, tmp_path: Path, capsys):
+        """``dataclasses`` resolves string annotations via ``sys.modules[cls.__module__]``,
+        so preview must register the script module before executing it."""
+        p = _write_script(
+            tmp_path, "s.py",
+            "from __future__ import annotations\n"
+            "from dataclasses import dataclass\n"
+            "from kiro_crew.cron_script import Report\n"
+            "@dataclass\n"
+            "class Item:\n"
+            "    name: str\n"
+            "def run(ctx): raise Report(f'item {Item(\"x\").name}')\n")
+        with _patch_resolve(tmp_path):
+            _cron_preview(_make_args(f"{p}:run"))
+        assert "item x" in capsys.readouterr().out
+
+
 class TestCronPreviewError:
     def test_error_output(self, tmp_path: Path, capsys):
         p = _write_script(
