@@ -6620,6 +6620,54 @@ class TestRunChatCompactDeferredWait:
             "window_tokens": 200_000,
         }
 
+    @pytest.mark.asyncio
+    async def test_replay_pending_compact_returns_without_waiting(self, tmp_path, monkeypatch):
+        """A /compact that reaches a fresh session still owing replay ends now.
+
+        The replayed history is delivered only with the next context-bearing
+        prompt, so the provider session holds nothing: kiro-cli answers
+        "Conversation too short to compact." with ``end_turn`` and never sends a
+        compaction status. Waiting for one strands the chat for the whole
+        compaction timeout and then reports a timeout for a compaction that was
+        never going to start. The replay lease must stay armed for the next
+        ordinary prompt, and no reinjection is armed because nothing was
+        compacted.
+        """
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_mock_client(
+            [
+                LLMEvent(kind=EVENT_TEXT_CHUNK, text="Conversation too short to compact.\n"),
+                LLMEvent(kind=EVENT_COMPLETE),
+            ]
+        )
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+        state.sessions.provider_switch_replay_pending = MagicMock(return_value=True)
+        state.sessions.consume_provider_switch_replay = MagicMock(return_value=True)
+        state.sessions.commit_provider_switch_replay_sid = MagicMock(return_value=True)
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "/compact")
+
+        client.wait_for_compaction.assert_not_called()
+        state.sessions.mark_needs_reinjection.assert_not_called()
+        state.sessions.consume_provider_switch_replay.assert_not_called()
+        state.sessions.commit_provider_switch_replay_sid.assert_not_called()
+        compacting_frames = [
+            c
+            for c in state.broadcast_ws.call_args_list
+            if c.args and c.args[0] == "chat_message" and c.args[1].get("role") == "compacting"
+        ]
+        assert compacting_frames == []
+        notices = [m for m in slot.messages if m.get("meta", {}).get("kind") == "compaction"]
+        assert len(notices) == 1
+        assert notices[0]["content"].startswith("Nothing to compact yet")
+        assert not any("timed out" in m.get("content", "") for m in slot.messages)
+
     @staticmethod
     def _compaction_notice(slot) -> str:
         """The text of the compaction notice appended to the transcript."""

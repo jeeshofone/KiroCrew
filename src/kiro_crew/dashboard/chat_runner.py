@@ -2443,6 +2443,14 @@ _COMPACTION_FAILED_RETRIES = 2
 # conversation away instead of explaining it.
 _COMPACT_FAIL_REASON_MAX_CHARS = 300
 
+# The answer to a /compact that reached a fresh provider session still owing the
+# Kiro Crew conversation replay. The replay rides the next context-bearing
+# prompt, so that session holds nothing yet and the backend reports no
+# compaction status to wait for.
+COMPACT_REPLAY_PENDING_NOTICE = (
+    "Nothing to compact yet: the restored history is delivered with your next message."
+)
+
 
 class _Snapshot(NamedTuple):
     content: str
@@ -17000,7 +17008,15 @@ async def _run_chat(
             # harness it is. The two arms are not interchangeable: acknowledging a
             # backend that reports asynchronously loses the notice, and awaiting one
             # that already finished strands the waiter for its whole timeout.
-            if capabilities_of(client).compacts_inline:
+            if _replay_pending:
+                # A slash command never delivers the replay, so the lease is
+                # still armed and the provider session is empty: kiro-cli ends
+                # the turn with "Conversation too short to compact." and sends
+                # no compaction status. Awaiting one would hold the chat for the
+                # whole compaction timeout. Nothing was compacted, so skills
+                # context is not re-armed and the lease stays for the next prompt.
+                _append_compaction_notice(state, slot, COMPACT_REPLAY_PENDING_NOTICE)
+            elif capabilities_of(client).compacts_inline:
                 _restore_skills_context_after_compaction()
                 msg = "✅ Conversation compacted."
                 _append_compaction_notice(state, slot, msg)
