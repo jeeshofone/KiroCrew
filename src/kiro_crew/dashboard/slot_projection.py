@@ -154,6 +154,7 @@ class SlotProjection:
         include_check_status: bool,
         source_links: list[dict],
         prompt_roles: frozenset[str],
+        transient_roles: frozenset[str],
         redact: Callable[[str], str],
         parse_options: Callable[[str], list[str]],
         strip_options: Callable[[str], str],
@@ -176,7 +177,19 @@ class SlotProjection:
         input the slot reads as idle while its owner is parked on an approval.
         Oldest first; the projection reads only the first one for the card.
         """
-        last_ts = slot.messages[-1].get("ts", "") if slot.messages else ""
+        # The newest DURABLE row: a transient row (the turn-end ``done`` row
+        # among them) is never persisted, so a slot rebuilt from disk after a
+        # gateway restart lacks it. Projecting from one would move ``last_ts``
+        # backwards across the restart, and the dashboard stores ``last_ts`` as
+        # the unread watermark it can only clear with a covering ``last_ts``.
+        last_ts = next(
+            (
+                message.get("ts", "")
+                for message in reversed(slot.messages)
+                if message.get("role") not in transient_roles
+            ),
+            "",
+        )
         last_msg = ""
         has_options = False
         options: list[str] = []

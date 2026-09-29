@@ -85,7 +85,7 @@ interface PeerSlot {
   pending_approval?: boolean
   /** ISO-8601. Moves only when a turn starts or ends — the ranking/display rung. */
   last_turn_ts?: string
-  /** ISO-8601 of the newest row of any role; advances on every streamed tool call. */
+  /** ISO-8601 of the newest saved row of any role; advances on every streamed tool call. */
   last_ts?: string
   /** ISO-8601 slot creation instant; last rung of the ladder. */
   created?: string

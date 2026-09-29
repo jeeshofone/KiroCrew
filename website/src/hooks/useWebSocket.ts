@@ -48,13 +48,13 @@ import { sseStatus, sseYolo, sseConnected, sseDisconnected, sseSlots, sseTodoUpd
 import { addNotification, ackNotificationByTs, unackNotificationByTs, removeNotificationByTs, clearAllNotifications, fetchNotifications, markBootNotificationsFetched } from '../store/notificationsSlice'
 import { dispatchMcNotification, dispatchLiveNotification, TURN_DONE_KIND, APPROVAL_KIND, shouldChimeOnTurnDone, shouldChimeOnPermissionRow } from './notificationEvent'
 import { shouldNotifyOnChatComplete } from './chatCompleteNotify'
-import { chatMessageMarksUnread, loadUnreadOnAttention } from './unreadOnAttention'
+import { chatMessageMarksUnread, loadUnreadOnAttention, unreadWatermarkTs } from './unreadOnAttention'
 import { postNativeNotification } from '../lib/nativeNotify'
 import { isChatPath } from './notificationBanner'
 import { emitThemeSound } from './themeSound'
 import { streamingFlushHoldMs } from '../lib/streamHold'
 import { registerPendingChunkDrain } from '../lib/pendingChunkDrain'
-import { bindSlotReadSender, emitSlotRead, flushSlotRead } from '../lib/slotReadRelay'
+import { bindSlotReadSender, emitSlotRead, flushSlotRead, noteUnsavedRowTs } from '../lib/slotReadRelay'
 import { getViewedThreadSlot } from '../lib/viewedThread'
 import { VoicePcmPlayer, voiceBoundary, createVoiceRequestId } from '../lib/voicePlayback'
 import { reportVoiceFailure } from '../lib/voiceFailure'
@@ -2047,9 +2047,14 @@ export function useWebSocket() {
                 data.role === 'user' || data.role === 'inject',
               )
             }
+            // The slot's last_ts skips an unsaved row, so reads this window
+            // relays later carry its ts explicitly (see noteUnsavedRowTs).
+            if (data.slot && unreadWatermarkTs(data.role, data.ts) === undefined && data.ts) noteUnsavedRowTs(data.slot, data.ts)
             if (data.slot && !isSlotOnScreen(data.slot) && !reconnectingRef.current) {
               // The "only when done or waiting" opt-in leaves routine rows unbadged.
-              if (chatMessageMarksUnread(data.role)) dispatch(markSlotUnread({ slot: data.slot, ts: data.ts || undefined }))
+              if (chatMessageMarksUnread(data.role)) {
+                dispatch(markSlotUnread({ slot: data.slot, ts: unreadWatermarkTs(data.role, data.ts), localTs: data.ts || undefined }))
+              }
             }
             // The message landed in THIS window's active slot while the tab is
             // visible: the user is watching it arrive, so the fresh bubble the
