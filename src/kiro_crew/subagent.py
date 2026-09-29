@@ -3913,6 +3913,13 @@ class SubagentManager:
             dispatch_parked_secs=0.0,
             is_shell=bool(getattr(event, "is_shell", False)),
             tool_name=getattr(event, "tool_name", "") or "",
+            # Only a provenance-verified identity names the server, so a frame
+            # without one cannot select the trusted wait contract.
+            mcp_server_name=(
+                getattr(event, "mcp_server_name", "") or ""
+                if getattr(event, "mcp_identity_trusted", False) is True
+                else ""
+            ),
         )
         oracle = info._stall_oracle
         info._stall_oracle = oracle.fresh() if oracle is not None else None
