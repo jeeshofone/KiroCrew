@@ -1113,25 +1113,28 @@ def get_lessons_context(
                 f"{total - len(rows)} omitted."
             )
         body = "\n".join(f"- {text}" for _, text in rows)
-        return f"{header}]\n{body}\n[End of learned corrections]\n"
+        return f"{header}]\n{body}\n{_EXPLICIT_LESSONS_FOOTER}"
 
     if not cap:
         return render(ranked)
+    whole = render(ranked)
+    if len(whole) <= cap:
+        return whole
 
+    # Each entry is judged against the RENDERED block, frame included, so an
+    # admitted entry never has to be trimmed back out. Skip rather than stop,
+    # and apply the skip to the first entry too: one long lesson anywhere in
+    # the ranking, top included, must not discard every shorter one behind it
+    # that still fits.
     selected: list[tuple[dict, str]] = []
-    used = 0
     for entry in ranked:
-        size = len(entry[1]) + 3  # "- " prefix and newline
-        if selected and used + size > cap:
-            # Skip rather than stop: one long lesson high in the ranking
-            # must not discard every shorter one behind it that still fits.
-            continue
-        selected.append(entry)
-        used += size
-    # The header grows with the counts it reports, so trim to fit rather
-    # than reserving a guessed margin. At least one lesson is always kept.
-    while len(selected) > 1 and len(render(selected)) > cap:
-        selected.pop()
+        if len(render([*selected, entry])) <= cap:
+            selected.append(entry)
+    if not selected:
+        # No entry fits: keep the top-ranked one so the block never goes
+        # silent. It exceeds *cap*; ``truncate_explicit_lessons`` shortens it
+        # for a caller that needs the block to fit.
+        selected = ranked[:1]
     return render(selected)
 
 
@@ -1234,6 +1237,30 @@ def turn_lessons(
         chosen.append((row["key"], text))
         used += size
     return chosen
+
+
+_EXPLICIT_LESSONS_FOOTER = "[End of learned corrections]\n"
+LESSON_TRUNCATION_MARKER = "… [truncated]"
+
+
+def truncate_explicit_lessons(block: str, cap: int) -> str:
+    """Shorten an over-cap explicit lessons block so it fits *cap*.
+
+    The explicit renderer exceeds its cap only when no entry fits, and then it
+    carries exactly one lesson, so the body is a single ``- `` line between the
+    header and the footer. That lesson's text is cut and marked; the header and
+    its shown/omitted counts stay as rendered. Returns ``""`` when the frame and
+    marker alone leave no room for any of the text.
+    """
+    if len(block) <= cap:
+        return block
+    body_start = block.index("]\n- ") + len("]\n- ")
+    tail = "\n" + _EXPLICIT_LESSONS_FOOTER
+    room = cap - body_start - len(tail) - len(LESSON_TRUNCATION_MARKER)
+    if room < 1:
+        return ""
+    text = block[body_start : len(block) - len(tail)]
+    return block[:body_start] + text[:room] + LESSON_TRUNCATION_MARKER + tail
 
 
 def rank_lessons(
