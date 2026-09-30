@@ -3249,6 +3249,14 @@ async def api_skill_detail(request: web.Request) -> web.Response:
             headers={"Allow": "GET"},
         )
 
+    # ``_safe_name`` has no length bound, so an over-long name would reach a Path
+    # probe that raises ENAMETOOLONG. Same whole-name budget api_skills_create
+    # applies, so this route accepts exactly the names create can produce.
+    if len(name.encode("utf-8")) > MAX_PROMPT_NAME_BYTES:
+        return web.json_response(
+            {"error": "skill name is too long", "code": "name_too_long"}, status=400
+        )
+
     if request.method == "DELETE":
         # Off the loop: delete_skill walks a pinned parent chain and then rmtrees
         # the skill directory, and update_skill below stages a temp file, carries
