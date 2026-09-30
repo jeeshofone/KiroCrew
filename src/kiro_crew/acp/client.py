@@ -15288,7 +15288,9 @@ class AcpClient:
             return []
         results: list[AcpEvent] = []
         try:
-            with open(jsonl_path, "r") as f:
+            # kiro-cli writes the transcript as UTF-8. Without an explicit
+            # encoding a Windows interpreter decodes with the ANSI code page.
+            with open(jsonl_path, "r", encoding="utf-8") as f:
                 f.seek(self._jsonl_pos)
                 while True:
                     line = f.readline()
