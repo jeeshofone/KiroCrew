@@ -464,7 +464,9 @@ async def test_the_revalidation_fallback_is_rate_limited(
 ):
     # Each fallback spawns a process, so it must not fire on every grant poll for
     # the whole TTL. With the interval left at its real value, many ticks yield
-    # exactly one probe.
+    # exactly one probe. Counted in watcher ticks, not wall-clock time: a
+    # contended runner can take longer than any fixed sleep to finish the first
+    # tick.
     monkeypatch.setattr(mint, "_MINT_GRANT_POLL_SECONDS", 0.001)
     _write_paired_grant_artifacts(_URL)
     _FakeClient.command_results["/mcp"] = {
@@ -472,17 +474,51 @@ async def test_the_revalidation_fallback_is_rate_limited(
     }
     monkeypatch.setattr(mint, "grant_fingerprint", lambda url, **kw: None)
 
-    await mint.start_oauth_mint("notion", _URL)
-    entry = mint._mints["notion"]
+    # Patched before the mint starts: the watcher is live before
+    # `start_oauth_mint` returns, so a validator swapped in afterwards can miss
+    # the first fallback. The first call is the start-up validation, made before
+    # the watcher exists, so it goes to the real validator. Every later call is
+    # a watcher fallback.
     calls: list[str] = []
+    first_fallback = asyncio.Event()
+    real_validate = mint._validate_existing_grant
+    startup_validated = False
 
-    def _never_proves(slug: str, url: str):
+    async def _never_proves(slug: str, url: str) -> bool:
+        nonlocal startup_validated
+        if not startup_validated:
+            startup_validated = True
+            return await real_validate(slug, url)
         calls.append(slug)
-        return _async_value(False)
+        first_fallback.set()
+        return False
 
     monkeypatch.setattr(mint, "_validate_existing_grant", _never_proves)
 
-    await asyncio.sleep(0.05)
+    # Every watcher tick calls `grant_observed` first, so counting its calls after
+    # the first fallback counts the polls that had a chance to fire a second one.
+    ticks_after_first = 0
+    enough_ticks = asyncio.Event()
+    real_grant_observed = mint.grant_observed
+
+    async def _counting_grant_observed(url: str, **kw: Any) -> bool | None:
+        nonlocal ticks_after_first
+        if first_fallback.is_set():
+            ticks_after_first += 1
+            if ticks_after_first >= 20:
+                enough_ticks.set()
+        return await real_grant_observed(url, **kw)
+
+    monkeypatch.setattr(mint, "grant_observed", _counting_grant_observed)
+
+    await mint.start_oauth_mint("notion", _URL)
+    entry = mint._mints["notion"]
+    assert startup_validated
+
+    await asyncio.wait_for(first_fallback.wait(), timeout=30)
+    # The window opens at the first fallback, and this bound keeps every counted
+    # tick inside the shipped 60 s interval.
+    await asyncio.wait_for(enough_ticks.wait(), timeout=30)
 
     assert len(calls) == 1
     assert mint._mints["notion"]["state"] == "waiting"
