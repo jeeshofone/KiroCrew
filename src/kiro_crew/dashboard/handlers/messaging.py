@@ -5566,7 +5566,7 @@ def _write_env_updates_locked(ep: "Path", updates: dict[str, str | None]) -> Non
     """The read-modify-atomic-rewrite of .env, run under the .env lock held by
     the caller (:func:`_write_env_updates`)."""
 
-    lines = ep.read_text(encoding="utf-8").splitlines() if ep.exists() else []
+    lines = _loader.read_env_text(ep, encoding="utf-8").splitlines() if ep.exists() else []
     seen: set[str] = set()
     out: list[str] = []
     for line in lines:

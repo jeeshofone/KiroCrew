@@ -41,6 +41,7 @@ from kiro_crew.config.loader import (
     config_path,
     env_path,
     read_config_text,
+    read_env_text,
 )
 from kiro_crew.dashboard.channel_folders import (
     channel_restart_required,
@@ -127,7 +128,7 @@ def _write_env_secret(key: str, value: str) -> None:
     lines: list[str] = []
     found = False
     if ep.exists():
-        for line in ep.read_text(encoding="utf-8").splitlines():
+        for line in read_env_text(ep, encoding="utf-8").splitlines():
             stripped = line.strip()
             if stripped and not stripped.startswith("#") and "=" in stripped:
                 k = stripped.split("=", 1)[0].strip()
@@ -150,7 +151,7 @@ def _read_env_value(key: str) -> Optional[str]:
     ep = env_path()
     if not ep.exists():
         return None
-    for line in ep.read_text(encoding="utf-8").splitlines():
+    for line in read_env_text(ep, encoding="utf-8").splitlines():
         stripped = line.strip()
         if stripped and not stripped.startswith("#") and "=" in stripped:
             k, _, value = stripped.partition("=")
@@ -165,7 +166,7 @@ def _delete_env_key(key: str) -> None:
     if not ep.exists():
         return
     kept: list[str] = []
-    for line in ep.read_text(encoding="utf-8").splitlines():
+    for line in read_env_text(ep, encoding="utf-8").splitlines():
         stripped = line.strip()
         if stripped and not stripped.startswith("#") and "=" in stripped:
             if stripped.split("=", 1)[0].strip() == key:

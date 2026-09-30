@@ -33,6 +33,7 @@ from kiro_crew.config.loader import (
     env_path,
     normalize_workspace_path,
     read_config_text,
+    read_env_text,
     unsandboxed_exec_declared,
     unsandboxed_exec_platform_default,
     update_config_locked,
@@ -641,7 +642,7 @@ def _setup_slack_tokens() -> None:
     cred_path = env_path()
     existing: dict[str, str] = {}
     if cred_path.exists():
-        for line in cred_path.read_text(encoding="utf-8").splitlines():
+        for line in read_env_text(cred_path, encoding="utf-8").splitlines():
             if "=" in line and not line.startswith("#"):
                 k, _, v = line.partition("=")
                 existing[k.strip()] = v.strip()
@@ -754,7 +755,7 @@ def _setup_slack_tokens() -> None:
         # top so a concurrent write that landed during the prompts is preserved.
         merged: dict[str, str] = {}
         if cred_path.exists():
-            for line in cred_path.read_text(encoding="utf-8").splitlines():
+            for line in read_env_text(cred_path, encoding="utf-8").splitlines():
                 if "=" in line and not line.startswith("#"):
                     k, _, v = line.partition("=")
                     merged[k.strip()] = v.strip()

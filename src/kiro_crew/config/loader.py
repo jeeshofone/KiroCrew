@@ -12,10 +12,12 @@ dashboard URL via the config file. (The dashboard *port* is set with the
 from __future__ import annotations
 
 import asyncio
+import codecs as _codecs
 import contextlib
 import copy
 import hashlib as _hashlib
 import json
+import locale as _locale
 import logging
 import math  # noqa: F401 - historical loader namespace compatibility
 import os
@@ -524,20 +526,77 @@ def env_path() -> Path:
     return config_dir() / ".env"
 
 
+_UTF16_BOMS = (_codecs.BOM_UTF16_LE, _codecs.BOM_UTF16_BE)
+
+# ``.env`` paths already warned about as undecodable (fire once per process).
+_warned_undecodable_env: set[str] = set()
+
+
+def decode_env_bytes(raw: bytes, encoding: str | None = None, errors: str = "strict") -> str:
+    """Decode the bytes of a ``.env`` file, honouring a byte-order mark.
+
+    A UTF-8 BOM (what PowerShell 5.1's ``Out-File -Encoding utf8`` writes) says
+    the file is UTF-8, so the rest is decoded as UTF-8 and the BOM is dropped:
+    left in, it becomes part of the first key and that credential silently
+    never matches. A UTF-16 BOM (PowerShell's default ``>`` / ``Out-File``)
+    raises :class:`UnicodeDecodeError`, because a wide-encoded credential file
+    is not a supported format and decoding it as UTF-8 or the locale would
+    yield NUL-riddled keys instead of an error. Without a BOM the bytes are
+    decoded exactly as before: with *encoding*, or the locale default that a
+    bare ``read_text()`` uses when *encoding* is ``None``.
+    """
+    if raw.startswith(_codecs.BOM_UTF8):
+        return raw[len(_codecs.BOM_UTF8) :].decode("utf-8", errors)
+    if raw.startswith(_UTF16_BOMS):
+        raise UnicodeDecodeError(
+            "utf-8", raw, 0, 2, "UTF-16 byte-order mark; save the .env as UTF-8"
+        )
+    return raw.decode(encoding or _locale.getpreferredencoding(False), errors)
+
+
+def read_env_text(ep: Path, encoding: str | None = None) -> str:
+    """Read a ``.env`` file through :func:`decode_env_bytes`.
+
+    Every reader and in-place rewriter of the data home's ``.env`` goes through
+    this, so they agree on what the first key is: if only the readers stripped
+    a BOM, a dashboard clear could not match the key the gateway loads, and the
+    cleared credential would survive. Raises :class:`OSError` or
+    :class:`UnicodeDecodeError`; a rewriter lets the decode error propagate so
+    it never overwrites a file it could not parse.
+    """
+    return decode_env_bytes(ep.read_bytes(), encoding)
+
+
+def warn_undecodable_env(ep: Path, exc: UnicodeDecodeError) -> None:
+    """Log once per path that *ep* could not be decoded and is treated as unset."""
+    key = str(ep)
+    if key in _warned_undecodable_env:
+        return
+    _warned_undecodable_env.add(key)
+    logger.warning(
+        "Cannot decode %s (%s); treating it as empty. Save it as UTF-8.",
+        ep,
+        exc.reason,
+    )
+
+
 def read_env_file_credential(key: str, env_file: Path | None = None) -> str:
     """Best-effort read of one ``KEY=VALUE`` entry from the data home's ``.env``.
 
     Same line format :meth:`KiroCrewConfig.load_credentials` parses (one pair
     per line, ``#`` comments, no quotes required, last occurrence wins).
-    Returns ``""`` when the file is absent or unreadable — callers treat the
-    credential as unset rather than failing.
+    Returns ``""`` when the file is absent, unreadable or undecodable — callers
+    treat the credential as unset rather than failing.
 
     Blocking file IO: call via ``asyncio.to_thread`` from async paths.
     """
     ep = env_file if env_file is not None else env_path()
     try:
-        text = ep.read_text()
+        text = read_env_text(ep)
     except OSError:
+        return ""
+    except UnicodeDecodeError as exc:
+        warn_undecodable_env(ep, exc)
         return ""
     value = ""
     for line in text.splitlines():
@@ -5114,7 +5173,12 @@ class KiroCrewConfig:
                     ep.chmod(0o600)
             except OSError:
                 logger.warning("Cannot enforce permissions on %s", ep)
-            for line in ep.read_text().splitlines():
+            try:
+                env_text = read_env_text(ep)
+            except UnicodeDecodeError as exc:
+                warn_undecodable_env(ep, exc)
+                env_text = ""
+            for line in env_text.splitlines():
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
