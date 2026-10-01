@@ -1148,6 +1148,107 @@ class TestRouteBackendLine:
         assert record["pid"] == 4242
 
     @pytest.mark.asyncio
+    async def test_is_error_tool_result_is_not_a_successful_metric(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A tool that failed reports it in-band (``result.isError``), not as a
+        # JSON-RPC error, so the record must not count it as a success.
+        path = tmp_path / "metrics.jsonl"
+        monkeypatch.setattr(backend_mod, "_METRICS_PATH", str(path))
+        backend = _make_backend()
+        await backend.attach_stub("s1")
+        backend._pending_requests["gw-1"] = _PendingRequest(
+            "s1", 1, "tools/call", t_start_ms=time.monotonic() * 1000.0,
+            tool_name="get_creds")
+        await backend._route_backend_line(_line({"id": "gw-1", "result": {
+            "isError": True, "content": [{"type": "text", "text": "role not found"}]}}))
+        await _settle(backend)
+        record = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+        assert record["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_failed_tool_call_logs_one_bounded_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        backend = _make_backend()
+        await backend.attach_stub("s1")
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        backend._pending_requests["gw-1"] = _PendingRequest(
+            "s1", 1, "tools/call", session_key="cron:abc", tool_name="get_creds")
+        long_tail = "x" * 5000
+        with caplog.at_level(logging.WARNING, logger=backend_mod.logger.name):
+            await backend._route_backend_line(_line({"id": "gw-1", "result": {
+                "isError": True,
+                "content": [{"type": "text",
+                             "text": f"IAM role not found\nkey {secret} {long_tail}"}],
+            }}))
+        hits = [r for r in caplog.records if "MCP tool call failed" in r.getMessage()]
+        assert len(hits) == 1
+        line = hits[0].getMessage()
+        assert hits[0].levelno == logging.WARNING
+        assert "server='example-mcp'" in line
+        assert "tool='get_creds'" in line
+        assert "session_key='cron:abc'" in line
+        assert "IAM role not found" in line
+        assert secret not in line
+        assert long_tail not in line
+        assert len(line) < 1000
+
+    @pytest.mark.asyncio
+    async def test_failed_tool_call_warning_cannot_forge_log_lines_via_tool_name(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The tool name is the caller's ``params.name``, unvalidated: a newline
+        # in it must not start a second log line, and a huge one is capped.
+        backend = _make_backend()
+        await backend.attach_stub("s1")
+        forged = "t\n2026-10-01 00:00:00 WARNING kiro_crew.forged: fake"
+        backend._pending_requests["gw-1"] = _PendingRequest(
+            "s1", 1, "tools/call", tool_name=forged + "y" * 5000)
+        with caplog.at_level(logging.WARNING, logger=backend_mod.logger.name):
+            await backend._route_backend_line(_line({"id": "gw-1", "result": {
+                "isError": True, "content": []}}))
+        hits = [r.getMessage() for r in caplog.records
+                if "MCP tool call failed" in r.getMessage()]
+        assert len(hits) == 1
+        assert "\n" not in hits[0]
+        assert "y" * 200 not in hits[0]
+
+    @pytest.mark.asyncio
+    async def test_json_rpc_error_tool_call_logs_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        backend = _make_backend()
+        await backend.attach_stub("s1")
+        backend._pending_requests["gw-1"] = _PendingRequest(
+            "s1", 1, "tools/call", tool_name="search")
+        with caplog.at_level(logging.WARNING, logger=backend_mod.logger.name):
+            await backend._route_backend_line(_line({"id": "gw-1", "error": {
+                "code": -32000, "message": "Failed to refresh authentication token"}}))
+        hits = [r.getMessage() for r in caplog.records
+                if "MCP tool call failed" in r.getMessage()]
+        assert len(hits) == 1
+        assert "tool='search'" in hits[0]
+        assert "-32000" in hits[0]
+        assert "Failed to refresh authentication token" in hits[0]
+
+    @pytest.mark.asyncio
+    async def test_successful_or_non_tool_responses_log_no_failure(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        backend = _make_backend()
+        await backend.attach_stub("s1")
+        backend._pending_requests["gw-1"] = _PendingRequest(
+            "s1", 1, "tools/call", tool_name="ok_tool")
+        backend._pending_requests["gw-2"] = _PendingRequest("s1", 2, "resources/read")
+        with caplog.at_level(logging.WARNING, logger=backend_mod.logger.name):
+            await backend._route_backend_line(_line({"id": "gw-1", "result": {
+                "isError": False, "content": []}}))
+            await backend._route_backend_line(_line({"id": "gw-2", "error": {
+                "code": -32002, "message": "not found"}}))
+        assert not [r for r in caplog.records if "MCP tool call failed" in r.getMessage()]
+
+    @pytest.mark.asyncio
     async def test_init_sentinel_response_goes_to_handshake(self) -> None:
         backend = _make_backend()
         inbox = await backend.attach_stub("s1")

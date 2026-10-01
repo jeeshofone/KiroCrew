@@ -136,6 +136,70 @@ async def _emit_call_metric(record: dict[str, Any]) -> None:
     await asyncio.to_thread(_write_metric_line, record)
 
 
+# --- Failed tool-call logging -------------------------------------------
+#
+# A tool call can fail two ways: a JSON-RPC ``error``, or a ``result`` that
+# reports the failure in-band with ``isError: true``. Both get one WARNING in
+# the gateway log so an MCP outage is visible without reading transcripts.
+# The summary is backend-authored text: it is redacted WHOLE before the display
+# cap (a cut first could sever a credential into a fragment no pattern
+# matches), and text over the redaction input cap is replaced by a length-only
+# marker so a huge error payload cannot stall the shared stdout pump.
+_TOOL_FAILURE_SUMMARY_CAP = 300
+_TOOL_FAILURE_REDACT_INPUT_CAP = 16 * 1024
+_LOG_IDENTIFIER_CAP = 128
+
+
+def _loggable_identifier(value: str) -> str:
+    """A caller- or server-authored name (a tool's ``params.name``) made safe
+    for one log line: redacted whole, rendered with ``repr`` so a newline or
+    control character cannot start a forged line, then length-capped."""
+    if len(value) > _TOOL_FAILURE_REDACT_INPUT_CAP:
+        return f"<name too long: {len(value)} chars>"
+    return repr(redact(value))[:_LOG_IDENTIFIER_CAP]
+
+
+def _response_failed(msg: Mapping[str, Any]) -> bool:
+    """True when a JSON-RPC response reports failure, either as a JSON-RPC
+    ``error`` or as an MCP tool result carrying ``isError: true``."""
+    if "error" in msg:
+        return True
+    result = msg.get("result")
+    return isinstance(result, dict) and bool(result.get("isError"))
+
+
+def _tool_failure_summary(msg: Mapping[str, Any]) -> str:
+    """A redacted, length-capped one-line summary of a failed response: the
+    JSON-RPC error code and message, or the text blocks of an ``isError``
+    result. Never the full payload."""
+    error = msg.get("error")
+    if error is not None:
+        if isinstance(error, dict):
+            message = error.get("message")
+            text = f"code={error.get('code')!r} {message if isinstance(message, str) else ''}"
+        else:
+            text = "<non-object error>"
+    else:
+        parts: list[str] = []
+        size = 0
+        result = msg.get("result")
+        content = result.get("content") if isinstance(result, dict) else None
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "text":
+                    continue
+                block_text = block.get("text")
+                if isinstance(block_text, str):
+                    parts.append(block_text)
+                    size += len(block_text)
+                    if size > _TOOL_FAILURE_REDACT_INPUT_CAP:
+                        break
+        text = " ".join(parts) if parts else "<no text content>"
+    if len(text) > _TOOL_FAILURE_REDACT_INPUT_CAP:
+        return f"<error text too long: {len(text)} chars>"
+    return redact(" ".join(text.split()))[:_TOOL_FAILURE_SUMMARY_CAP]
+
+
 # Default handshake deadline. Real MCP backends reply to ``initialize``
 # within tens of milliseconds; 10s is generous slack for a cold-spawning
 # backend on a loaded host.
@@ -2040,6 +2104,15 @@ class Backend:
                     self.pid, msg_id,
                 )
                 return
+            failed = _response_failed(msg)
+            if failed and pending.method == "tools/call":
+                logger.warning(
+                    "MCP tool call failed: server=%s tool=%s session_key=%s error=%r",
+                    _loggable_identifier(self.pool_key.server_name),
+                    _loggable_identifier(pending.tool_name or "?"),
+                    _loggable_identifier(pending.session_key or "unknown"),
+                    _tool_failure_summary(msg),
+                )
             if pending.t_start_ms:
                 # Fire-and-forget: awaiting the emit here (even with its file
                 # I/O offloaded to a thread) yields the shared stdout pump,
@@ -2051,7 +2124,7 @@ class Backend:
                     "dur_ms": round(time.monotonic() * 1000.0 - pending.t_start_ms, 3),
                     "pool": self.pool_key.human_readable(),
                     "pid": self.pid,
-                    "ok": "error" not in msg,
+                    "ok": not failed,
                     "stub": pending.stub_uuid,
                 })
             if pending.stub_uuid == "__init__":
