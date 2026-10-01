@@ -1974,9 +1974,23 @@ self-contained file with no WAL to pair.
   file carries a new mtime while its name still says when its contents were taken.
 - **Atomicity**: each call writes its own hidden UUID `.partial` and renames it, so an
   interrupted or concurrent run cannot delete another call's stage or leave a
-  truncated file that looks like a backup.
+  truncated file that looks like a backup. The stage is switched to
+  `journal_mode=DELETE` before it is verified, so the published `.db` is a
+  rollback-journal file: opening it creates no `-wal`/`-shm`, and the rename moves the
+  whole backup. A call removes its stage's `-wal`/`-shm`/`-journal` siblings before the
+  `.partial` itself.
 - **Retention**: `memory.backup_keep` (default 7), clamped to at least 1. A retention
   policy that can empty the directory is a scheduled deletion, not retention.
+  Before counting published backups, `prune_backups` on a V1 store also removes
+  staging leftovers: a `.partial-wal`/`-shm`/`-journal` whose `.partial` is gone, and a
+  `.partial` older than `STALE_STAGE_SECONDS` (6 hours) with its siblings, which is what
+  a run killed before its cleanup leaves. A live stage is never that old: the age is
+  read from the stage's mtime, which moves while the copy writes, and a copy finishes in
+  seconds. Manual and pre-update backups skip `MIN_BACKUP_INTERVAL_HOURS`, so runs can
+  be seconds apart; the age check does not depend on that spacing.
+  Member V2 backup directories are not swept. A pruned backup's own `-wal`/`-shm`,
+  which reading a WAL-header backup taken before rollback-journal publishing leaves
+  behind, go with it.
   The loader preserves this value and `memory.backup_enabled` (default true)
   across reload/save, so disabling automatic backups or extending recovery
   retention survives a gateway restart. Automatic retention prunes only the
@@ -2000,7 +2014,9 @@ source's structural V1 lineage for Global. Named V1 also accepts the established
 unowned crew-schema shape. Both refuse a `member_database` identity, empty
 databases and unrelated SQLite files without publishing a restore journal or
 changing current memory. It uses SQLite's online backup API to stage a
-self-contained copy, verifies integrity and the same source admission on that snapshot, and
+self-contained copy, switches the stage to `journal_mode=DELETE` so verifying it
+leaves no `restore-*.db-wal`/`-shm` even from a WAL-header backup, verifies
+integrity and the same source admission on that snapshot, and
 publishes its checksum in `pending-v1-restore.json` in the store's backup
 directory. Live memory stays at its original path and continues accepting writes
 until shutdown. The same
