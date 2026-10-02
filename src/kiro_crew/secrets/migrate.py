@@ -53,9 +53,10 @@ from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import (
     _JIRA_TOKEN_RE,
     CRED_JIRA_API_TOKEN,
+    EnvFileWideEncodingError,
     config_dir,
-    decode_env_bytes,
     env_path,
+    read_env_file,
     warn_undecodable_env,
 )
 from kiro_crew.mcp_gateway.secret_uri import SECRET_URI_PREFIX
@@ -224,21 +225,21 @@ def migrate_env_secrets(
     ep = env_path()
     report = MigrationReport(env_file=ep, dry_run=dry_run)
 
+    # A UTF-8 BOM is dropped for parsing (left in, it would be read as part of
+    # the first key) and put back on the rewrite, which otherwise preserves the
+    # file byte-for-byte. A UTF-16 or UTF-32 file is not a supported .env:
+    # nothing in it parses as a key, so there is nothing to migrate. Reading
+    # through the loader also re-arms its undecodable-file warning once the
+    # file decodes again.
     try:
-        original_bytes = ep.read_bytes()
+        original_bytes, text = read_env_file(ep, "utf-8", errors="surrogateescape")
     except OSError:
         # No .env (or unreadable): nothing to migrate.
         return report
-    # A UTF-8 BOM is dropped for parsing (left in, it would be read as part of
-    # the first key) and put back on the rewrite, which otherwise preserves the
-    # file byte-for-byte. A UTF-16 file is not a supported .env: nothing in it
-    # parses as a key, so there is nothing to migrate.
-    bom = codecs.BOM_UTF8 if original_bytes.startswith(codecs.BOM_UTF8) else b""
-    try:
-        text = decode_env_bytes(original_bytes, "utf-8", errors="surrogateescape")
-    except UnicodeDecodeError as exc:
+    except EnvFileWideEncodingError as exc:
         warn_undecodable_env(ep, exc)
         return report
+    bom = codecs.BOM_UTF8 if original_bytes.startswith(codecs.BOM_UTF8) else b""
 
     vault = SecretVault(config_dir())
     to_migrate: dict[str, str] = {}

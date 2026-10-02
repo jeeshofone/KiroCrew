@@ -39,6 +39,7 @@ from kiro_crew.config.loader import (
     CRED_WEIXIN_TOKEN,
     KiroCrewConfig,
     config_path,
+    env_bom_prefix,
     env_path,
     read_config_text,
     read_env_text,
@@ -139,7 +140,7 @@ def _write_env_secret(key: str, value: str) -> None:
             lines.append(line)
     if not found:
         lines.append(f"{key}={value}")
-    _atomic_write(ep, "\n".join(lines) + "\n", secret=True)
+    _atomic_write(ep, env_bom_prefix(ep) + "\n".join(lines) + "\n", secret=True)
 
 
 def _read_env_value(key: str) -> Optional[str]:
@@ -172,7 +173,7 @@ def _delete_env_key(key: str) -> None:
             if stripped.split("=", 1)[0].strip() == key:
                 continue
         kept.append(line)
-    _atomic_write(ep, "\n".join(kept) + "\n", secret=True)
+    _atomic_write(ep, env_bom_prefix(ep) + "\n".join(kept) + "\n", secret=True)
 
 
 def _commit_credential_and_config(cp: Path, serialized: str, token: str) -> None:
