@@ -29,10 +29,12 @@ as the write route does. The route tests look the handler up out of a real
 data behind one ``routes._scope`` patch, mirroring ``test_issue_radar_crew_routes``.
 """
 
+import asyncio
 import itertools
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -50,6 +52,7 @@ from kiro_crew.apps.builtins.issue_radar.backend import (
 )
 from kiro_crew.crew_log import emit as crew_log_emit
 from kiro_crew.crew_log import projection as crew_log
+from kiro_crew.crew_log import store as crew_log_store
 from kiro_crew.crew_log.schema import KIND_SESSION
 from kiro_crew.crew_log.store import CrewLog
 
@@ -491,6 +494,21 @@ def _registered() -> dict:
     }
 
 
+async def _seed_step(
+    root: Path, crew_id: str, number: int, phase: str, kind: str, text: str
+) -> dict:
+    """:func:`_step` from a worker thread, the way the write route runs it.
+
+    ``POST /crew/work`` reaches ``commit_work_progress`` through ``routes._st``,
+    i.e. ``asyncio.to_thread``, so its lock acquisitions may wait. Called
+    synchronously from an async test the same write runs on the event-loop thread,
+    where ``file_lock`` takes exactly one attempt and the read-back of the entry
+    just written loses to the crew log writer whenever that thread still holds the
+    unit's lock -- a ``CrewLedgerNotRecorded`` no real route can produce.
+    """
+    return await asyncio.to_thread(_step, root, crew_id, number, phase, kind, text)
+
+
 def _payload(response: web.Response) -> dict:
     raw = response.body
     assert isinstance(raw, bytes)
@@ -546,7 +564,7 @@ class RouteTest(unittest.IsolatedAsyncioTestCase):
         # Even if a GitLab repo somehow had crew records on disk, the route must
         # answer items:[] — crews are a GitHub-only feature.
         crew = _crew(self.root)
-        _step(self.root, crew["id"], 5109, "claimed", "claim", "claimed")
+        await _seed_step(self.root, crew["id"], 5109, "claimed", "claim", "claimed")
         resp = await self._get(provider="gitlab", host="gitlab.com")
         self.assertEqual(resp.status, 200)
         body = _payload(resp)
@@ -563,7 +581,7 @@ class RouteTest(unittest.IsolatedAsyncioTestCase):
             ("implementing", "implement", "edit"),
             ("awaiting-ci", "ci", "PR opened"),
         ):
-            _step(self.root, cid, 5109, phase, kind, text)
+            await _seed_step(self.root, cid, 5109, phase, kind, text)
         resp = await self._get()
         self.assertEqual(resp.status, 200)
         body = _payload(resp)
@@ -575,6 +593,36 @@ class RouteTest(unittest.IsolatedAsyncioTestCase):
             [t["phase"] for t in item["timeline"]],
             ["claimed", "implementing", "awaiting-ci"],
         )
+
+    async def test_seeding_survives_a_briefly_held_unit_lock(self):
+        # The Windows flake, made deterministic: another thread holds the unit's
+        # crew log lock for a moment while the test seeds. From a worker thread
+        # (the route's path) the write waits and records; on the event-loop
+        # thread it got one attempt and raised CrewLedgerNotRecorded.
+        crew = _crew(self.root)
+        cid = crew["id"]
+        lock_path = crew_log_store._lock_path(KIND_SESSION, _UNITS[cid])
+        held, release = threading.Event(), threading.Event()
+
+        def _hold() -> None:
+            with crew_log_store._open_lock(lock_path):
+                held.set()
+                release.wait(5.0)
+
+        holder = threading.Thread(target=_hold, daemon=True)
+        holder.start()
+        self.assertTrue(held.wait(5.0))
+        timer = threading.Timer(0.3, release.set)
+        timer.start()
+        try:
+            out = await _seed_step(self.root, cid, 5109, "claimed", "claim", "claimed")
+        finally:
+            release.set()
+            timer.cancel()
+            holder.join(5.0)
+        self.assertTrue(out["durable"])
+        resp = await self._get()
+        self.assertEqual([it["number"] for it in _payload(resp)["items"]], [5109])
 
 
 if __name__ == "__main__":
