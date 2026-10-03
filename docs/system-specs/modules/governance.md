@@ -998,7 +998,13 @@ mirrors; if either mirror install fails, it stays set. Rebuilds are not serializ
 rebuild clears or restates the record only if no refusal was recorded and the ceiling did not
 move since it began: an earlier rebuild finishing late cannot erase a later refusal. Each refusal first re-reads the file and, if
 the read succeeds, rebuilds, so the first session start after the file is readable again
-re-projects it and proceeds. The record names one of two causes with what to check: the file
+re-projects it and proceeds. A read failure that does not clear on its own, such as a
+permission error on the file, is refused the same way, so the instance-wide refusal then lasts
+until someone makes the file readable. That is intended: the gateway cannot tell a failure that
+will clear from one that will not, and the moment the file reads again kiro-cli can load its
+stale grants (as the named spec, or as the default agent it falls back to), so every session
+must wait for a start to re-project it first. The notification feed announces the refusal
+(see app-notifications.md), and it ends without a restart. The record names one of two causes with what to check: the file
 cannot be read (its permissions or a lock holder), or it reads but the rebuild of it and its
 mirrors did not complete (the gateway log and the mirror specs). Each rebuild that keeps the
 record restates it, so a refusal never names a cause the last read disproved. The same check guards an

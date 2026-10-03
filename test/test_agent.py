@@ -1391,6 +1391,46 @@ class TestInstallAgent:
         assert "cannot be shown not to run" in str(refused.value)
         assert "runs on, or is mirrored from" in str(main_refused.value)
 
+    def test_a_lasting_permission_error_refuses_every_session_until_the_file_reads(
+        self, tmp_path: Path, monkeypatch, main_spec_state
+    ):
+        """A permission error that never clears is refused like a sharing violation.
+
+        The outage is intended: every start, the agentless one included, is
+        refused for as long as the read fails, and each costs one read and no
+        rebuild. The first start after the file reads again re-projects it before
+        any session is admitted, because kiro-cli would otherwise load the stale
+        grants the moment it can read them.
+        """
+        agent_mod = main_spec_state
+        cfg_dir = _bundled_defaults(tmp_path)
+        spec = self._custom_spec(tmp_path)
+        real_read_bytes = Path.read_bytes
+
+        def _denied(self: Path):
+            if self == spec:
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_read_bytes(self)
+
+        monkeypatch.setattr(agent_mod, "KIRO_AGENTS_DIR", spec.parent)
+        with patch.object(Path, "read_bytes", _denied):
+            _run_install(tmp_path, cfg_dir)
+            with patch("kiro_crew.agent.rebuild_agent_config") as retry:
+                for _ in range(3):
+                    for name in ("kirocrew", "kirocrew-worker", "other", None):
+                        with pytest.raises(agent_mod.AgentSpecUnprojected):
+                            agent_mod.require_fork_governance(name, None)
+            retry.assert_not_called()
+        assert "Permission denied" in agent_mod._main_spec_unprojected
+
+        def _rebuild(**kwargs):
+            return _run_install(tmp_path, cfg_dir, **kwargs)
+
+        with patch("kiro_crew.agent.rebuild_agent_config", side_effect=_rebuild) as retry:
+            agent_mod.require_fork_governance("other", None)
+        retry.assert_called_once_with(refresh_forks=False)
+        assert agent_mod._main_spec_unprojected is None
+
     def test_a_project_spec_does_not_vouch_for_a_name(
         self, tmp_path: Path, monkeypatch, main_spec_state
     ):
