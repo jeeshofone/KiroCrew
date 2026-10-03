@@ -1007,10 +1007,12 @@ already-spawned kiro-cli or KAS runtime: `AcpRuntime.create_session` and `load_s
 process would otherwise open sessions on the stale grants that the spawn gate refused; the
 entitlement probe's promptless `session/new` is skipped for the same reason. The
 common path reads module globals on the event loop; only a refusal in force moves to a
-thread. Because a start can then wait in the session-start queue and on the stdin lock, the
-check runs again under that lock right before the frame is written, and it also refuses when a
-refusal episode was recorded at any point since the start was admitted, since a KAS payload
-built before it predates the recovery rebuild. The verdict
+thread. A start is admitted at that check and is not re-checked at the frame write: a start
+admitted just before a refusal is recorded runs the same file it would have run without the
+refusal, the stale-grant lag every ceiling change already has until its rebuild writes. While the
+record is set, the gateway heartbeat also posts it to the notification feed as a critical
+`system.agent` note (app-notifications.md), because cron, channel and subagent starts have no
+one watching their refusal. The verdict
 comes from inside the rebuild itself, never a separate guard probe, which would race a
 concurrent default-home rewrite and record a projection that never landed. An unseeded
 baseline rebuilds once rather than skipping — a redundant rewrite costs a file write, a

@@ -3145,8 +3145,7 @@ _main_spec_unprojected: str | None = None
 #: Counts the unreadable-spec episodes recorded in ``_main_spec_unprojected``. A
 #: rebuild reads it before it reads the spec and clears or restates the record
 #: only while it is unchanged, so a rebuild that started earlier can never erase
-#: a refusal a later one recorded. A queued session start compares it at the
-#: frame write for the same reason (see :func:`main_spec_refusal_episode`).
+#: a refusal a later one recorded.
 _main_spec_unprojected_episode = 0
 
 #: Guards compound reads and updates of the two values above.
@@ -3762,21 +3761,18 @@ def main_spec_unprojected() -> bool:
 
     One module global read under its lock, no file I/O, so an event-loop
     caller can skip the thread hop to :func:`require_main_spec_projected` on the
-    common path, and ask again at the frame write.
+    common path.
     """
     return _main_spec_refusal() is not None
 
 
-def main_spec_refusal_episode() -> int:
-    """Opaque counter that moves each time an unreadable-spec refusal is recorded.
+def main_spec_refusal_reason() -> str | None:
+    """The recorded cause while agent sessions are refused, else ``None``.
 
-    Compared for equality only. A session start reads it before it builds its
-    request and again at the frame write: a change means a refusal was recorded
-    while the start waited, so what it built may predate that episode and any
-    recovery rebuild after it.
+    Read by the operator notice (:mod:`kiro_crew.notifications.agent_spec`); one
+    module global under its lock, no file I/O.
     """
-    with _main_spec_state_lock:
-        return _main_spec_unprojected_episode
+    return _main_spec_refusal()
 
 
 def require_main_spec_projected(agent: str | None) -> None:

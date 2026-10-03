@@ -1519,6 +1519,49 @@ class TestInstallAgent:
         config = json.loads(spec.read_text(encoding="utf-8"))
         assert config["model"] == "claude-user-custom"
 
+    def test_a_burst_of_blocked_starts_runs_one_rebuild(self, main_spec_state):
+        """Concurrent starts after the file reads again share one recovery rebuild.
+
+        The first start to take the retry lock rebuilds and clears the record; the
+        rest wait on that lock for the one rebuild, then find nothing to retry.
+        """
+        agent_mod = main_spec_state
+        agent_mod._main_spec_unprojected = "the agent spec kirocrew.json could not be read"
+        calls: list[int] = []
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _rebuild(**_kwargs):
+            calls.append(1)
+            entered.set()
+            assert release.wait(5)
+            with agent_mod._main_spec_state_lock:
+                agent_mod._main_spec_unprojected = None
+
+        errors: list[BaseException] = []
+
+        def _start() -> None:
+            try:
+                agent_mod._require_main_spec_projected("kirocrew")
+            except BaseException as exc:  # noqa: BLE001 - surfaced by the assert below
+                errors.append(exc)
+
+        with (
+            patch.object(agent_mod, "_main_spec_read_succeeds", return_value=True),
+            patch("kiro_crew.agent.rebuild_agent_config", side_effect=_rebuild),
+        ):
+            threads = [threading.Thread(target=_start) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            assert entered.wait(5)
+            release.set()
+            for thread in threads:
+                thread.join(5)
+        assert not any(thread.is_alive() for thread in threads)
+        assert errors == []
+        assert calls == [1]
+        assert agent_mod._main_spec_unprojected is None
+
     def test_an_earlier_rebuild_cannot_clear_a_later_refusal(self, tmp_path: Path, main_spec_state):
         """Rebuilds are not serialized, so one can finish after a later one began.
 

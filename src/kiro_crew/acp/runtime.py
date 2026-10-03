@@ -159,7 +159,6 @@ from kiro_crew.acp.types import (
 from kiro_crew.agent import (
     ForkGovernanceUnresolved,
     ensure_agent_materialized,
-    main_spec_refusal_episode,
     main_spec_unprojected,
     markdown_spec_for_agent,
     require_main_spec_projected,
@@ -330,14 +329,6 @@ class AcpWorkspaceBindingError(AcpRuntimeError):
 
 class AcpToolSurfaceBindingError(AcpWorkspaceBindingError):
     """A deferral-enabled process cannot serve an agent whose spec grants no loader."""
-
-
-class AcpSessionStartWithdrawn(AcpRuntimeError):
-    """A session start refused at its frame write: the main spec became unprojected.
-
-    Raised under the stdin write lock, before any byte of the request is written,
-    so nothing reached the backend and the start is not a failed start sample.
-    """
 
 
 _STDOUT_BUFFER_LIMIT = 10 * 1024 * 1024  # 10MB
@@ -5171,14 +5162,7 @@ class AcpRuntime:
             f"delivering response to req={safe_id}"
         )
 
-    async def _write_request_bounded(
-        self,
-        data: bytes,
-        request_id: int,
-        method: str,
-        *,
-        admit: Callable[[], None] | None = None,
-    ) -> None:
+    async def _write_request_bounded(self, data: bytes, request_id: int, method: str) -> None:
         """Write a REQUEST frame under the write lock and the same no-progress bound.
 
         The request twin of :meth:`_write_response_bounded`, for the same
@@ -5212,10 +5196,6 @@ class AcpRuntime:
         paused backend may have consumed; a ``LOCK_STALL`` wrote no byte, so it is
         not ambiguous and its replay is safe. The method name and request id appear
         only through ``_loggable_request_id``.
-
-        *admit*, when given, replaces :meth:`_refuse_write_if_dead` as the check
-        run under the lock right before the write, and must call it itself (see
-        :meth:`_main_spec_admission`).
         """
         assert self._process is not None and self._process.stdin is not None
         result = await write_request_frame_bounded(
@@ -5223,7 +5203,7 @@ class AcpRuntime:
             self._stdin_write_lock(),
             data,
             bound_secs=_RESPONSE_WRITE_BOUND_SECS,
-            before_write=admit or self._refuse_write_if_dead,
+            before_write=self._refuse_write_if_dead,
         )
         if result is RequestWriteResult.OK:
             return
@@ -6751,35 +6731,6 @@ class AcpRuntime:
         except ForkGovernanceUnresolved as exc:
             raise AcpRuntimeError(str(exc)) from exc
 
-    def _main_spec_admission(self) -> Callable[[], None] | None:
-        """The frame-write re-check for a ``session/new`` or ``session/load`` on this runtime.
-
-        :meth:`_refuse_unprojected_main_spec` admits a start before its request is
-        built, and the start can then wait in the session-start queue or on the
-        stdin lock for as long as other starts take. A refusal recorded in that
-        wait would otherwise be missed, and a KAS payload built before it, or
-        before the recovery rebuild that cleared it, carries grants derived
-        earlier. So the refusal episode is read now, and the returned check runs
-        under the write lock right before the frame goes out: it refuses while a
-        refusal is in force or when the episode has moved since. Synchronous and
-        I/O-free, so nothing can be recorded between it and the write. ``None``
-        for a backend whose spawn path does not ask the spawn gate.
-        """
-        if self.acp_backend not in (ACP_BACKEND_KIRO, ACP_BACKEND_KAS):
-            return None
-        episode = main_spec_refusal_episode()
-
-        def admit() -> None:
-            self._refuse_write_if_dead()
-            if main_spec_unprojected() or main_spec_refusal_episode() != episode:
-                raise AcpSessionStartWithdrawn(
-                    "the main agent spec was recorded as unprojected while this session "
-                    "start waited, so its request was not sent; the next session start "
-                    "re-checks the spec and retries"
-                )
-
-        return admit
-
     async def create_session(
         self,
         cwd: str | Path | None = None,
@@ -6843,8 +6794,6 @@ class AcpRuntime:
         if not self._initialized:
             raise AcpRuntimeError("Runtime not initialized — call spawn() first")
         await self._refuse_unprojected_main_spec(agent)
-        # Read right after admission, before anything the request carries is built.
-        admit = self._main_spec_admission()
 
         # Inject the shared gateway's broker stubs unless the caller supplied an
         # explicit list. A session-injected server outranks the same-named entry
@@ -7054,9 +7003,7 @@ class AcpRuntime:
         # samples for its ``start_latency`` / ``timeouts`` signals.
         start_t0 = time.monotonic()
         try:
-            resp = await self._send_and_await(
-                METHOD_SESSION_NEW, params, timeout=budget, admit=admit
-            )
+            resp = await self._send_and_await(METHOD_SESSION_NEW, params, timeout=budget)
             session_id = str(resp.get("sessionId") or "")
             permit.release()
             if not session_id:
@@ -7101,10 +7048,6 @@ class AcpRuntime:
             if collector is None:
                 permit.release()
             raise AcpSessionStartTimeout(str(stalled), collector=collector) from exc
-        except AcpSessionStartWithdrawn:
-            # Nothing was written, so this is no start-latency sample.
-            permit.release()
-            raise
         except BaseException:
             permit.release()
             runtime_start._record_session_start(start_t0, ok=False)
@@ -7635,17 +7578,13 @@ class AcpRuntime:
                 # starts that spec's own MCP servers, so it waits out the same
                 # refusal as create_session. [] is "no evidence", as on a failure.
                 return []
-            admit = self._main_spec_admission()
             params = build_session_new_params(await self._session_work_dir(), mcp_servers=[])
             session_id = ""
             self._session_inits_in_flight += 1
             try:
                 try:
                     resp = await self._send_and_await(
-                        METHOD_SESSION_NEW,
-                        params,
-                        timeout=_ENTITLEMENT_PROBE_TIMEOUT,
-                        admit=admit,
+                        METHOD_SESSION_NEW, params, timeout=_ENTITLEMENT_PROBE_TIMEOUT
                     )
                     session_id = str(resp.get("sessionId") or "")
                 finally:
@@ -7734,8 +7673,6 @@ class AcpRuntime:
             raise AcpRuntimeError("Backend does not advertise session/load support")
         agent = await self._source_agent(agent)
         await self._refuse_unprojected_main_spec(agent)
-        # Read right after admission, before anything the request carries is built.
-        admit = self._main_spec_admission()
 
         # Re-declare the pooled broker stubs so a resumed session keeps talking
         # to the broker — same injection as create_session() and the AcpClient
@@ -7923,9 +7860,7 @@ class AcpRuntime:
             # staging in _reader_loop, closed by _finish_session_init; see
             # docs/system-specs/modules/acp-client.md "loading a session
             # triggers MCP re-initialization") — so it gets the same budget.
-            resp = await self._send_and_await(
-                METHOD_SESSION_LOAD, load_params, timeout=budget, admit=admit
-            )
+            resp = await self._send_and_await(METHOD_SESSION_LOAD, load_params, timeout=budget)
 
             # A genuine resume echoes "modes" in the response (same signal AcpClient
             # keys on). Anything else means load did not actually restore state.
@@ -8168,7 +8103,6 @@ class AcpRuntime:
         timeout: float = _REQUEST_TIMEOUT,
         *,
         translate: bool = True,
-        admit: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Send a JSON-RPC request and await the response via _pending_requests.
 
@@ -8207,13 +8141,7 @@ class AcpRuntime:
             # drain under the shared write lock and must not park it against
             # a flow-control-paused kiro-cli. A stall raises AcpRuntimeStdinStalled
             # (an AcpRuntimeDead), caught below to retrieve/cancel the future.
-            await self._write_request_bounded(data.encode(), req_id, method, admit=admit)
-        except AcpSessionStartWithdrawn:
-            # *admit* refused under the lock, before any byte was written: no
-            # answer can arrive, so the future is dropped unused.
-            self._pending_requests.pop(req_id, None)
-            future.cancel()
-            raise
+            await self._write_request_bounded(data.encode(), req_id, method)
         except AcpRuntimeDead:
             # Reached through _refuse_write_if_dead (a sibling stall marked the
             # runtime dead while this caller held the lock wait) OR through

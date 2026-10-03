@@ -6639,6 +6639,8 @@ async def start_dashboard(
             # block the loop this heartbeat exists to watch. After the lag
             # read so the await can't register as loop lag.
             await state.resource_pressure_notifier.maybe_sample()
+            # A module-global read, no I/O, so it stays on the loop.
+            state.agent_spec_refusal_notifier.sample()
             released = await _heap_trim_maintainer.maybe_trim()
             if released >= platform_compat.HEAP_TRIM_LOG_THRESHOLD_BYTES:
                 logger.info(
