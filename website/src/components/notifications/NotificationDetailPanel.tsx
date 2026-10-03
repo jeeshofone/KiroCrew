@@ -3,7 +3,7 @@ import { X, MailOpen, Check, MessageSquare, CheckCircle, Ban, Clock, ClipboardLi
 import { useNavigate } from 'react-router-dom'
 import { useGuardedLeave } from '../NavigationLeaveGuard'
 import { useAppSelector, useAppDispatch } from '../../store'
-import { deleteNotification, ackNotification, unackNotification, retireApprovalRow, settleDecidedApproval, approvalDecisionKey, approvalDecideTarget } from '../../store/notificationsSlice'
+import { deleteNotification, ackNotification, unackNotification, retireApprovalRow, settleDecidedApproval, approvalDecideTarget } from '../../store/notificationsSlice'
 import { switchSlot, resumeFromHistory } from '../../store/chatSlice'
 import { Badge } from '../ui'
 import MarkdownRenderer from '../MarkdownRenderer'
@@ -55,7 +55,6 @@ export default function NotificationDetailPanel({ n, onClose }: { n: Notificatio
   // for (the panel is reused across rows). Only this panel's buttons wait on
   // it: a second decision from another view is refused by the server, which
   // accepts one per approval.
-  const decisionKey = approvalDecisionKey(n)
   const [decidingTs, setDecidingTs] = useState<string | null>(null)
   const decidingHere = decidingTs === n.ts
   // A DELETE for this row was refused (this panel's Dismiss, or the cleanup
@@ -90,18 +89,23 @@ export default function NotificationDetailPanel({ n, onClose }: { n: Notificatio
   }
   const decide = async (action: 'approve' | 'reject') => {
     if (decidingHere) return
-    setDecidingTs(n.ts)
     setDecideFailure(null)
+    // Bound to the request this row showed (see the feed's decide).
+    const target = approvalDecideTarget(n)
+    if (!target) {
+      dispatch(retireApprovalRow(n.ts, 'refused', { seen: true }))
+      return
+    }
     // Approve/Reject are disabled while the decision is in flight, so a slow
     // press does not look dead or invite a second one.
+    setDecidingTs(n.ts)
     try {
-      // Bound to the request this row showed (see the feed's decide).
-      await api.resolveApproval(decisionKey, action, approvalDecideTarget(n))
+      await api.decideApproval(target, action)
     } catch (e) {
       setDecidingTs(null)
       if (isTerminalApprovalRefusal(e)) {
         // `refused`: this request failed, so it renders as an error.
-        dispatch(retireApprovalRow(n.ts, 'refused'))
+        dispatch(retireApprovalRow(n.ts, 'refused', { seen: true }))
         return
       }
       // eslint-disable-next-line no-console -- keep the raw failure for diagnosis
@@ -283,7 +287,9 @@ export default function NotificationDetailPanel({ n, onClose }: { n: Notificatio
                     ? <><CheckCircle className="lucide-inline" /> {i18nT('components.approvalCard.approved')}</>
                     : retiredWhy === 'reject'
                       ? <><Ban className="lucide-inline" /> {i18nT('components.approvalCard.rejected')}</>
-                      : i18nT('components.approvalCard.approval_no_longer_pending')}
+                      : retiredWhy === 'expired'
+                        ? i18nT('hooks.useWebSocket.approval_wait_expired')
+                        : i18nT('components.approvalCard.approval_no_longer_pending')}
                 </div>
               )}
               <ErrorNotice

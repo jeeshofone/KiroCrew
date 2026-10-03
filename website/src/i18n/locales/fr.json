@@ -241,7 +241,8 @@
       "stream_ended_without_completion": "Flux interrompu avant la fin",
       "token_not_accepted": "Cette URL de connexion a été refusée. Relance kirocrew token et colle la nouvelle URL de connexion ci-dessous.",
       "token_exchange_unreachable": "La passerelle est injoignable, l'URL de connexion n'a donc pas été vérifiée. Vérifiez qu'elle fonctionne, puis appuyez de nouveau sur Entrée.",
-      "unexpected_server_response": "Réponse inattendue du serveur"
+      "unexpected_server_response": "Réponse inattendue du serveur",
+      "no_pending_approval": "Cette approbation n'est plus en attente."
     }
   },
   "app": {
@@ -6225,6 +6226,7 @@
       "add_files_options": "Ajouter des fichiers et des options",
       "agent": "Agent : {{name}}",
       "allow_once": "Autoriser une fois",
+      "coordinator_no_trust": "Cette demande se décide une seule fois ici, la confiance ne peut donc pas être enregistrée pour elle.",
       "apply_a_ready_made_set_of_instructions": "Appliquer un ensemble d’instructions prêt à l’emploi",
       "approve": "Approuver",
       "approve_all": "Tout approuver",
@@ -9585,7 +9587,6 @@
       "cron": "Cron{{detail}}",
       "cron_running": "Cron · en cours",
       "deny": "Refuser",
-      "failed": "échec",
       "idle": "Inactif",
       "kiro_is_working": "kiro travaille…",
       "loading_thread": "Chargement du fil…",
@@ -14261,6 +14262,7 @@
       "no_idea_or_spec_content_available": "Aucun contenu d'idée ou de spécification disponible.",
       "phased": "Par phases",
       "task_is_waiting_for_your_decision": "Tâche {{index}} \"{{title}}\" attend votre décision",
+      "task_gate_gone": "Tâche {{index}} \"{{title}}\" : cette approbation a expiré ou a déjà été décidée, elle ne peut donc plus être décidée ici.",
       "tasks": "Tâches",
       "the_dag_view_will_appear_once_the_plan_is_ready": "La vue DAG apparaîtra dès que le plan sera prêt",
       "failed_to_update_task": "Échec de la mise à jour de la tâche"

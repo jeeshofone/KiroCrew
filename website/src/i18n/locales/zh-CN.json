@@ -239,7 +239,8 @@
       "stream_ended_without_completion": "流在完成前结束",
       "token_not_accepted": "该登录 URL 未被接受。请重新运行 kirocrew token，然后将新的登录 URL 粘贴到下方。",
       "token_exchange_unreachable": "无法连接到网关，因此没有校验登录 URL。请确认它正在运行，然后再按一次 Enter。",
-      "unexpected_server_response": "服务器响应异常"
+      "unexpected_server_response": "服务器响应异常",
+      "no_pending_approval": "此审批已不再处于待处理状态。"
     }
   },
   "app": {
@@ -6031,6 +6032,7 @@
       "add_files_options": "添加文件与选项",
       "agent": "代理：{{name}}",
       "allow_once": "允许一次",
+      "coordinator_no_trust": "此请求在这里只能决定一次，因此无法为它保存信任。",
       "apply_a_ready_made_set_of_instructions": "套用现成的指令集",
       "approve": "批准",
       "approve_all": "全部批准",
@@ -9331,7 +9333,6 @@
       "cron": "定时任务{{detail}}",
       "cron_running": "定时任务 · 运行中",
       "deny": "拒绝",
-      "failed": "失败",
       "idle": "空闲",
       "kiro_is_working": "kiro 正在工作…",
       "loading_thread": "加载话题…",
@@ -13827,6 +13828,7 @@
       "no_idea_or_spec_content_available": "没有可用的想法或规格内容。",
       "phased": "分阶段",
       "task_is_waiting_for_your_decision": "任务 {{index}}“{{title}}”正在等待你的决定",
+      "task_gate_gone": "任务 {{index}}“{{title}}”：这条审批已过期或已被处理，无法在此处再作决定。",
       "tasks": "任务",
       "the_dag_view_will_appear_once_the_plan_is_ready": "计划就绪后将显示 DAG 视图",
       "failed_to_update_task": "更新任务失败"

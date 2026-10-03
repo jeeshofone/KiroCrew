@@ -256,7 +256,7 @@ function ChatInput({
     approvalModeAdjusted, approvalNudgeActive, dismissApprovalNudge, hideApprovalNudge,
     approvalNotice, setApprovalNotice, approvalNoticeKind,
     approvalToolInput, approvalIsReadOnly, approvalFullCommand, approvalBaseCommand, approvalIsShell,
-    approvalTrustCommandGrantable, approvalTrustBaseGrantable, approvalTrustAllGrantable, approvalIsUnattended, approvalTrustGrantable,
+    approvalTrustCommandGrantable, approvalTrustBaseGrantable, approvalTrustAllGrantable, approvalIsUnattended, approvalTrustGrantable, approvalTrustOneShotOnly,
     approvalLabelRaw, approvalToolCallId, approvalPurpose, approvalTs, approvalLabel, showGhost, showInChat, handleApprovalAction,
   } = useToolApproval({ slotId, slotApprovalChrome, approvalMode, dispatch })
   const activeSlot = slotId
@@ -686,6 +686,11 @@ function ChatInput({
                           onAction={(action) => { handleApprovalAction(action) }}
                       />
                   </div>
+                  {approvalTrustOneShotOnly && (
+                    <div className="mt-1 text-[12px] text-muted" data-testid="approval-one-shot-only">
+                      {i18nT('components.chatInput.coordinator_no_trust')}
+                    </div>
+                  )}
               </div>
               {/* A1 discoverability hint: points at the footer mode picker so a
                   new user learns approval prompting is adjustable. Withheld for

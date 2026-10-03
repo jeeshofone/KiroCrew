@@ -242,7 +242,8 @@
       "stream_ended_without_completion": "Поток прервался до завершения",
       "token_not_accepted": "Этот URL для входа не принят. Запустите kirocrew token снова и вставьте новый URL для входа ниже.",
       "token_exchange_unreachable": "Не удалось связаться со шлюзом, поэтому URL для входа не был проверен. Убедитесь, что он запущен, и нажмите Enter снова.",
-      "unexpected_server_response": "Неожиданный ответ сервера"
+      "unexpected_server_response": "Неожиданный ответ сервера",
+      "no_pending_approval": "Это подтверждение больше не ожидает решения."
     }
   },
   "app": {
@@ -6322,6 +6323,7 @@
       "add_files_options": "Добавить файлы и параметры",
       "agent": "Агент: {{name}}",
       "allow_once": "Разрешить один раз",
+      "coordinator_no_trust": "Этот запрос решается здесь один раз, поэтому доверие для него сохранить нельзя.",
       "apply_a_ready_made_set_of_instructions": "Применить готовый набор инструкций",
       "approve": "Одобрить",
       "approve_all": "Разрешить все",
@@ -9712,7 +9714,6 @@
       "cron": "Cron{{detail}}",
       "cron_running": "Cron · выполняется",
       "deny": "Запретить",
-      "failed": "не удалось",
       "idle": "Простой",
       "kiro_is_working": "kiro работает…",
       "loading_thread": "Загрузка ветки…",
@@ -14478,6 +14479,7 @@
       "no_idea_or_spec_content_available": "Нет содержимого идеи или спецификации.",
       "phased": "По этапам",
       "task_is_waiting_for_your_decision": "Задача {{index}} «{{title}}» ожидает вашего решения",
+      "task_gate_gone": "Задача {{index}} «{{title}}»: срок этого запроса на одобрение истёк или решение уже принято, поэтому здесь его больше не принять.",
       "tasks": "Задачи",
       "the_dag_view_will_appear_once_the_plan_is_ready": "Представление DAG появится, когда план будет готов",
       "failed_to_update_task": "Не удалось обновить задачу"

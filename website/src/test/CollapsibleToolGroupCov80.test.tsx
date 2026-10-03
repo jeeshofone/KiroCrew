@@ -157,7 +157,7 @@ describe('CollapsibleToolGroup approval dispatch', () => {
     fireEvent.click(screen.getByText(T('approve')))
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      i18nT('components.approvalCard.approval_no_longer_pending'),
+      i18nT('components.approvalCard.decision_refused_not_pending'),
     )
     expect(screen.queryByText(T('approve'))).not.toBeInTheDocument()
     expect(screen.queryByText(T('reject'))).not.toBeInTheDocument()

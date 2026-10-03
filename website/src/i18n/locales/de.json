@@ -240,7 +240,8 @@
       "stream_ended_without_completion": "Stream endete ohne Abschluss",
       "token_not_accepted": "Diese Anmelde-URL wurde nicht akzeptiert. Führe kirocrew token erneut aus und füge die neue Anmelde-URL unten ein.",
       "token_exchange_unreachable": "Das Gateway war nicht erreichbar, daher wurde die Anmelde-URL nicht geprüft. Stelle sicher, dass es läuft, und drücke erneut die Eingabetaste.",
-      "unexpected_server_response": "Unerwartete Serverantwort"
+      "unexpected_server_response": "Unerwartete Serverantwort",
+      "no_pending_approval": "Diese Genehmigung steht nicht mehr aus."
     }
   },
   "app": {
@@ -6128,6 +6129,7 @@
       "add_files_options": "Dateien & Optionen hinzufügen",
       "agent": "Agent: {{name}}",
       "allow_once": "Einmal erlauben",
+      "coordinator_no_trust": "Diese Anfrage wird hier einmalig entschieden, daher lässt sich dafür kein Vertrauen speichern.",
       "apply_a_ready_made_set_of_instructions": "Vorgefertigten Anweisungssatz anwenden",
       "approve": "Genehmigen",
       "approve_all": "Alle genehmigen",
@@ -9458,7 +9460,6 @@
       "cron": "Cron{{detail}}",
       "cron_running": "Cron · läuft",
       "deny": "Ablehnen",
-      "failed": "fehlgeschlagen",
       "idle": "Inaktiv",
       "kiro_is_working": "Kiro arbeitet…",
       "loading_thread": "Thread wird geladen…",
@@ -14044,6 +14045,7 @@
       "no_idea_or_spec_content_available": "Kein Ideen- oder Spezifikationsinhalt verfügbar.",
       "phased": "Phasenweise",
       "task_is_waiting_for_your_decision": "Aufgabe {{index}} „{{title}}“ wartet auf Ihre Entscheidung",
+      "task_gate_gone": "Aufgabe {{index}} „{{title}}“: Diese Genehmigung ist abgelaufen oder wurde bereits entschieden und kann hier nicht mehr entschieden werden.",
       "tasks": "Aufgaben",
       "the_dag_view_will_appear_once_the_plan_is_ready": "Die DAG-Ansicht erscheint, sobald der Plan bereit ist",
       "failed_to_update_task": "Aufgabe konnte nicht aktualisiert werden"

@@ -240,7 +240,8 @@
       "stream_ended_without_completion": "Stream ended without completion",
       "token_not_accepted": "That sign-in URL was not accepted. Run kirocrew token again and paste the new sign-in URL below.",
       "token_exchange_unreachable": "Could not reach the gateway, so the sign-in URL was not checked. Make sure it is running, then press Enter again.",
-      "unexpected_server_response": "Unexpected server response"
+      "unexpected_server_response": "Unexpected server response",
+      "no_pending_approval": "This approval is no longer pending."
     }
   },
   "app": {
@@ -1971,6 +1972,7 @@
       "terminal": "Terminal"
     },
     "chatInput": {
+      "coordinator_no_trust": "This request is decided once here, so Trust can't be saved for it.",
       "cancel_upload": "Cancel upload",
       "auto_jev": "Auto (Jev)",
       "auto_jev_desc": "Let Jev choose: act now, or run after",
@@ -6332,6 +6334,7 @@
       "export_yaml": "Export YAML",
       "exporting": "Exporting…",
       "task_is_waiting_for_your_decision": "Task {{index}} \"{{title}}\" is waiting for your decision",
+      "task_gate_gone": "Task {{index}} \"{{title}}\": this approval has expired or was already decided, so it can no longer be decided here.",
       "failed_to_update_task": "Failed to update task"
     },
     "projectsPage": {

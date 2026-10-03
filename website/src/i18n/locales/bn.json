@@ -240,7 +240,8 @@
       "stream_ended_without_completion": "স্ট্রিম সম্পূর্ণ হওয়ার আগেই শেষ হয়ে গেছে",
       "token_not_accepted": "এই সাইন-ইন URL গৃহীত হয়নি। kirocrew token আবার চালাও এবং নতুন সাইন-ইন URL নিচে পেস্ট করো।",
       "token_exchange_unreachable": "গেটওয়েতে পৌঁছানো যায়নি, তাই সাইন-ইন URL যাচাই করা হয়নি। এটি চলছে কিনা নিশ্চিত করে আবার Enter চাপো।",
-      "unexpected_server_response": "সার্ভার থেকে অপ্রত্যাশিত সাড়া"
+      "unexpected_server_response": "সার্ভার থেকে অপ্রত্যাশিত সাড়া",
+      "no_pending_approval": "এই অনুমোদনটি আর অপেক্ষমাণ নেই।"
     }
   },
   "app": {
@@ -6128,6 +6129,7 @@
       "add_files_options": "ফাইল ও অপশন যোগ করুন",
       "agent": "এজেন্ট: {{name}}",
       "allow_once": "একবারের জন্য অনুমতি দিন",
+      "coordinator_no_trust": "এই অনুরোধের সিদ্ধান্ত এখানে একবারই নেওয়া যায়, তাই এটির জন্য বিশ্বাস সংরক্ষণ করা যায় না।",
       "apply_a_ready_made_set_of_instructions": "আগে থেকে তৈরি নির্দেশের একটি সেট প্রয়োগ করুন",
       "approve": "মঞ্জুর করো",
       "approve_all": "সব অনুমোদন",
@@ -9458,7 +9460,6 @@
       "cron": "Cron{{detail}}",
       "cron_running": "Cron · চলছে",
       "deny": "প্রত্যাখ্যান",
-      "failed": "ব্যর্থ",
       "idle": "নিষ্ক্রিয়",
       "kiro_is_working": "kiro কাজ করছে…",
       "loading_thread": "থ্রেড লোড হচ্ছে…",
@@ -14044,6 +14045,7 @@
       "no_idea_or_spec_content_available": "কোনো আইডিয়া বা স্পেক বিষয়বস্তু নেই।",
       "phased": "ধাপভিত্তিক",
       "task_is_waiting_for_your_decision": "টাস্ক {{index}} \"{{title}}\" আপনার সিদ্ধান্তের অপেক্ষায় আছে",
+      "task_gate_gone": "টাস্ক {{index}} \"{{title}}\": এই অনুমোদনটির মেয়াদ শেষ হয়ে গেছে বা ইতিমধ্যে সিদ্ধান্ত নেওয়া হয়েছে, তাই এখানে আর এটির সিদ্ধান্ত নেওয়া যাবে না।",
       "tasks": "টাস্ক",
       "the_dag_view_will_appear_once_the_plan_is_ready": "পরিকল্পনা প্রস্তুত হলে DAG ভিউ দেখা যাবে",
       "failed_to_update_task": "টাস্ক আপডেট করা যায়নি"

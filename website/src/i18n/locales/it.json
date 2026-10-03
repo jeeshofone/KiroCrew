@@ -241,7 +241,8 @@
       "stream_ended_without_completion": "Lo stream è terminato senza completarsi",
       "token_not_accepted": "Questo URL di accesso non è stato accettato. Esegui di nuovo kirocrew token e incolla qui sotto il nuovo URL di accesso.",
       "token_exchange_unreachable": "Non è stato possibile raggiungere il gateway, quindi l'URL di accesso non è stato verificato. Verifica che sia in esecuzione, poi premi di nuovo Invio.",
-      "unexpected_server_response": "Risposta del server inaspettata"
+      "unexpected_server_response": "Risposta del server inaspettata",
+      "no_pending_approval": "Questa approvazione non è più in sospeso."
     }
   },
   "app": {
@@ -6225,6 +6226,7 @@
       "add_files_options": "Aggiungi file e opzioni",
       "agent": "Agente: {{name}}",
       "allow_once": "Consenti una volta",
+      "coordinator_no_trust": "Questa richiesta si decide una sola volta qui, quindi la fiducia non può essere salvata.",
       "apply_a_ready_made_set_of_instructions": "Applica un set di istruzioni predefinito",
       "approve": "Approva",
       "approve_all": "Approva tutto",
@@ -9585,7 +9587,6 @@
       "cron": "Cron{{detail}}",
       "cron_running": "Cron · in esecuzione",
       "deny": "Nega",
-      "failed": "non riuscito",
       "idle": "Inattivo",
       "kiro_is_working": "Kiro sta lavorando…",
       "loading_thread": "Caricamento del thread…",
@@ -14261,6 +14262,7 @@
       "no_idea_or_spec_content_available": "Nessun contenuto di idea o specifica disponibile.",
       "phased": "A fasi",
       "task_is_waiting_for_your_decision": "Attività {{index}} \"{{title}}\" è in attesa della tua decisione",
+      "task_gate_gone": "Attività {{index}} \"{{title}}\": questa approvazione è scaduta o è già stata decisa, quindi non si può più decidere qui.",
       "tasks": "Attività",
       "the_dag_view_will_appear_once_the_plan_is_ready": "La vista DAG apparirà quando il piano sarà pronto",
       "failed_to_update_task": "Impossibile aggiornare l'attività"

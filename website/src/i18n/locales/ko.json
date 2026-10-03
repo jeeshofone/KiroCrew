@@ -239,7 +239,8 @@
       "stream_ended_without_completion": "스트림이 완료되지 않은 채 종료되었습니다",
       "token_not_accepted": "이 로그인 URL은 거부되었습니다. kirocrew token 을 다시 실행하고 새 로그인 URL을 아래에 붙여넣으세요.",
       "token_exchange_unreachable": "게이트웨이에 연결할 수 없어 로그인 URL을 확인하지 못했습니다. 실행 중인지 확인한 뒤 Enter를 다시 누르세요.",
-      "unexpected_server_response": "예기치 않은 서버 응답"
+      "unexpected_server_response": "예기치 않은 서버 응답",
+      "no_pending_approval": "이 승인은 더 이상 대기 중이 아닙니다."
     }
   },
   "app": {
@@ -6031,6 +6032,7 @@
       "add_files_options": "파일 및 옵션 추가",
       "agent": "에이전트: {{name}}",
       "allow_once": "한 번만 허용",
+      "coordinator_no_trust": "이 요청은 여기서 한 번만 결정되므로 신뢰를 저장할 수 없습니다.",
       "apply_a_ready_made_set_of_instructions": "미리 준비된 지시 세트 적용",
       "approve": "승인",
       "approve_all": "모두 승인",
@@ -9331,7 +9333,6 @@
       "cron": "정기 실행{{detail}}",
       "cron_running": "정기 실행 · 실행 중",
       "deny": "거부",
-      "failed": "실패",
       "idle": "유휴",
       "kiro_is_working": "kiro가 작업 중…",
       "loading_thread": "스레드 불러오는 중…",
@@ -13827,6 +13828,7 @@
       "no_idea_or_spec_content_available": "아이디어나 명세 내용이 없습니다.",
       "phased": "단계별",
       "task_is_waiting_for_your_decision": "작업 {{index}} ‘{{title}}’이(가) 결정을 기다리고 있습니다",
+      "task_gate_gone": "작업 {{index}} ‘{{title}}’: 이 승인은 만료되었거나 이미 결정되어 여기서 더 이상 결정할 수 없습니다.",
       "tasks": "작업",
       "the_dag_view_will_appear_once_the_plan_is_ready": "플랜이 준비되면 DAG 보기가 표시됩니다",
       "failed_to_update_task": "작업을 업데이트하지 못했습니다"
