@@ -95,7 +95,7 @@ function renderSidebar(slots: ChatSlot[], chat: Record<string, unknown>, activeS
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={slots} activeSlot={activeSlotProp} unreadSlots={[]}
               history={[]} historyHasMore={false} defaultAgent="" installedAgents={[]}
             />

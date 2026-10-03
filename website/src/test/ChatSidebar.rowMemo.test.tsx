@@ -150,7 +150,7 @@ function renderSidebar() {
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={slots} activeSlot={null} unreadSlots={EMPTY_UNREAD}
               history={EMPTY_HISTORY} historyHasMore={historyHasMore} defaultAgent="" installedAgents={EMPTY_AGENTS}
             />
@@ -184,7 +184,7 @@ function renderSidebarParts() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   qc.setQueryData(['chat-folders'], [])
   const sidebarBelowProviders = (historyHasMore: boolean) => (
-    <ChatSidebar
+    <ChatSidebar winW={window.innerWidth}
       slots={slots} activeSlot={null} unreadSlots={EMPTY_UNREAD}
       history={EMPTY_HISTORY} historyHasMore={historyHasMore} defaultAgent="" installedAgents={EMPTY_AGENTS}
     />
@@ -221,7 +221,7 @@ function renderSidebarWithSlots(slots: ReturnType<typeof slot>[]) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   qc.setQueryData(['chat-folders'], [])
   const sidebarWithSlots = (rows: ReturnType<typeof slot>[]) => (
-    <ChatSidebar
+    <ChatSidebar winW={window.innerWidth}
       slots={rows} activeSlot={null} unreadSlots={EMPTY_UNREAD}
       history={EMPTY_HISTORY} historyHasMore={false} defaultAgent="" installedAgents={EMPTY_AGENTS}
     />
@@ -437,7 +437,7 @@ function renderWithAgents(initial: ReturnType<typeof painterAgents>) {
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={slots} activeSlot={null} unreadSlots={EMPTY_UNREAD}
               history={EMPTY_HISTORY} historyHasMore={false} defaultAgent="" installedAgents={ags}
             />

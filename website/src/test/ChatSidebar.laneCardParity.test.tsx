@@ -126,7 +126,7 @@ function renderLane(lane: 'flat' | 'conductor', slots: TestSlot[] = SUBJECT) {
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={slots as never} activeSlot={null} unreadSlots={[]}
               history={[]} historyHasMore={false} defaultAgent="kirocrew" installedAgents={[]}
             />

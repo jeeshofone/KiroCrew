@@ -108,7 +108,7 @@ function renderSidebar(extraProps: RemovedSplitProps = {}) {
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={SLOTS} activeSlot={null} unreadSlots={[]}
               history={[]} historyHasMore={false} defaultAgent="" installedAgents={[]}
               {...extraProps}

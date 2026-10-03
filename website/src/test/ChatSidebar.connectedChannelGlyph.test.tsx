@@ -106,7 +106,7 @@ function renderSidebar() {
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={slots} activeSlot={'dashboard_chat-1-4'} unreadSlots={[]}
               history={[]} historyHasMore={false} defaultAgent={'default'} installedAgents={[]}
             />

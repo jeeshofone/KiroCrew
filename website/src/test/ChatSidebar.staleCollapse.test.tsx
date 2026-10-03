@@ -88,7 +88,7 @@ function renderSidebar(slots: FixtureSlot[], { folders = [] as FixtureSlot[], ac
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={slots as never} activeSlot={activeSlot} unreadSlots={unreadSlots}
               history={[]} historyHasMore={false} defaultAgent="" installedAgents={[]}
             />
@@ -315,7 +315,7 @@ describe('chat sidebar — stale-session collapse', () => {
         <Provider store={view.store}>
           <ThemeProvider>
             <MemoryRouter>
-              <ChatSidebar
+              <ChatSidebar winW={window.innerWidth}
                 slots={after as never} activeSlot={null} unreadSlots={[]}
                 history={[]} historyHasMore={false} defaultAgent="" installedAgents={[]}
               />

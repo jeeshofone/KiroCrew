@@ -129,7 +129,7 @@ function renderSidebar(folderId = ARCHIVE) {
   const Harness = () => {
     const slots = useAppSelector(s => s.dashboard.slots)
     return (
-      <ChatSidebar
+      <ChatSidebar winW={window.innerWidth}
         slots={slots} activeSlot={null} unreadSlots={[]}
         history={[]} historyHasMore={false} defaultAgent="" installedAgents={[]}
       />

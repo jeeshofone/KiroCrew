@@ -208,7 +208,7 @@ function renderSidebar(opts: {
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={rows as never} activeSlot={opts.activeSlot ?? null} unreadSlots={[]}
               history={[]} historyHasMore={false}
               defaultAgent="" installedAgents={[{ name: 'builder', source: 'builtin' }]}

@@ -104,7 +104,7 @@ function mountSidebar(slots: ChatSlot[], chat: Record<string, unknown>, activeSl
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={slots} activeSlot={activeSlotProp} unreadSlots={[]}
               history={[]} historyHasMore={false} defaultAgent="" installedAgents={[]}
             />

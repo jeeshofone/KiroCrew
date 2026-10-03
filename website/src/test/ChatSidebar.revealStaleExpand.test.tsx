@@ -111,7 +111,7 @@ function renderSidebar(slots: FixtureSlot[], { folders = [] as FixtureSlot[], ac
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={slots as never} activeSlot={activeSlot} unreadSlots={[]}
               history={[]} historyHasMore={false} defaultAgent="" installedAgents={[]}
             />

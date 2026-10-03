@@ -120,7 +120,7 @@ function renderSidebar(folderData: ChatFolder[] = folders, slotData: ChatSlot[] 
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={slotData} activeSlot={null} unreadSlots={[]}
               history={[]} historyHasMore={false} defaultAgent="" installedAgents={[]}
             />

@@ -117,7 +117,7 @@ function renderSidebar(activeSlot: string | null) {
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar slots={slots} activeSlot={activeSlot} unreadSlots={EMPTY}
+            <ChatSidebar winW={window.innerWidth} slots={slots} activeSlot={activeSlot} unreadSlots={EMPTY}
               history={EMPTY} historyHasMore={false} defaultAgent="" installedAgents={EMPTY} />
           </MemoryRouter>
         </ThemeProvider>

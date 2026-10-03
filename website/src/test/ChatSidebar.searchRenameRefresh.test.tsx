@@ -98,7 +98,7 @@ function renderSidebar(slots: ChatSlot[]) {
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={slots}
               activeSlot={'chat-decoy'}
               unreadSlots={[]}
@@ -118,7 +118,7 @@ function renderSidebar(slots: ChatSlot[]) {
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={next}
               activeSlot={'chat-decoy'}
               unreadSlots={[]}

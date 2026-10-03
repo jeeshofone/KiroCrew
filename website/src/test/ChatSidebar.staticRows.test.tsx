@@ -71,7 +71,7 @@ function renderSidebar(staticRows: boolean) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
     <Provider store={store}><QueryClientProvider client={qc}><MemoryRouter><ThemeProvider>
-      <ChatSidebar
+      <ChatSidebar winW={window.innerWidth}
         slots={SLOTS as never}
         activeSlot={'s1'}
         unreadSlots={[]}

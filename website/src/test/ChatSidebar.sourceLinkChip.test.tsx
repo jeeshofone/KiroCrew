@@ -115,7 +115,7 @@ function renderSidebar(opts: {
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={rows} activeSlot={'s1'} unreadSlots={[]}
               history={[]} historyHasMore={false} defaultAgent={'default'} installedAgents={[]}
               onOpenSource={opts.onOpenSource}

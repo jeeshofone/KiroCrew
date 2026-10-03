@@ -107,7 +107,7 @@ function renderSidebar(slots: ChatSlot[] = SLOTS, revealRequest: { kind: 'sessio
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={slots} activeSlot={null} unreadSlots={[]}
               history={[]} historyHasMore={false} defaultAgent="" installedAgents={[]}
             />
@@ -155,7 +155,7 @@ function renderWithFolders(slots: ChatSlot[] = FOLDER_SLOTS, folders: ChatFolder
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={slots} activeSlot={null} unreadSlots={[]}
               history={[]} historyHasMore={false} defaultAgent="" installedAgents={[]}
             />

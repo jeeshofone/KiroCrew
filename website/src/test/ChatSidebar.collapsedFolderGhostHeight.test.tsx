@@ -118,7 +118,7 @@ async function renderSidebar(collapsed: boolean) {
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={SLOTS as React.ComponentProps<typeof ChatSidebar>['slots']}
               activeSlot={null} unreadSlots={[]}
               history={[]} historyHasMore={false} defaultAgent="" installedAgents={[]}

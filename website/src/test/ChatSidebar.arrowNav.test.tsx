@@ -99,7 +99,7 @@ function renderSidebar(slots: ChatSlot[]) {
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={nextSlots} activeSlot={null} unreadSlots={[]}
               history={[]} historyHasMore={false} defaultAgent="" installedAgents={[]}
             />
@@ -398,7 +398,7 @@ describe('chat sidebar — board column arrow navigation', () => {
         <Provider store={store}>
           <ThemeProvider>
             <MemoryRouter>
-              <ChatSidebar
+              <ChatSidebar winW={window.innerWidth}
                 slots={slots} activeSlot={null} unreadSlots={[]}
                 history={[]} historyHasMore={false} defaultAgent="" installedAgents={[]}
               />

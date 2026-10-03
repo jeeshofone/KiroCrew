@@ -89,7 +89,7 @@ function renderSidebar(connected = false, onSelectSlot?: (key: string) => void) 
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={[slot]} activeSlot={null} unreadSlots={[]}
               history={[]} historyHasMore={false} defaultAgent="" installedAgents={[]}
               onSelectSlot={onSelectSlot}

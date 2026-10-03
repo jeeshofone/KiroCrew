@@ -113,7 +113,7 @@ function renderSidebar(onOpenSlotInNewTab?: (key: string, opts?: { background?: 
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={SLOTS} activeSlot={ORIGIN} unreadSlots={[]}
               history={[]} historyHasMore={false} defaultAgent="kirocrew" installedAgents={[]}
               onOpenSlotInNewTab={onOpenSlotInNewTab}

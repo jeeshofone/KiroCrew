@@ -119,7 +119,7 @@ function renderSidebar() {
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={[]} activeSlot={null} unreadSlots={[]}
               history={[]} historyHasMore={false} defaultAgent={DEFAULT_AGENT} installedAgents={[]}
             />

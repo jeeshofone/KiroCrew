@@ -141,7 +141,7 @@ function renderSidebar() {
   const Harness = () => {
     const slots = useAppSelector(st => st.dashboard.slots)
     return (
-      <ChatSidebar
+      <ChatSidebar winW={window.innerWidth}
         slots={slots} activeSlot={null} unreadSlots={[]}
         history={[]} historyHasMore={false} defaultAgent="" installedAgents={[]}
       />

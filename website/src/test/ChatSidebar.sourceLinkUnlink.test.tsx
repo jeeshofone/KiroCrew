@@ -50,7 +50,7 @@ function rows(): ChatSlot[] {
 }
 function ConnectedSidebar() {
   const slots = useAppSelector(s => s.dashboard.slots)
-  return <ChatSidebar slots={slots} activeSlot="s1" unreadSlots={[]} history={[]} historyHasMore={false} defaultAgent="default" installedAgents={[]} onOpenSource={openSourceMock} />
+  return <ChatSidebar winW={window.innerWidth} slots={slots} activeSlot="s1" unreadSlots={[]} history={[]} historyHasMore={false} defaultAgent="default" installedAgents={[]} onOpenSource={openSourceMock} />
 }
 function renderSidebar(list = rows(), connected = true) {
   const store = createTestStore({

@@ -160,7 +160,7 @@ function renderSidebar(slots: ChatSlot[]) {
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={slots}
               activeSlot={'chat-gamma'}
               unreadSlots={[]}

@@ -98,7 +98,7 @@ function renderSidebar(opts: { onOpenSlotInNewTab?: (key: string) => void; conne
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatSidebar
+            <ChatSidebar winW={window.innerWidth}
               slots={SLOTS}
               activeSlot="s1"
               unreadSlots={[]}
