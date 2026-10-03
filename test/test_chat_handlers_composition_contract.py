@@ -46,7 +46,9 @@ _FACADE_PATH = Path(ch.__file__).resolve()
 
 #: Every module-level name ``chat_handlers`` bound at the base the split was cut
 #: from: what it defined and what it imported, private names included, because tests
-#: and production read private names off it too.
+#: and production read private names off it too. One name is left off on purpose:
+#: ``restore_agent_selection``, since ``restore_session_binding`` is the one binding
+#: restore and every caller goes through it.
 _BASE_NAMES = frozenset("""
         ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS ADOPT_PEER_MODE_UNKNOWN ADOPT_TARGET_UNKNOWN
         ARTIFACT_SLUG_RE AUTOCOMPACT_PCT_MAX AUTOCOMPACT_PCT_MIN AcpModelUnavailable AcpProvider
@@ -146,7 +148,7 @@ _BASE_NAMES = frozenset("""
         relay_remote_turn release_prewarmed_session reload_slot_session remote_bound_refusal
         remote_mirror request_slot_origin resolve_adopt_target resolve_agent_bindings
         resolve_folder_project_dir_off_loop resolve_session_agent_bindings resolved_row_identity
-        restore_agent_selection restore_replacement_if_handover_did_not_land
+        restore_replacement_if_handover_did_not_land
         resume_slot_from_history row_mid safety_override save_slot_off_loop schedule_eager_spawn
         sel session_agent_selection_name session_start_failure_streak slot_history_key
         slot_switch_session_lock spawn_guarded_turn stage_boundary_for start_queue_persist
