@@ -851,7 +851,8 @@ class TestTranscriptOwnershipWithoutALiveSlot:
 
         async def create_and_close_destination():
             assert "b1" not in state._slots_under_construction
-            assert not (await asyncio.to_thread(log.get_metadata, source_key)).get("closed")
+            # The reopen write runs after construction, so the source is still closed.
+            assert (await asyncio.to_thread(log.get_metadata, source_key)).get("closed")
             await _persist_and_close(state, state.get_or_create_slot("b1", origin=SlotOrigin.USER))
             before["meta"] = await asyncio.to_thread(log.get_metadata, destination_key)
             before["rows"] = await asyncio.to_thread(log.read_messages, destination_key)
@@ -995,11 +996,18 @@ class TestTranscriptOwnershipWithoutALiveSlot:
         assert state._slots["a1"]._app == APP
 
     @pytest.mark.asyncio
-    async def test_a_late_refusal_puts_the_closed_marker_back(self, state, monkeypatch) -> None:
-        """Refused after the eager clear, the transcript must not be left reopened."""
+    async def test_a_late_refusal_leaves_the_closed_marker_untouched(
+        self, state, monkeypatch
+    ) -> None:
+        """Refused at the late ownership barrier, the transcript is left closed.
+
+        The reopen write runs only after construction, so the late barrier refuses
+        before any durable write: the clear is never attempted.
+        """
         await _persist_and_close(state, state.get_or_create_slot("a1", app=APP))
         log = state.conversation_log
         cleared: list[str] = []
+        reads: list[str] = []
         real_clear, real_get = log.clear_closed, log.get_metadata
 
         def clear_closed(key, **kw):
@@ -1007,17 +1015,21 @@ class TestTranscriptOwnershipWithoutALiveSlot:
             return real_clear(key, **kw)
 
         def get_metadata(key):
+            reads.append(key)
             meta = real_get(key)
-            # After the clear, the post-read snapshot records no app.
-            return {k: v for k, v in meta.items() if k != "app"} if cleared else meta
+            # Every snapshot after the first records no app: the post-read
+            # snapshot is not the app's.
+            return {k: v for k, v in meta.items() if k != "app"} if len(reads) > 1 else meta
 
         monkeypatch.setattr(log, "clear_closed", clear_closed)
         monkeypatch.setattr(log, "get_metadata", get_metadata)
         async with _client(state, APP) as client:
             resp = await client.post("/api/chat/slots/a1/resume", json={"key": "dashboard:a1"})
             assert (resp.status, await resp.json()) == (404, _NOT_FOUND)
-        assert cleared == ["dashboard:a1"]
+        assert len(reads) > 1, "the late barrier's re-read did not happen"
+        assert cleared == []
         assert "a1" not in state._slots
+        assert "a1" not in state._slots_under_construction
         meta, readable = log.get_metadata_status("dashboard:a1")
         assert readable and meta.get("closed")
 
@@ -1536,22 +1548,33 @@ class TestResumeAnswersAnAppLikeEveryOtherRoute:
             assert (await resp.json())["code"] == "resume_in_progress"
 
     @pytest.mark.asyncio
-    async def test_construction_starting_after_the_clear_restores_the_marker(
+    async def test_construction_starting_during_the_reads_leaves_the_marker(
         self, state, sel_spy, monkeypatch
     ) -> None:
+        """Another build of the key starting inside the reads refuses with no write."""
+        from kiro_crew.dashboard import chat_handlers
+
         await _persist_and_close(state, state.get_or_create_slot("a1", app=APP))
         log = state.conversation_log
+        cleared: list[str] = []
         real_clear = log.clear_closed
+        load_cfg = chat_handlers._load_restore_cfg
 
-        def clear_then_construct(key, **kw):
-            result = real_clear(key, **kw)
+        def clear_closed(key, **kw):
+            cleared.append(key)
+            return real_clear(key, **kw)
+
+        def construct_then_load():
             state._slots_under_construction.add("a1")
-            return result
+            return load_cfg()
 
-        monkeypatch.setattr(log, "clear_closed", clear_then_construct)
+        monkeypatch.setattr(log, "clear_closed", clear_closed)
+        monkeypatch.setattr(chat_handlers, "_load_restore_cfg", construct_then_load)
         async with _client(state, APP) as client:
             resp = await client.post("/api/chat/slots/a1/resume", json={})
             assert (resp.status, await resp.json()) == (404, _NOT_FOUND)
+        state._slots_under_construction.discard("a1")
+        assert cleared == []
         meta, readable = log.get_metadata_status("dashboard:a1")
         assert readable and meta.get("closed")
         assert "a1" not in state._slots

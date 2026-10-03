@@ -929,10 +929,12 @@ async def resume_slot_from_history(
     nothing resolves it, ``serialize_slots`` never shows it, and a named create on
     its key is refused by the construction guard. A refusal it returns discards
     the built slot the way a failed construction is discarded and comes back as
-    ``ResumeOutcome.refusal``. With a hook the reopen write (clearing ``closed``)
-    is deferred until the hook has passed, so a hook refusal has nothing durable
-    to undo, and a clear that cannot land refuses (``reopen_failed``) rather than
-    publishing a tab that would not restore. The hook is an idempotent pre-publish
+    ``ResumeOutcome.refusal``. The reopen write (clearing ``closed``) runs in the
+    same retracted window, after the hook when there is one, with or without a
+    hook: it is awaited and verified BEFORE the publish, a refusal before it has
+    nothing durable to undo, one after it puts the marker back, and a clear that
+    cannot land refuses (``reopen_failed``) rather than publishing a tab that
+    would not restore. The hook is an idempotent pre-publish
     check (it may update in-memory bookkeeping such as ``_created_by`` and
     ``_revived_by`` on the built slot, never durable state) and runs TWICE: once before the deferred clear, and once after it as the last
     awaiting act, because the clear and its verification read are awaits during
@@ -1132,17 +1134,21 @@ async def resume_slot_from_history(
         folder_unhidden = await _unhide_folder(state, folder_checked_id)
     cleared_closed: bool = False
     cleared_closed_at: Any = meta.get("closed_at")
-    # With a containment hook the clear is DEFERRED until the hook has passed:
-    # a refusal then has no durable change to undo, and a clear that cannot
-    # land refuses the resume instead of publishing a tab that would not restore.
-    defer_clear = containment is not None and bool(meta.get("closed"))
+    # The reopen write (clearing ``closed``) is DEFERRED to the reserved window
+    # after construction, with or without a hook: every refusal before it has no
+    # durable change to undo, the write is awaited and verified BEFORE the
+    # publish, and a clear that cannot land refuses the resume instead of
+    # publishing a tab that would not restore.
+    defer_clear = bool(meta.get("closed"))
+    # The slot is built retracted under its construction mark, and published only
+    # after the awaited tail (the hook, the reopen write) has passed.
+    reserved = containment is not None or defer_clear
     if name in getattr(state, "_slots_under_construction", ()):
         # Another resume of this key is between hydration and publish. The same
         # coded conflict is answered again at construction (the window can open
         # after this read); asking here first means the common case refuses
-        # BEFORE the eager clear below has dropped the ``closed`` marker, so a
-        # click that lost the race leaves the line as it found it. An app gets
-        # the uniform 404 (see _app_resume_refusal).
+        # before any of the reads below. An app gets the uniform 404 (see
+        # _app_resume_refusal).
         if request_app:
             return ResumeOutcome(refusal=_RESUME_APP_NOT_FOUND)
         return ResumeOutcome(
@@ -1150,46 +1156,6 @@ async def resume_slot_from_history(
                 "this session is being resumed elsewhere; try again", "resume_in_progress", 409
             )
         )
-    if meta.get("closed") and not defer_clear:
-        # Clear the closed flag so the session restores on the next gateway restart.
-        # Offloaded because clear_closed takes the per-session cross-process lock,
-        # which fails fast on the loop under contention. Best-effort: resume anyway.
-        #
-        # COMPARE-AND-CLEAR, not an unconditional clear. We are acting on the
-        # ``meta`` snapshot above, and by the time this call takes the lock the
-        # session may have been closed again by someone else -- or deleted,
-        # recreated and closed, in which case the flag we would drop belongs to a
-        # DIFFERENT conversation that the identity re-check below is about to
-        # refuse with a 409. Clearing it anyway reopens a replacement the user
-        # closed. ``only_if_closed_before`` moves the comparison inside the store's
-        # own lock, so there is no window between the check and the write; a close
-        # instant at or after our boundary leaves the flag standing.
-        try:
-            await asyncio.to_thread(
-                state.conversation_log.clear_closed,
-                history_key,
-                only_if_closed_before=resume_started_at,
-            )
-        except Exception:
-            logger.warning("Failed to clear closed flag for %s", history_key, exc_info=True)
-        else:
-            cleared_closed = True
-            # Absorb OUR OWN mutation into the identity baseline: the member
-            # guard further down compares a later snapshot against ``meta``,
-            # and clear_closed just dropped exactly ``closed``/``closed_at``
-            # from the line this baseline was read from. Without this, a
-            # legitimate closed-thread resume trips that barrier — a
-            # guaranteed 409 issued AFTER the reopen durably landed. The two
-            # keys are removed from the LOCAL dict rather than re-reading the
-            # file, so every drift the barrier exists for (delete/recreate,
-            # concurrent edits — anything not these two keys) still differs
-            # from the post-await snapshot and still refuses. clear_closed is
-            # conditional (compare-and-clear, no-op arms), so the snapshot
-            # may retain the keys; the barrier compares the POST-read against
-            # this baseline, and a retained ``closed`` there simply mismatches
-            # and refuses — fail-closed, never fail-open.
-            meta = {k: v for k, v in meta.items() if k not in ("closed", "closed_at")}
-
     restored_agent = await asyncio.to_thread(
         _restored_agent_name, _resume_session_identity(state, history_key), meta
     )
@@ -1471,20 +1437,15 @@ async def resume_slot_from_history(
     # Late twin of the transcript-ownership refusal above, on the post-await
     # snapshot: a delete and same-key recreate inside the reads replaces the
     # metadata line, so ownership the old snapshot earned says nothing about the
-    # transcript about to be adopted. Like every refusal after the eager clear,
-    # it puts back the ``closed`` marker that clear dropped.
+    # transcript about to be adopted. Nothing durable has changed yet (the
+    # reopen write runs in the reserved window after construction), so there is
+    # no ``closed`` marker to put back.
     if request_app and (
         destination_refusal is not None or not app_owns_transcript_meta(meta, request_app)
     ):
         if destination_refusal is None:
             audit_app_slot_denial(
                 request_app, "slot_resume", name, "app does not own this transcript (late barrier)"
-            )
-        if cleared_closed and not await _restore_closed_marker():
-            logger.error(
-                "app resume of %s was refused after its closed marker was cleared, and "
-                "the marker could not be confirmed restored; the session may restore as open",
-                history_key,
             )
         return ResumeOutcome(refusal=_RESUME_APP_NOT_FOUND)
     if _member_binding is None and str(meta.get("mode", "")) == members_mod.DM_SLOT_MODE:
@@ -1518,39 +1479,42 @@ async def resume_slot_from_history(
         # a bare ``ValueError``; answer with a coded conflict instead, since a
         # retry a moment later finds the key either published or free.
         #
-        # This arm sits AFTER the hook-less path's eager clear: a click that won
-        # the guard at the top and lost here has already dropped the ``closed``
-        # marker, and if the resume it lost to is then refused (a hooked revive
-        # discards its build and restores only what IT cleared) the archived
-        # session would come back as a sidebar row at the next start. Put the
-        # marker back, compare-and-set, before answering. An app gets the
-        # uniform 404 whatever the restore did (see _app_resume_refusal), as at
-        # the late ownership barrier above.
-        if cleared_closed and not await _restore_closed_marker():
-            logger.error(
-                "resume of %s lost to a concurrent resume after its closed marker was "
-                "cleared, and the marker could not be confirmed restored; the session "
-                "may restore as open",
-                history_key,
-            )
-            if request_app:
-                return ResumeOutcome(refusal=_RESUME_APP_NOT_FOUND)
-            # The same answer ``_discard`` gives for this failure: the caller
-            # must hear that the durable session is not as it found it, not an
-            # ordinary conflict that a retry would clear.
-            return ResumeOutcome(
-                refusal=ResumeRefusal(
-                    "the session was refused but its closed marker could not be restored; "
-                    "close it again from the History tab",
-                    "reopen_rollback_failed",
-                    503,
-                )
-            )
+        # Nothing durable has changed yet: the reopen write runs in the reserved
+        # window after construction, so the refusal leaves the ``closed`` marker
+        # as this resume found it. An app gets the uniform 404 (see
+        # _app_resume_refusal).
         if request_app:
             return ResumeOutcome(refusal=_RESUME_APP_NOT_FOUND)
         return ResumeOutcome(
             refusal=ResumeRefusal(
                 "this session is being resumed elsewhere; try again", "resume_in_progress", 409
+            )
+        )
+    # A delete still IN FLIGHT is invisible to the existence and identity
+    # barrier above: it holds the transcript lock across its whole transaction
+    # (index drop, attachment and reply-thread staging, the unlink) and that
+    # barrier's read takes no lock, so the file reads as present until the very
+    # end. Publishing here leaves a slot the delete does not know about -- a
+    # delete handler removes only the slot it claimed before its first await --
+    # so the deleted conversation stays open as a tab. Checked HERE, the last
+    # synchronous point before construction, because every await above (the
+    # member-binding read included) is a window a delete can start in.
+    # ``delete_in_flight`` is in-process bookkeeping with no I/O. The reserved
+    # path re-runs the same check in ``_identity_refusal`` after its own awaits.
+    #
+    # The resume cannot know yet whether the delete will go through (a bulk
+    # clear skips a pinned row), so it refuses with a retryable
+    # ``resume_conflict``: a retry after the delete ends either finds the
+    # session gone or opens it. Nothing durable has changed yet (the reopen
+    # write comes after construction), so the session is left as it was found.
+    if session_existed and state.conversation_log.delete_in_flight(history_key):
+        logger.info(
+            "chat resume: session %s is being deleted; refusing the resume",
+            history_key,
+        )
+        return ResumeOutcome(
+            refusal=ResumeRefusal(
+                "this session is being deleted; try again", "resume_conflict", 409
             )
         )
     slot = _materialise_slot_from_history(
@@ -1564,10 +1528,10 @@ async def resume_slot_from_history(
         member_binding=_member_binding,
         folder_unhidden=folder_unhidden,
         folder_checked_id=folder_checked_id,
-        # Under a hook the rows must not reach any client before the hook has
+        # A reserved build must not reach any client before its tail has
         # passed: a refused build is discarded, and frames already pushed for it
         # would describe a session that never appears.
-        broadcast_rows=containment is None,
+        broadcast_rows=not reserved,
     )
     if _member_binding is None:
         # Restore the protected choice read before construction, not the
@@ -1612,11 +1576,11 @@ async def resume_slot_from_history(
     # unsaved interruption row, and the wrapper's paging cursor has to account
     # for it or the next older page repeats a row.
     total = slot._disk_older_count + len(slot.messages)
-    if containment is not None:
-        # Retract while the hook awaits, keep the construction mark: a lookup
+    if reserved:
+        # Retract while the tail awaits, keep the construction mark: a lookup
         # finds nothing, the payload shows nothing, and a create on this key is
         # refused by the construction guard, so no acquirer can reach a slot the
-        # hook may still refuse. The refusal discard mirrors the construction
+        # hook or the reopen write may still refuse. The refusal discard mirrors the construction
         # rollback above (mark released, key freed, restricted marker dropped) and
         # puts back the ``closed`` marker this call cleared, so a refused resume
         # leaves the durable session exactly as it found it.
@@ -1670,6 +1634,17 @@ async def resume_slot_from_history(
                     "resume_conflict",
                     409,
                 )
+            if (
+                session_existed
+                and state.conversation_log is not None
+                and state.conversation_log.delete_in_flight(history_key)  # type: ignore[arg-type]
+            ):
+                # Same in-flight arm as the pre-hook barrier: the lock-free read
+                # above still sees a file the delete is about to unlink. The
+                # refusal goes through ``_discard``, which restores the marker.
+                return ResumeRefusal(
+                    "this session is being deleted; try again", "resume_conflict", 409
+                )
             if not post and session_existed:
                 return ResumeRefusal(
                     "the session was deleted while it was being resumed",
@@ -1695,7 +1670,7 @@ async def resume_slot_from_history(
         # Same shape as the construction rollback above. The discard is
         # shielded so a second cancellation cannot cut the rollback short.
         try:
-            refusal = await containment(slot)
+            refusal = await containment(slot) if containment is not None else None
             if refusal is not None:
                 return ResumeOutcome(refusal=(await _discard()) or refusal)
             holder = state._slots.get(slot.key)
@@ -1720,12 +1695,15 @@ async def resume_slot_from_history(
             if refusal is not None:
                 return ResumeOutcome(refusal=(await _discard()) or refusal)
             if defer_clear:
-                # The reopen write, after the hook and before the publish. A clear
-                # that cannot land refuses: publishing a tab whose line still says
-                # ``closed`` would give the person a session that vanishes at the
-                # next start. Compare-and-clear against the resume's own boundary,
-                # as on the hook-less path; a marker still present afterwards means
-                # somebody re-closed the session inside the window, which refuses too.
+                # The reopen write, after the hook (when there is one) and before
+                # the publish. A clear that cannot land refuses: publishing a tab
+                # whose line still says ``closed`` would give the person a session
+                # that vanishes at the next start. COMPARE-AND-CLEAR against the
+                # resume's own boundary, inside the store's lock: a close at or
+                # after that instant (someone re-closed it, or deleted, recreated
+                # and closed it) keeps its marker, and a marker still present
+                # afterwards refuses too. Offloaded because clear_closed takes the
+                # per-session cross-process lock, which fails fast on the loop.
                 try:
                     # Recorded BEFORE the write is awaited: a cancellation can be
                     # delivered at this very await after the worker has already
@@ -1773,9 +1751,10 @@ async def resume_slot_from_history(
             # once more here, as the LAST awaiting act: after it only the synchronous
             # ``final_check`` and the publish remain. The hook is a read-only
             # predicate, so the second pass has no side effect of its own.
-            refusal = await containment(slot)
-            if refusal is not None:
-                return ResumeOutcome(refusal=(await _discard()) or refusal)
+            if containment is not None:
+                refusal = await containment(slot)
+                if refusal is not None:
+                    return ResumeOutcome(refusal=(await _discard()) or refusal)
             # The second hook pass was itself an await, so the transcript identity is
             # read one final time SYNCHRONOUSLY here, where nothing can run between
             # the read and the publish. A plain file read, not a session-store getter
