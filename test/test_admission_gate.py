@@ -23,6 +23,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from overload_fakes import wait_taskq_open
 
 from kiro_crew import resource_status as rs
 from kiro_crew.config.loader import KiroCrewConfig
@@ -1396,7 +1397,7 @@ class TestSpawnAdmissionGate:
 
         async def run() -> tuple[Any, Any, MagicMock]:
             mgr = self._mgr()
-            await asyncio.wait_for(mgr.wait_taskq_ready(), _QUEUED_EMIT_CEILING_SECS)
+            await wait_taskq_open(mgr)
             self._busy(mgr)
             mgr._spawn_stagger_secs = 0.0
             mgr._on_event = on_event
@@ -2091,7 +2092,7 @@ def test_event_loop_spawns_validate_the_agent_off_the_loop(monkeypatch: pytest.M
         mgr = SubagentManager(
             sessions=sessions, ctx_builder=MagicMock(), on_done=MagicMock(), max_concurrent=3
         )
-        await asyncio.wait_for(mgr.wait_taskq_ready(), _QUEUED_EMIT_CEILING_SECS)
+        await wait_taskq_open(mgr)
         mgr._spawn_stagger_secs = 60.0  # the second spawn queues for the stagger
         with (
             patch("kiro_crew.subagent.check_memory_available", return_value=(True, 8.0)),

@@ -9,6 +9,7 @@ A plain module, imported explicitly (``from overload_fakes import Clock``) like
 * :func:`backoff` -- the coordinator's recovery-ladder schedule with a test-sized base and cap.
 * :func:`task_record` -- a minimal ``TaskRecord`` for one id.
 * :func:`open_task_store` -- the store a fixture yields, closed on teardown.
+* :func:`wait_taskq_open` -- a manager's off-loop store open, attached or failed by name.
 * :func:`settle_store_writes` / :func:`settle_dependency_park` -- the two
   barriers: the store's writer thread, and a step reaching its dependency wait.
 * :func:`settle_depth_emits` -- wait out every in-flight queued-depth emit.
@@ -90,6 +91,36 @@ def open_task_store(
         yield s
     finally:
         s.close()
+
+
+#: How long :func:`wait_taskq_open` waits for a manager's off-loop store open.
+#: A guard against an open that never returns, never a pass condition. The open
+#: is a config load, SQLite create, schema and boot reconcile on a worker thread:
+#: about 15 ms on an idle Linux host, and inside a test call of about 0.3 s on a
+#: hosted Windows runner. That runner stalls for several seconds at a time,
+#: sometimes every xdist worker at once and sometimes one worker alone, and calls
+#: that take 0.3 s there have been measured at 5.5 to 6.9 s. The ceiling is more
+#: than twice that and under the ``timeout(30)`` these tests carry, so a wedged
+#: open fails here, by name, instead of taking the xdist worker down with the
+#: pytest-timeout kill.
+STORE_OPEN_CEILING_SECS = 20.0
+
+
+async def wait_taskq_open(mgr: SubagentManager, ceiling: float = STORE_OPEN_CEILING_SECS) -> None:
+    """Wait for *mgr*'s startup store open to attach, or fail by name.
+
+    ``SubagentManager`` opens its task store on a worker thread when it is
+    built on a running loop, and every spawn answers ``task_store_unavailable``
+    until that open attaches. This awaits the open itself (a signal, not a
+    poll); *ceiling* only bounds an open that never returns.
+    """
+    try:
+        await asyncio.wait_for(mgr.wait_taskq_ready(), ceiling)
+    except asyncio.TimeoutError:
+        raise AssertionError(
+            f"the task store did not open within {ceiling:.1f}s "
+            f"(state: {mgr._taskq_unavailable!r})"
+        ) from None
 
 
 def _noop() -> None:

@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from overload_fakes import Clock, mock_ctx, mock_sessions
+from overload_fakes import Clock, mock_ctx, mock_sessions, wait_taskq_open
 
 import kiro_crew.subagent as subagent_mod
 from kiro_crew.adaptive.controller import AdaptiveController, HostSample
@@ -237,7 +237,7 @@ async def test_startup_cost_cannot_lower_enabled_floor_on_exhausted_cgroup(
         lambda: AdmissionDecision(admitted=True, posture=POSTURE_AMPLE, available_gb=32.0),
     )
     mgr = SubagentManager(sessions=mock_sessions(), ctx_builder=mock_ctx(), max_concurrent=3)
-    await asyncio.wait_for(mgr.wait_taskq_ready(), 5)
+    await wait_taskq_open(mgr)
     mgr._spawn_stagger_secs = 0.0
     worker = AsyncMock()
     monkeypatch.setattr(mgr, "_run", worker)
@@ -280,7 +280,7 @@ async def test_delayed_dedicated_rss_does_not_spend_the_startup_reserve(
     epoch = clock()
     monkeypatch.setattr(subagent_mod, "time", SimpleNamespace(monotonic=clock, time=time.time))
     mgr = SubagentManager(sessions=mock_sessions(), ctx_builder=mock_ctx(), max_concurrent=64)
-    await asyncio.wait_for(mgr.wait_taskq_ready(), 5)
+    await wait_taskq_open(mgr)
     mgr._spawn_stagger_secs = cfg.agent.subagent_spawn_stagger_secs
     starts: dict[str, float] = {}
     finishes: dict[str, asyncio.Future] = {}

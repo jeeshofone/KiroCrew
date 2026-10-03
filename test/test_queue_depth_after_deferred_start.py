@@ -12,7 +12,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from overload_fakes import mock_ctx, mock_sessions
+from overload_fakes import mock_ctx, mock_sessions, wait_taskq_open
 
 import kiro_crew.subagent as subagent_mod
 from kiro_crew.config.loader import KiroCrewConfig
@@ -44,7 +44,7 @@ async def test_deferred_row_that_starts_clears_the_queued_count(monkeypatch) -> 
         lambda: AdmissionDecision(admitted=True, posture=POSTURE_AMPLE, available_gb=32.0),
     )
     mgr = SubagentManager(sessions=mock_sessions(), ctx_builder=mock_ctx(), max_concurrent=3)
-    await asyncio.wait_for(mgr.wait_taskq_ready(), 5)
+    await wait_taskq_open(mgr)
     mgr._spawn_stagger_secs = 0.0
     mgr._taskq_admit_wait_secs = 0.05
     events: list[dict[str, Any]] = []

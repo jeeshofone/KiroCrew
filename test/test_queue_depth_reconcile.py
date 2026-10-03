@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import threading
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -28,6 +29,7 @@ from overload_fakes import (
     mock_sessions,
     settle_depth_emits,
     settle_store_writes,
+    wait_taskq_open,
 )
 
 import kiro_crew.subagent as subagent_mod
@@ -75,7 +77,10 @@ _PARENT = "dash:depth-parent"
 
 #: ``_settle``'s one ceiling for everything a test caused, kept well under the
 #: tests' own ``timeout(30)`` so a wedged task fails here, by name, instead of
-#: taking the xdist worker down with the pytest-timeout kill.
+#: taking the xdist worker down with the pytest-timeout kill. ``_until`` and the
+#: emit drain inside ``_settle`` wait under it too: a Windows runner can freeze
+#: every worker for several seconds, and a shorter private ceiling on any one
+#: wait turns that freeze into a failure of whichever wait it lands in.
 _SETTLE_SECS = 20.0
 
 Event = tuple[str, str, str, dict[str, Any]]
@@ -92,7 +97,7 @@ async def _manager(
     mgr = SubagentManager(
         sessions=mock_sessions(), ctx_builder=mock_ctx(), max_concurrent=max_concurrent
     )
-    await asyncio.wait_for(mgr.wait_taskq_ready(), 5)
+    await wait_taskq_open(mgr)
     mgr._spawn_stagger_secs = 0.0
     mgr._last_spawn_ts = 0.0
     # A delayed re-read after an unreadable store comes this soon. Only that
@@ -150,7 +155,7 @@ async def _settle(mgr: SubagentManager) -> None:
         pending = [t for t in asyncio.all_tasks() if t is not me and t not in parked]
         pending = [t for t in pending if not t.done()]
         if not pending:
-            await settle_depth_emits(mgr)
+            await settle_depth_emits(mgr, timeout=max(0.0, deadline - loop.time()))
             if not mgr._queue_depth_emits:
                 return
             continue
@@ -160,7 +165,7 @@ async def _settle(mgr: SubagentManager) -> None:
         await asyncio.wait(pending, timeout=left)
 
 
-async def _until(check: Any, what: str, timeout: float = 5.0) -> None:
+async def _until(check: Any, what: str, timeout: float = _SETTLE_SECS) -> None:
     """Wait for *check* to hold (a delayed re-read lands on a timer), or fail by name."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -218,6 +223,69 @@ def _fail_chip_reads(monkeypatch: pytest.MonkeyPatch, times: int) -> list[int]:
 
     monkeypatch.setattr(SpawnAdmissionCoordinator, "taskq_chip_overflow_async", flaky)
     return calls
+
+
+# ── a host freeze during the store open is not a failure ────────────────────
+
+#: A stall longer than five seconds and inside the 5.5 to 6.9 s ones measured on
+#: a hosted Windows runner (see ``overload_fakes.STORE_OPEN_CEILING_SECS``).
+_HOST_FREEZE_SECS = 6.0
+
+
+def _freeze_the_open(monkeypatch: pytest.MonkeyPatch, secs: float) -> threading.Event:
+    """Hold the manager's off-loop store open on its worker thread for *secs*.
+
+    The worker thread stops, as every thread on the host does while a runner
+    freezes; the open then runs as usual. The returned event ends the hold early.
+    """
+    real = SubagentManager._open_taskq
+    release = threading.Event()
+
+    def frozen(self: SubagentManager) -> Any:
+        release.wait(secs)
+        return real(self)
+
+    monkeypatch.setattr(SubagentManager, "_open_taskq", frozen)
+    return release
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_a_store_open_held_up_by_a_host_freeze_still_attaches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _freeze_the_open(monkeypatch, _HOST_FREEZE_SECS)
+    mgr = await _manager(monkeypatch, pump_off_loop=True)
+    try:
+        assert mgr._taskq is not None
+        mgr._queue_wait[_PARENT] = dict(_STALE_WAIT)
+        events = _record(mgr)
+
+        assert await mgr.cancel_for_parent(_PARENT) == (0, 0)
+        await _settle(mgr)
+
+        assert _depths(events) == [{"queued": 0}]
+    finally:
+        _close(mgr)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_a_store_open_that_never_returns_fails_by_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = _freeze_the_open(monkeypatch, _SETTLE_SECS)
+    monkeypatch.setattr(subagent_mod, "Stats", MagicMock())
+    monkeypatch.setattr(subagent_mod, "sel", MagicMock())
+    monkeypatch.setattr(SpawnAdmissionCoordinator, "open_store_off_loop", True)
+    mgr = SubagentManager(sessions=mock_sessions(), ctx_builder=mock_ctx(), max_concurrent=1)
+    try:
+        with pytest.raises(AssertionError, match="task store did not open within 0.1s"):
+            await wait_taskq_open(mgr, ceiling=0.1)
+    finally:
+        release.set()
+        await wait_taskq_open(mgr)
+        _close(mgr)
 
 
 # ── every settle point answers ───────────────────────────────────────────────

@@ -12,7 +12,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from overload_fakes import mock_ctx, mock_sessions
+from overload_fakes import mock_ctx, mock_sessions, wait_taskq_open
 
 import kiro_crew.subagent as subagent_mod
 from kiro_crew.config.loader import KiroCrewConfig
@@ -46,7 +46,7 @@ async def test_a_deferred_spawn_is_readable_until_it_starts(monkeypatch) -> None
         lambda: AdmissionDecision(admitted=True, posture=POSTURE_AMPLE, available_gb=32.0),
     )
     mgr = SubagentManager(sessions=mock_sessions(), ctx_builder=mock_ctx(), max_concurrent=3)
-    await asyncio.wait_for(mgr.wait_taskq_ready(), 5)
+    await wait_taskq_open(mgr)
     mgr._spawn_stagger_secs = 0.0
     # Long enough that the row is still parked when it is read below.
     mgr._taskq_admit_wait_secs = 30.0

@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
+from overload_fakes import wait_taskq_open
 
 from kiro_crew.providers.cleanup import _is_safe_path
 from kiro_crew.subagent_persistence import (
@@ -67,7 +68,7 @@ async def _owning(manager):
     try:
         yield manager
     finally:
-        await asyncio.wait_for(manager.wait_taskq_ready(), 5)
+        await wait_taskq_open(manager)
         manager._shutting_down = True
         store = manager._taskq
         if store is not None:

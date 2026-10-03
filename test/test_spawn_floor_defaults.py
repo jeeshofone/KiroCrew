@@ -23,7 +23,7 @@ import threading
 from unittest.mock import MagicMock
 
 import pytest
-from overload_fakes import mock_ctx, mock_sessions
+from overload_fakes import mock_ctx, mock_sessions, wait_taskq_open
 
 import kiro_crew.resource_status as rs
 import kiro_crew.subagent as subagent_mod
@@ -92,7 +92,7 @@ async def _manager(monkeypatch, *, eligible: bool):
     monkeypatch.setattr(subagent_mod, "Stats", MagicMock())
     monkeypatch.setattr(subagent_mod, "sel", MagicMock())
     mgr = SubagentManager(sessions=sessions, ctx_builder=mock_ctx(), max_concurrent=4)
-    await asyncio.wait_for(mgr.wait_taskq_ready(), _WAIT_SECS)
+    await wait_taskq_open(mgr)
     mgr._spawn_stagger_secs = 0.0
     mgr._last_spawn_ts = 0.0
     mgr._taskq_admit_wait_secs = 3600.0  # no re-check pass inside a scenario
