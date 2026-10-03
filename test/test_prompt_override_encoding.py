@@ -34,6 +34,9 @@ from kiro_crew.skills import SkillsLoader
 
 _UTF16_OVERRIDE = b"\xff\xfe" + "You are helpful.".encode("utf-16-le")
 _UTF8_OVERRIDE = "UTF8-OVERRIDE-MARKER: you are the override prompt.\n"
+# The unpinned reader, kept before any fixture replaces it, so a test can show
+# that the cap it moves really reaches the prompt's figure.
+_REAL_LIVE_CAP_FIGURE = ContextBuilder.__dict__["_live_cap_figure"].__func__
 
 
 @pytest.fixture
@@ -143,6 +146,9 @@ class TestUtf16OverrideDegradesToShippedPrompt:
         sizes = iter(range(15, 0, -1))
         monkeypatch.setattr("kiro_crew.subagent.compute_max_subagents", lambda cfg: next(sizes))
         monkeypatch.setattr("kiro_crew.resource_status.adaptive_exec_cap", lambda: 0)
+
+        # The drift is live: unpinned, two readings of the figure differ.
+        assert _REAL_LIVE_CAP_FIGURE() != _REAL_LIVE_CAP_FIGURE()
 
         control = _resolve(builder)
         (home / "prompt.md").write_bytes(_UTF16_OVERRIDE)
