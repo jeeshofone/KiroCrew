@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2681,8 +2682,9 @@ async def test_a_retarget_under_a_terminal_verdict_is_not_settled(tmp_path, monk
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("write_secs", [0.0, 0.5], ids=["fast-disk", "slow-disk"])
 async def test_a_terminal_watch_notifies_even_though_it_cancels_its_own_timer(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, write_secs
 ):
     """The finish must reach the user, not be lost to a self-cancel.
 
@@ -2691,6 +2693,13 @@ async def test_a_terminal_watch_notifies_even_though_it_cancels_its_own_timer(
     that timer, outside the firing window that would have deferred the cancel. So
     anything sequenced AFTER the await can be dropped, and that is the
     notification.
+
+    The notification is emitted only after the settlement is durable, and the
+    tick makes two fsync'd store writes before it gets there (the in-flight
+    marker, then the settlement). On a shared Windows runner each of those can
+    take hundreds of milliseconds, the rename retry alone allowing ~0.45s, so a
+    fixed wall-clock wait reads a slow disk as a lost notification. The
+    ``slow-disk`` case pins that: it holds every write for ``write_secs``.
     """
     import kiro_crew.autonudge as _an
 
@@ -2706,6 +2715,13 @@ async def test_a_terminal_watch_notifies_even_though_it_cancels_its_own_timer(
         _terminal_poll(),
     )
     service = AutoNudgeService(base_dir=tmp_path, on_fire=on_fire)
+    real_write_state = service._store.write_state
+
+    def _slow_write_state(payload):
+        time.sleep(write_secs)
+        real_write_state(payload)
+
+    monkeypatch.setattr(service._store, "write_state", _slow_write_state)
 
     def _record(event, loop):
         events.append(event)
@@ -2730,10 +2746,13 @@ async def test_a_terminal_watch_notifies_even_though_it_cancels_its_own_timer(
         # defect lives in update() cancelling the timer task that awaits it, so a
         # direct call registers no timer and cannot see it.
         service._arm_timer(loop, delay=0)
-        for _ in range(80):
-            await asyncio.sleep(0.01)
-            if events:
-                break
+        timer = service._timers[loop.id]
+        # Wait for the timer task itself to end, not for a fixed time. A
+        # self-cancel ends it at once with nothing emitted, so the assertion
+        # below still fails fast on the defect; a slow disk only delays it.
+        # The timeout is a hang guard, never the expected path.
+        await asyncio.wait({timer}, timeout=30)
+        assert timer.done(), "the terminal tick must finish, not hang"
         assert "expired" in events, "the user must be told the watch finished"
         assert reasons and reasons[0] == _an.MONITOR_TERMINAL_REASON, (
             "the reason must be readable at emit time or the wording falls through "
