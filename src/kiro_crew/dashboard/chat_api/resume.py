@@ -1399,6 +1399,10 @@ async def resume_slot_from_history(
             return True
 
         def _same_transcript(current: dict) -> bool:
+            # An app resume read a transcript that app owns; a line now owned by
+            # someone else is not that transcript, whatever its stamp says.
+            if request_app and not app_owns_transcript_meta(current, request_app):
+                return False
             stamp = current.get("created_at")
             return not pre_identity or not stamp or stamp == pre_identity
 
@@ -1651,6 +1655,19 @@ async def resume_slot_from_history(
                     "resume_session_deleted",
                     409,
                 )
+            if request_app and not app_owns_transcript_meta(post, request_app):
+                # The late barrier's ownership term, re-asserted on every re-read
+                # after its awaits. A delete and same-key recreate under another
+                # owner, on a line with no ``created_at`` for the identity arm
+                # below to compare, is told apart only by its owner. An app gets
+                # the uniform 404 (see _app_resume_refusal).
+                audit_app_slot_denial(
+                    request_app,
+                    "slot_resume",
+                    name,
+                    "app does not own this transcript (reserved window)",
+                )
+                return _RESUME_APP_NOT_FOUND
             post_created = post.get("created_at")
             if pre_identity and post_created and pre_identity != post_created:
                 return ResumeRefusal(

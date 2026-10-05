@@ -3130,8 +3130,8 @@ def _claim_history_delete(
     The one way a delete handler takes a slot claim. The claim names the slot the
     delete will remove afterwards, so the window has to be open from that instant
     until the cleanup ran: a resume that published before it is in the claim, and
-    one that re-checks after it sees the window and refuses
-    (``resume_session_deleted``). Both steps are synchronous, so nothing can land
+    one that re-checks after it sees the window and refuses with a retryable
+    ``resume_conflict``. Both steps are synchronous, so nothing can land
     between them. The caller closes *windows* after its slot cleanup.
     """
     assert state.conversation_log is not None

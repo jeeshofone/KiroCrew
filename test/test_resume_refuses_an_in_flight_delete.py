@@ -19,6 +19,7 @@ while it is parked, and the delete is let go only once the resume answered.
 """
 
 import asyncio
+import contextlib
 import threading
 import time
 
@@ -116,14 +117,10 @@ async def test_a_resume_that_rechecks_while_the_delete_holds_its_lock_is_refused
 
 
 @pytest.mark.asyncio
-async def test_a_resume_after_the_delete_finished_still_refuses_and_one_before_it_publishes(
-    tmp_path, monkeypatch
-):
-    """The in-flight marker is released when the delete ends, either way.
+async def test_a_skipped_delete_leaves_nothing_that_refuses_a_later_resume(tmp_path, monkeypatch):
+    """A delete that did NOT go through (pinned session, skip_pinned) releases its window.
 
-    A finished delete is still refused by the existence re-check (the file is
-    gone). A delete that did NOT go through (pinned session, skip_pinned) must
-    leave nothing behind that would refuse a later resume of the live session.
+    Nothing it leaves behind may refuse a later resume of the live session.
     """
     monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
     state = _make_state(tmp_path)
@@ -431,3 +428,106 @@ async def test_a_delete_starting_during_the_member_binding_read_is_seen(tmp_path
         f"await (status {resp.status})"
     )
     assert name not in state._slots, "a slot was published for a deleted session"
+
+
+@pytest.mark.asyncio
+async def test_a_finished_delete_releases_its_window(tmp_path, monkeypatch):
+    """After a delete that went through, nothing it left behind refuses the key.
+
+    The key names no transcript now, so a resume of it opens a fresh slot;
+    a marker left open would answer ``resume_conflict`` instead, and none of the
+    deleted rows come back.
+    """
+    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+    state = _make_state(tmp_path)
+    log = state.conversation_log
+    key = "dashboard:inflight6"
+    log.append(key, "user", "history-1")
+
+    assert log.delete_session(key), "the fixture did not delete the session"
+    assert not log.delete_in_flight(key), "a finished delete left its window open"
+    async with TestClient(TestServer(_make_app(state))) as client:
+        resp = await client.post("/api/chat/slots/inflight6/resume", json={"key": key})
+        body = await resp.json()
+    assert resp.status == 200, f"a finished delete still refuses the key: {body}"
+    assert log.read_messages(key) == [], "the deleted rows came back"
+
+
+def test_a_delete_that_raises_releases_its_window(tmp_path):
+    """A delete whose transaction raises leaves no marker that would refuse every later resume."""
+    state = _make_state(tmp_path)
+    log = state.conversation_log
+    key = "dashboard:inflight7"
+    log.append(key, "user", "history-1")
+
+    def failing_delete(*_args, **_kwargs):
+        assert log.delete_in_flight(key), "the window was not open during the delete"
+        raise OSError("disk full")
+
+    log._metadata_projection.delete_session = failing_delete
+    with pytest.raises(OSError, match="disk full"):
+        log.delete_session(key)
+    assert not log.delete_in_flight(key), "a delete that raised left its window open"
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_delete_releases_its_window(tmp_path):
+    """A delete handler cancelled while its window is open (a torn-down request) releases it."""
+    state = _make_state(tmp_path)
+    log = state.conversation_log
+    key = "dashboard:inflight8"
+    entered = asyncio.Event()
+
+    async def handler_body():
+        with contextlib.ExitStack() as windows:
+            windows.enter_context(log.delete_in_flight_window(key))
+            entered.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(handler_body())
+    await asyncio.wait_for(entered.wait(), timeout=30)
+    assert log.delete_in_flight(key)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not log.delete_in_flight(key), "a cancelled delete left its window open"
+
+
+@pytest.mark.asyncio
+async def test_a_delete_opening_during_the_reopen_write_refuses_the_resume(tmp_path, monkeypatch):
+    """The reserved tail's own in-flight arm, after construction.
+
+    A closed session's resume clears ``closed`` in an awaited worker call after
+    the slot is built. A delete whose window opens during that call still finds
+    the file on the lock-free verification read, so only the tail's in-flight
+    check stops the publish. The resume must refuse ``resume_conflict``, publish
+    nothing, release its construction mark, and put the ``closed`` marker back.
+    """
+    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+    state = _make_state(tmp_path)
+    log = state.conversation_log
+    key = "dashboard:inflight12"
+    log.append(key, "user", "history-1")
+    log.append(key, "assistant", "history-2")
+    closed_at = time.time() - 60
+    log.update_metadata(key, {"closed": True, "closed_at": closed_at})
+    original_clear = log.clear_closed
+    windows = contextlib.ExitStack()
+    opened = []
+
+    def clear_while_a_delete_opens(*args, **kwargs):
+        windows.enter_context(log.delete_in_flight_window(key))
+        opened.append(True)
+        return original_clear(*args, **kwargs)
+
+    monkeypatch.setattr(log, "clear_closed", clear_while_a_delete_opens)
+    with windows:
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post("/api/chat/slots/inflight12/resume", json={"key": key})
+            await _conflict(resp)
+        assert opened, "the resume never reached its reopen write"
+        assert "inflight12" not in state._slots, "resume published during the delete"
+        assert "inflight12" not in state._slots_under_construction, "the resume leaked its hold"
+        meta = log.get_metadata(key)
+        assert meta.get("closed") is True, "the refused resume left the session open"
+        assert meta.get("closed_at") == closed_at

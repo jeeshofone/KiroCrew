@@ -952,6 +952,55 @@ class TestTranscriptOwnershipWithoutALiveSlot:
         assert "b1" not in state._slots_under_construction
 
     @pytest.mark.asyncio
+    async def test_resume_rechecks_app_ownership_after_the_reopen_write(
+        self, state, monkeypatch
+    ) -> None:
+        """A transcript replaced under another app inside the reopen window never publishes.
+
+        A closed session's resume clears ``closed`` after construction, in an
+        awaited worker call. The fixture's line carries no ``created_at`` (the
+        legacy shape), so the identity arm cannot see a delete and same-key
+        recreate there; ownership is what tells the two transcripts apart. The
+        clear is parked, the session is deleted and recreated as another app's,
+        and the resume must refuse with the app's uniform 404, publish nothing,
+        and leave the other app's transcript as that app wrote it.
+        """
+        log = state.conversation_log
+        key = "dashboard:a1"
+
+        def write_legacy_line(fields: dict) -> None:
+            # Written by hand: every store writer stamps ``created_at``.
+            path = log._path(key)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"_type": "metadata", **fields}) + "\n", encoding="utf-8")
+
+        await asyncio.to_thread(write_legacy_line, {"app": APP, "closed": True, "closed_at": 1.0})
+        assert "created_at" not in await asyncio.to_thread(log.get_metadata, key)
+        original_clear = log.clear_closed
+        replaced = []
+
+        def replace_then_clear(*args, **kwargs):
+            assert log.delete_session(key), "the fixture did not delete the source"
+            write_legacy_line({"app": "other-app"})
+            replaced.append(True)
+            return original_clear(*args, **kwargs)
+
+        monkeypatch.setattr(log, "clear_closed", replace_then_clear)
+        async with _client(state, APP) as client:
+            resp = await client.post("/api/chat/slots/a1/resume", json={"key": key})
+            body = await resp.json()
+        assert replaced, "the resume never reached its reopen write"
+        assert (resp.status, body) == (404, _NOT_FOUND), (
+            f"an app resume published a transcript another app recreated during the "
+            f"reopen write (status {resp.status})"
+        )
+        assert "a1" not in state._slots
+        assert "a1" not in state._slots_under_construction
+        meta = await asyncio.to_thread(log.get_metadata, key)
+        assert meta.get("app") == "other-app"
+        assert "closed" not in meta, "the rollback closed another app's transcript"
+
+    @pytest.mark.asyncio
     async def test_resume_dedups_a_session_published_during_the_destination_read(
         self, state, monkeypatch
     ) -> None:

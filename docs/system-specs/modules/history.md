@@ -323,8 +323,11 @@ Per-thread JSONL files at `~/.kiro/crew/sessions/{safe_key}.jsonl`. First line i
   slot is built (retracted under its construction mark) and, with a hook, after
   the hook passes, and it publishes only once that write has landed and been
   verified; a later refusal puts the marker back, and a failed write refuses
-  with `reopen_failed` (503) instead of publishing a tab that would not restore. A
-  delete in another process is not visible here; the save's delete-won guard
+  with `reopen_failed` (503) instead of publishing a tab that would not restore.
+  An app's resume re-checks on every re-read in that window that the app still
+  owns the transcript, so a line deleted and recreated under another owner
+  refuses with the app's uniform 404, and the rollback puts the marker back only
+  on a line that app owns. A delete in another process is not visible here; the save's delete-won guard
   below still keeps that case from rewriting the file.
 
 ### MCP chat-history tools (`mcp_core.py`)
