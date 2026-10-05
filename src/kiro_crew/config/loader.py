@@ -666,6 +666,16 @@ def read_env_text(ep: Path, encoding: str | None = None) -> str:
     return read_env_file(ep, encoding)[1]
 
 
+def undecodable_env_message(ep: Path, exc: UnicodeDecodeError) -> str:
+    """The one sentence that tells an operator *ep* is unreadable and how to fix it.
+
+    The gateway logs it through :func:`warn_undecodable_env`, and ``service
+    install`` / ``doctor`` print it where the shell cannot see that log, so every
+    surface names the same file and the same re-save.
+    """
+    return f"Cannot decode {ep} ({exc.reason}); treating it as empty. Save it as UTF-8."
+
+
 def warn_undecodable_env(ep: Path, exc: UnicodeDecodeError) -> None:
     """Log that *ep* could not be decoded and is treated as unset.
 
@@ -675,11 +685,7 @@ def warn_undecodable_env(ep: Path, exc: UnicodeDecodeError) -> None:
     if key in _warned_undecodable_env:
         return
     _warned_undecodable_env.add(key)
-    logger.warning(
-        "Cannot decode %s (%s); treating it as empty. Save it as UTF-8.",
-        ep,
-        exc.reason,
-    )
+    logger.warning("%s", undecodable_env_message(ep, exc))
 
 
 def read_env_file_credential(key: str, env_file: Path | None = None) -> str:

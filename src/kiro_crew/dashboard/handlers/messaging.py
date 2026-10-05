@@ -2188,7 +2188,7 @@ def _clean_id_list(raw: object, is_valid: Callable[[str], bool], label: str) -> 
     return out
 
 
-async def _write_env_off_loop(updates: dict[str, str | None], *, config_kept: bool = False) -> None:
+async def _write_env_off_loop(updates: dict[str, str | None]) -> None:
     """Run the blocking ``.env`` write on a worker, drained under the config lock.
 
     Every caller holds ``_get_config_lock()`` across this, and a thread cannot be
@@ -2211,13 +2211,10 @@ async def _write_env_off_loop(updates: dict[str, str | None], *, config_kept: bo
     A ``.env`` saved as UTF-16 or UTF-32 is refused before anything is written
     (:func:`_write_env_updates_locked` never overwrites a file it cannot
     parse). That refusal is raised here as a 409 carrying the fix, so every
-    channel save answers it the same way instead of with an opaque 500. A
-    caller that rolls its config write back on a failed ``.env`` write (Slack,
-    Teams, Webex, WeCom and Feishu) still does, because it catches every
-    exception; Discord and Telegram commit config before this call and keep it,
-    so their 409 leaves the config change in place and only the ``.env`` part
-    unsaved, which a retry after the UTF-8 re-save completes. Those two callers
-    pass ``config_kept=True`` so the 409 says their other settings were saved.
+    channel save answers it the same way instead of with an opaque 500. Every
+    caller (Slack, Teams, Webex, WeCom, Feishu, Discord and Telegram) rolls its
+    config write back on a failed ``.env`` write, because it catches every
+    exception, so on every channel the 409 means nothing was saved.
     """
     fut = asyncio.ensure_future(asyncio.to_thread(_write_env_updates, updates))
     try:
@@ -2226,23 +2223,14 @@ async def _write_env_off_loop(updates: dict[str, str | None], *, config_kept: bo
         await asyncio.wait([fut])
         raise
     except _loader.EnvFileWideEncodingError as exc:
-        raise _wide_env_refusal(exc, config_kept=config_kept) from exc
+        raise _wide_env_refusal(exc) from exc
 
 
-def _wide_env_refusal(
-    exc: _loader.EnvFileWideEncodingError, *, config_kept: bool = False
-) -> web.HTTPConflict:
-    """The response for a channel save refused because ``.env`` is wide-encoded.
-
-    ``config_kept`` is set by a caller whose config write stays in place when
-    the ``.env`` write is refused, so the message does not imply the whole save
-    was discarded.
-    """
-    outcome = "The .env was not changed"
-    outcome += "; your other settings were saved." if config_kept else "."
+def _wide_env_refusal(exc: _loader.EnvFileWideEncodingError) -> web.HTTPConflict:
+    """The response for a channel save refused because ``.env`` is wide-encoded."""
     message = (
         f"{_loader.env_path()} is saved as {exc.wide_encoding}, which Kiro Crew "
-        f"cannot read. Re-save it as UTF-8 and save again. {outcome}"
+        "cannot read. Re-save it as UTF-8 and save again. The .env was not changed."
     )
     return web.HTTPConflict(
         text=json.dumps({"error": message}),
