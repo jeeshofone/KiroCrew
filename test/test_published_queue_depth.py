@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from chat_test_helpers import _make_state
-from overload_fakes import mock_ctx, mock_sessions
+from overload_fakes import mock_ctx, mock_sessions, wait_taskq_open
 
 from kiro_crew.session_surface import set_dashboard_surfaced
 from kiro_crew.subagent import SubagentInfo, SubagentManager
@@ -119,7 +119,7 @@ async def test_the_real_emit_path_records_what_it_publishes() -> None:
 
     mgr = SubagentManager(sessions=mock_sessions(), ctx_builder=mock_ctx(), on_event=on_event)
     try:
-        await asyncio.wait_for(mgr.wait_taskq_ready(), 5)
+        await wait_taskq_open(mgr)
         mgr._queue.append({"parent_session_key": PARENT, "_preassigned_id": "q1"})
         mgr._emit_queue_depth(PARENT)
         await asyncio.wait_for(_until(lambda: frames[-1:] == [1]), 5)
@@ -164,7 +164,7 @@ async def test_a_child_start_re_derives_a_depth_no_path_cleared() -> None:
 
     mgr = SubagentManager(sessions=mock_sessions(), ctx_builder=mock_ctx(), on_event=on_event)
     try:
-        await asyncio.wait_for(mgr.wait_taskq_ready(), 5)
+        await wait_taskq_open(mgr)
         # Published 1, then the row left the window with no emit.
         await mgr._fire_event("subagent_queued", _queue_info(), {"queued": 1})
         assert _published(mgr) == 1

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -26,7 +27,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _hot_reload_helpers import change
-from overload_fakes import Clock, mock_ctx, mock_sessions
+from overload_fakes import Clock, mock_ctx, mock_sessions, wait_taskq_open
 
 import kiro_crew.subagent as subagent_mod
 from kiro_crew import taskq
@@ -134,7 +135,7 @@ def _patch_host(monkeypatch) -> tuple[dict[str, KiroCrewConfig], dict[str, float
 async def _harness(monkeypatch) -> AsyncIterator[_Harness]:
     cfgs, free = _patch_host(monkeypatch)
     mgr = SubagentManager(sessions=mock_sessions(), ctx_builder=mock_ctx(), max_concurrent=3)
-    await asyncio.wait_for(mgr.wait_taskq_ready(), 5)
+    await wait_taskq_open(mgr)
     clock = Clock(1000.0)
     mgr._taskq._clock = clock
     mgr._spawn_stagger_secs = 0.0
@@ -320,6 +321,30 @@ class TestTheBoundIsLive:
             assert h.delivered == []
 
 
+class TestAHostFreezeDuringTheStoreOpen:
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(60)
+    async def test_the_harness_waits_out_the_freeze_and_the_bound_still_ends_the_wait(
+        self, monkeypatch
+    ) -> None:
+        """The harness's off-loop store open is held for longer than five
+        seconds, as a hosted Windows runner stalls (``overload_fakes.
+        STORE_OPEN_CEILING_SECS``). The open still attaches and the test runs."""
+        real = SubagentManager._open_taskq
+
+        def frozen(self: SubagentManager) -> Any:
+            threading.Event().wait(6.0)
+            return real(self)
+
+        monkeypatch.setattr(SubagentManager, "_open_taskq", frozen)
+        async with _harness(monkeypatch) as h:
+            await _reload_bound(h, 60)
+            info = await h.spawn()
+            await _recheck(h, 2)
+            assert h.state(info.id) == taskq.FAILED
+            assert [d.error for d in h.delivered] == [QUEUED_WAIT_EXPIRED_TEXT]
+
+
 class TestEveryWaitingRowExpires:
     @pytest.mark.asyncio
     @pytest.mark.timeout(60)
@@ -400,6 +425,34 @@ class TestEveryWaitingRowExpires:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(60)
+    async def test_a_bound_of_whole_admit_waits_ends_on_the_park_that_reaches_it(
+        self, monkeypatch
+    ) -> None:
+        """Each park adds exactly its planned span to the floor-wait ledger,
+        wherever the monotonic clock happens to stand. In float seconds a park
+        that began 2.05 s into the clock adds ``(2.05 + 30) - 2.05``, an ulp
+        short of 30, so a 30 s bound would keep the row one more admit wait."""
+        from kiro_crew.subagent_manager.admission import MEMORY_WAIT_UNTIL_KEY
+
+        async with _harness(monkeypatch) as h:
+            h.mgr._memory_mode_for_session = lambda _key: "temporary"
+            await _reload_bound(h, 30)
+            info = await h.mgr.spawn_async("scratch", parent_session_key=_PARENT)
+            assert info is not None and info.queued and not info.done, info
+            closed, since, end = h.mgr._floor_waits[info.id]
+            span = end - since
+            # The ledger's own unit per second, so the park is placed at 2.05 s.
+            start = type(since)(2.05 * (span / _ADMIT))
+            # That park has run its whole admit wait: the next re-check ends it.
+            h.mgr._floor_waits[info.id] = (closed, start, start + span)
+            for params in h.mgr._queue:
+                params[MEMORY_WAIT_UNTIL_KEY] = 0.0
+            await h.pump()
+            assert not any(p.get("_preassigned_id") == info.id for p in h.mgr._queue)
+            assert [d.error for d in h.delivered] == [QUEUED_WAIT_EXPIRED_TEXT]
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(60)
     async def test_zero_leaves_an_in_memory_floor_wait_unbounded(self, monkeypatch) -> None:
         from kiro_crew.subagent_manager.admission import MEMORY_WAIT_UNTIL_KEY
 
@@ -409,7 +462,9 @@ class TestEveryWaitingRowExpires:
             info = await h.mgr.spawn_async("scratch", parent_session_key=_PARENT)
             assert info is not None and info.queued and not info.done, info
             closed, since, end = h.mgr._floor_waits[info.id]
-            h.mgr._floor_waits[info.id] = (closed + 10**6, since - 60, end - 60)
+            # Parked for a million minutes, the current park started a minute ago.
+            minute = (end - since) * 2
+            h.mgr._floor_waits[info.id] = (closed + minute * 10**6, since - minute, end - minute)
             for params in h.mgr._queue:
                 params[MEMORY_WAIT_UNTIL_KEY] = 0.0
             await h.pump()
@@ -658,7 +713,7 @@ class TestAnExpiryOutlivesItsProcess:
         try:
             assert mgr._taskq is None, "the open must still be in flight"
             mgr.start_reaper()
-            await asyncio.wait_for(mgr.wait_taskq_ready(), 5)
+            await wait_taskq_open(mgr)
             assert mgr._taskq is not None
             for _ in range(200):
                 if delivered:
@@ -696,7 +751,7 @@ class TestAnExpiryOutlivesItsProcess:
         mgr._on_done = on_done
         try:
             mgr.start_reaper()
-            await asyncio.wait_for(mgr.wait_taskq_ready(), 5)
+            await wait_taskq_open(mgr)
             assert mgr._taskq is not None
             mgr._admission.taskq_boot_dispatch()
             mgr._admission.taskq_schedule_owed_replay()
@@ -919,7 +974,7 @@ class TestADigestHeldExpiryStaysOwed:
 
             restarted._on_done = on_done
             try:
-                await asyncio.wait_for(restarted.wait_taskq_ready(), 5)
+                await wait_taskq_open(restarted)
                 restarted._admission.taskq_boot_dispatch()
                 for _ in range(200):
                     if delivered:

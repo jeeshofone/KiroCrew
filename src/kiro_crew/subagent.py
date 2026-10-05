@@ -3619,11 +3619,12 @@ class SubagentManager:
         self._pressure_episode_read_at = 0.0
         self._pressure_holds: dict[str, float] = {}
         self._pressure_hold_expired: set[str] = set()
-        # agent_id -> (closed parked seconds, current park's start, its planned
-        # end) for a start with no durable row that waits on the memory floor:
-        # the store sweep cannot see it, so the gate bounds it from this clock
+        # agent_id -> (closed parked time, current park's start, its planned
+        # end), all integer ``time.monotonic_ns()`` nanoseconds, for a start
+        # with no durable row that waits on the memory floor: the store sweep
+        # cannot see it, so the gate bounds it from this clock
         # (``agent.subagent_queue_max_wait_secs``) at each re-park.
-        self._floor_waits: dict[str, tuple[float, float, float]] = {}
+        self._floor_waits: dict[str, tuple[int, int, int]] = {}
         self._pressure_recheck_handle: asyncio.TimerHandle | None = None
         # agent_id -> the ``approval_mode`` a durable row was accepted with, for
         # as long as it waits: the store never carries it, so a window refill

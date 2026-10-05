@@ -1101,14 +1101,19 @@ class _GateMixin(ManagerComponent):
             # time it has spent PARKED on the floor is kept here (closed parks,
             # each cut at its planned end, so a later wait for a slot is not
             # counted) and checked as it is parked again, under the same live
-            # ``agent.subagent_queue_max_wait_secs`` (0 is no bound).
-            floor_now = time.monotonic()
+            # ``agent.subagent_queue_max_wait_secs`` (0 is no bound). Kept in
+            # integer nanoseconds: a park adds exactly its planned span, so a
+            # bound that is a whole number of admit waits ends the row on the
+            # re-park that reaches it. Float seconds would add ``(t + 30) - t``
+            # per park, which can fall an ulp short of the bound and keep the
+            # row for one more admit wait.
+            floor_now = time.monotonic_ns()
             floor_parked, park_from, park_end = self._manager._floor_waits.get(
-                agent_id, (0.0, floor_now, floor_now)
+                agent_id, (0, floor_now, floor_now)
             )
-            floor_parked += max(0.0, min(park_end, floor_now) - park_from)
+            floor_parked += max(0, min(park_end, floor_now) - park_from)
             bound = self._manager._admission.taskq_memory_wait_bound_secs()
-            if bound > 0 and floor_parked >= bound:
+            if bound > 0 and floor_parked >= round(bound * 1e9):
                 logger.warning(
                     "Subagent %s waited for memory longer than %.0fs; ending it (%s)",
                     agent_id,
@@ -1133,7 +1138,7 @@ class _GateMixin(ManagerComponent):
             self._manager._floor_waits[agent_id] = (
                 floor_parked,
                 floor_now,
-                floor_now + self._manager._admission.taskq_admit_wait_secs(),
+                floor_now + round(self._manager._admission.taskq_admit_wait_secs() * 1e9),
             )
         if (
             mem_ok

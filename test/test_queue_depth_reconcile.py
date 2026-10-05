@@ -18,7 +18,9 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import re
 import threading
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -292,6 +294,27 @@ async def test_a_store_open_that_never_returns_fails_by_name(
         release.set()
         await wait_taskq_open(mgr)
         _close(mgr)
+
+
+#: A store-open wait with a deadline of its own: ``asyncio.wait_for`` around a
+#: manager's ``wait_taskq_ready()``.
+_RAW_OPEN_WAIT = re.compile(r"wait_for\(\s*[\w.]+\.wait_taskq_ready\(\)")
+
+
+def test_every_store_open_wait_in_the_suite_uses_the_shared_ceiling() -> None:
+    """A test that bounds the off-loop store open must do it through
+    ``overload_fakes.wait_taskq_open``, whose ceiling sits above the hosted
+    Windows runner's stalls. A raw ``wait_for`` with a smaller deadline times
+    out on an open that would have attached; an unbounded await is fine."""
+    here = Path(__file__).parent
+    offenders = [
+        f"{path.name}:{number}"
+        for path in sorted(here.glob("*.py"))
+        if path.name != "overload_fakes.py"
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if _RAW_OPEN_WAIT.search(line)
+    ]
+    assert offenders == [], offenders
 
 
 # ── every settle point answers ───────────────────────────────────────────────
