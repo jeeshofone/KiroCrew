@@ -943,6 +943,16 @@ def _slots_broadcast_interval_for(frame_bytes: int) -> float:
     return min(_SLOTS_BROADCAST_MAX_INTERVAL_S, max(_SLOTS_BROADCAST_INTERVAL_S, stretched))
 
 
+def _slots_broadcast_clock() -> float:
+    """The one clock the slots coalescing window is measured on.
+
+    Every read that stamps or measures the window goes through here, so a test
+    can drive the window on a fake clock without replacing ``time.monotonic``
+    for the event loop and every other caller in the process.
+    """
+    return time.monotonic()
+
+
 # A successful plain persistent-memory create hands its full-list publication past
 # the HTTP response by this fixed interval. Callers may name the operation only.
 _DEFERRED_SLOTS_FLUSH_DELAY_S: float = 0.01
@@ -9402,7 +9412,7 @@ class DashboardState:
                     if self._slots_broadcast_timer is not None:
                         self._slots_broadcast_timer.cancel()
                         self._slots_broadcast_timer = None
-                    self._slots_broadcast_last = time.monotonic()
+                    self._slots_broadcast_last = _slots_broadcast_clock()
             self._do_slots_broadcast()
             return
         except Exception:
@@ -9475,7 +9485,7 @@ class DashboardState:
             self._slots_push_pending = True
             return
 
-        now = time.monotonic()
+        now = _slots_broadcast_clock()
         broadcast_now = False
         if lock is None:
             # Partially-constructed state (built via __new__): no coalescing.
@@ -9579,7 +9589,7 @@ class DashboardState:
         if lock is not None:
             with lock:
                 self._slots_broadcast_timer = None
-                self._slots_broadcast_last = time.monotonic()
+                self._slots_broadcast_last = _slots_broadcast_clock()
         self._do_slots_broadcast()
 
     def _take_slots_audience(self) -> bool:
