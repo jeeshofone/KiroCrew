@@ -92,6 +92,7 @@ import MonitorRadar from '../components/MonitorRadar'
 import { i18nT } from '../i18n/t'
 import { agentOrDefaultLabel } from '../utils/agentLabel'
 import { useLaneScrollMemory } from '../hooks/useLaneScrollMemory'
+import { useScrollEdges } from '../hooks/useScrollEdges'
 import { compareText, fmtDateFields, fmtList } from '../i18n/format'
 import { sidebarCollision } from './chat-sidebar/dnd/collision'
 export { sidebarCollision, isFolderNestBand } from './chat-sidebar/dnd/collision'
@@ -2695,6 +2696,14 @@ function ChatSidebar({
   const {
     paintedSidebarWidth, rootStyle, sidebarMax, paintedWidthRef, sidebarResize, nudgeSidebar, widenForBoard, restorePreBoardWidth,
   } = useSidebarResize({ onWidthChange, onDragChange, fillsHost, boardActive: orderedColumns.length > 0 })
+  // Which edges of the board's lane strip hide lanes. A window too narrow for
+  // every lane clips the strip at the sidebar's edge, and an overlay scrollbar
+  // leaves no standing sign that more lanes sit past it, so the strip paints an
+  // edge cue from these (the session tab strip's cue width). The box
+  // observer covers a resize; a lane added or removed changes only the
+  // content, so the column count re-measures it.
+  const [attachStripEdges, stripEdges, remeasureStripEdges] = useScrollEdges<HTMLDivElement>()
+  useEffect(() => { remeasureStripEdges() }, [orderedColumns.length, remeasureStripEdges])
   usePinnedOrderAuthority({ orderState: pinnedOrderState, slotsLoaded, tagColumnsSettled, orderedColumns })
   const {
     columnEditId, setColumnEditId, popoverPos, columnPopoverRef, columnPopoverImeLatch, closeColumnPopover,
@@ -5861,7 +5870,8 @@ function ChatSidebar({
               </span>
             </button>
           )}
-          <div className="flex-1 overflow-x-auto overflow-y-hidden flex gap-2 p-2" data-testid="column-strip">
+          <div className="relative flex-1 min-h-0 flex flex-col">
+          <div ref={attachStripEdges} className="flex-1 overflow-x-auto overflow-y-hidden flex gap-2 p-2" data-testid="column-strip">
             {orderedColumns.map((col, colIdx) => {
               // The board pool already leaves out every row the folder filter conceals,
               // and this one population feeds every render site below: the flat-board
@@ -6172,6 +6182,26 @@ function ChatSidebar({
                 </div>
               )
             })}
+          </div>
+          {/* Edge cues: lanes continue past a clipped edge of the strip. Each is
+            *  a 24 px band, the session tab strip's width, so the lane controls it
+            *  overlaps stay legible and clickable. It fades from the foreground
+            *  colour at low alpha, not from the page background as the tab
+            *  strip's does: the lanes are cards, and in light theme the card and
+            *  the page background are both near white, so a fade from bg over a
+            *  card shows nothing. The foreground contrasts with the card in every
+            *  theme. It is inset to the strip's padding, the cards' own vertical
+            *  extent, so it shades the clipped lane and not the page gutter above
+            *  and below it. It is fade-only, as the other scroll strips' cues are: the
+            *  strip scrolls natively, and an arrow here would look like the
+            *  follow-up bar's scroll buttons while a click on it fell through to the
+            *  row underneath. */}
+          {stripEdges.left && (
+            <div aria-hidden="true" data-testid="column-strip-cue-left" className="pointer-events-none absolute left-0 top-2 bottom-2 w-6 z-10 bg-gradient-to-r from-text-strong/15 to-transparent" />
+          )}
+          {stripEdges.right && (
+            <div aria-hidden="true" data-testid="column-strip-cue-right" className="pointer-events-none absolute right-0 top-2 bottom-2 w-6 z-10 bg-gradient-to-l from-text-strong/15 to-transparent" />
+          )}
           </div>
           </div>
         )}
