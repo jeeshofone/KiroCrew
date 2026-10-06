@@ -1940,11 +1940,22 @@ def _join_test_loop_executor(item) -> None:
     if loop.is_closed() or loop.is_running():
         return
     try:
-        pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
-        if pending:
+        # Repeat until nothing is pending: a cancelled task's ``finally`` can start a
+        # NEW task (a dashboard turn's queue cycle dispatches the next queued turn), and
+        # a single pass over a snapshot never sees it. Left pending, ``loop.close()``
+        # orphans it and the collector logs ``Task was destroyed but it is pending!``
+        # into whichever later test is capturing logs then. One deadline
+        # bounds every pass together, so a task that respawns on each cancel still
+        # costs one slow teardown, never a hung worker.
+        deadline = time.monotonic() + _EXECUTOR_JOIN_SECS
+        while True:
+            pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+            remaining = deadline - time.monotonic()
+            if not pending or remaining <= 0:
+                break
             for task in pending:
                 task.cancel()
-            loop.run_until_complete(asyncio.wait(pending, timeout=_EXECUTOR_JOIN_SECS))
+            loop.run_until_complete(asyncio.wait(pending, timeout=remaining))
         if getattr(loop, "_default_executor", None) is not None:
             loop.run_until_complete(loop.shutdown_default_executor(timeout=_EXECUTOR_JOIN_SECS))
             for name, reset in (("_executor_shutdown_called", False), ("_default_executor", None)):

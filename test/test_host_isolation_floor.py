@@ -1274,6 +1274,55 @@ class TestTheTestLoopIsRetiredBeforeThePinsLift:
             loop.run_until_complete(loop.shutdown_default_executor())
             loop.close()
 
+    def test_a_task_spawned_while_the_hook_cancels_is_retired_too(self) -> None:
+        """A cancelled task whose ``finally`` starts another task leaves no orphan.
+
+        A dashboard turn cancelled at teardown runs its queue cycle on the way out, and
+        that cycle dispatches the next queued turn as a NEW task. One cancel-and-wait
+        pass over a snapshot taken before the cancel never sees it, so it stays
+        pending on a loop pytest-asyncio then closes, and asyncio logs ``Task was
+        destroyed but it is pending!`` at whatever later moment the collector runs --
+        inside another test's ``caplog`` window, on another file's assertion.
+        """
+        import asyncio
+        import types
+
+        loop = asyncio.new_event_loop()
+        try:
+            seen: list[str] = []
+
+            async def successor() -> None:
+                try:
+                    await asyncio.Event().wait()  # parked until cancelled
+                finally:
+                    seen.append("successor finally")
+
+            async def turn() -> None:
+                try:
+                    await asyncio.Event().wait()  # parked until cancelled
+                finally:
+                    asyncio.ensure_future(successor())  # the next queued turn
+                    seen.append("turn finally")
+
+            async def arm() -> None:
+                asyncio.ensure_future(turn())
+                await asyncio.sleep(0)  # let it start
+
+            loop.run_until_complete(arm())
+            item = types.SimpleNamespace(funcargs={"event_loop": loop})
+
+            _root._join_test_loop_executor(item)
+
+            left = [t for t in asyncio.all_tasks(loop) if not t.done()]
+            assert not left, (
+                f"the hook left {len(left)} task(s) pending that a cancelled task started "
+                "while unwinding; loop.close() orphans them and the collector logs them "
+                "into a later test"
+            )
+            assert seen == ["turn finally", "successor finally"]
+        finally:
+            loop.close()
+
     def test_the_hook_runs_before_fixture_finalizers(self) -> None:
         """Placement is the guarantee: a fixture would tear down after the unpin."""
         source = _ROOT_CONFTEST.read_text(encoding="utf-8")
