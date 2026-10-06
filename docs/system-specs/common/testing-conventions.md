@@ -4547,6 +4547,10 @@ More shapes this class hides, all Windows-only and all green on every Linux run:
   pin the populated case deterministically: a helper that calls `AttachConsole` on
   the child keeps its console host alive past the child's exit
   (`test_runtime_cleanup_windows.py::test_a_child_exiting_259_reads_as_exited_and_its_drain_finishes[True]`).
+  Start that helper only once the child has said it is running: `AttachConsole` on a
+  child still initialising fails with `ERROR_INVALID_HANDLE` (6), and process creation
+  returns before the child's console connection exists, so a helper started straight
+  after creation fails as `helper did not attach`.
 - **A fixed drain ceiling over a batch of fsync-priced writes is a rate assertion.**
   Every test in `test_crew_log_edge_concurrency` hands the session log's single writer
   thread 30 to 160 appends, and `assert emit.flush(timeout=10.0)` across that batch
