@@ -696,10 +696,16 @@ async def test_a_child_exiting_259_reads_as_exited_and_its_drain_finishes(
     scans, so it is a genuine member the drain must also finish. The ``True``
     case holds it alive deterministically: a helper attached to the child's
     console keeps the console host running after the child exits.
+
+    ``AttachConsole`` refuses a target that has not finished starting, and
+    ``create_subprocess_exec`` returns as soon as the process object exists. So
+    the child announces itself from its own code, which runs only after its
+    console connection is made, and the helper starts on that announcement.
     """
 
     python = getattr(sys, "_base_executable", sys.executable)
     go, attached, release = tmp_path / "go", tmp_path / "attached", tmp_path / "release"
+    ready = tmp_path / "ready"
 
     async def wait_for_file(path):
         deadline = time.monotonic() + 15
@@ -715,11 +721,13 @@ async def test_a_child_exiting_259_reads_as_exited_and_its_drain_finishes(
         "-c",
         "import pathlib, sys, time\n"
         "go = pathlib.Path(sys.argv[1])\n"
+        "pathlib.Path(sys.argv[2]).write_text('1', encoding='utf-8')\n"
         "deadline = time.monotonic() + 30\n"
         "while not go.exists() and time.monotonic() < deadline:\n"
         "    time.sleep(0.01)\n"
         "raise SystemExit(259)",
         str(go),
+        str(ready),
         cwd=tmp_path,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.DEVNULL,
@@ -734,16 +742,20 @@ async def test_a_child_exiting_259_reads_as_exited_and_its_drain_finishes(
     state = None
     try:
         if console_host_outlives_child:
+            await wait_for_file(ready)
             helper = await asyncio.create_subprocess_exec(
                 python,
                 "-I",
                 "-S",
                 "-B",
                 "-c",
-                "import ctypes, pathlib, sys, time\n"
+                "import ctypes, os, pathlib, sys, time\n"
                 "kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)\n"
                 "attached = kernel32.AttachConsole(int(sys.argv[1]))\n"
-                "pathlib.Path(sys.argv[2]).write_text(str(attached), encoding='utf-8')\n"
+                "error = 0 if attached else ctypes.get_last_error()\n"
+                "staged = pathlib.Path(sys.argv[2] + '.tmp')\n"
+                "staged.write_text(f'{attached} {error}', encoding='utf-8')\n"
+                "os.replace(staged, sys.argv[2])\n"
                 "release = pathlib.Path(sys.argv[3])\n"
                 "deadline = time.monotonic() + 30\n"
                 "while not release.exists() and time.monotonic() < deadline:\n"
@@ -758,7 +770,8 @@ async def test_a_child_exiting_259_reads_as_exited_and_its_drain_finishes(
                 creationflags=pc.CREATE_NEW_PROCESS_GROUP | 0x00000008,  # DETACHED_PROCESS
             )
             await wait_for_file(attached)
-            assert attached.read_text(encoding="utf-8") == "1", "helper did not attach"
+            outcome = attached.read_text(encoding="utf-8")
+            assert outcome == "1 0", f"helper did not attach (result, error: {outcome})"
         go.touch()
         assert await asyncio.wait_for(process.wait(), 15) == 259, "fixture chose another status"
         # The kernel publishes the exit FILETIME just after the status, so read
