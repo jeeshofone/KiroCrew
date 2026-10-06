@@ -363,9 +363,9 @@ class TestEveryWaitingRowExpires:
             # Its first 30 s parked were written straight to tasks.db, through
             # no gate of this manager, the way an earlier process left them.
             await store.run(store.accept_one, old)
-            await store.run(store.defer, old.id, h.clock.t + _ADMIT, reason="low memory")
+            await store.run(store.defer, old.id, wait=_ADMIT, reason="low memory")
             h.clock.advance(_ADMIT)
-            await store.run(store.defer, old.id, h.clock.t + _ADMIT, reason="low memory")
+            await store.run(store.defer, old.id, wait=_ADMIT, reason="low memory")
             fresh = await h.spawn("accepted here")
             # One more re-check: the old row has 60 s parked, the fresh one 30 s.
             await _recheck(h)

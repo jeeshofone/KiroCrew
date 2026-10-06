@@ -2798,7 +2798,7 @@ async def test_a_row_an_accept_still_holds_arms_no_wake_and_no_warning(
         )
         await store.run(store.accept_one, row)
         if held == "deferred-past-due":
-            await store.run(store.defer, row.id, store.now() - 30, reason="test")
+            await store.run(store.defer, row.id, wait=-30, reason="test")
         admitting.add(row.id)
         with monkeypatch.context() as timers, caplog.at_level("WARNING", logger=_ADMISSION_LOGGER):
             timers.setattr(loop, "call_later", call_later)

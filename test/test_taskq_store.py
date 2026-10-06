@@ -374,8 +374,8 @@ def test_next_eligible_at_is_a_wake_only_for_rows_time_holds(
     assert store.next_eligible_at(model.KIND_SUBAGENT) is None
 
     store.accept([_rec("root"), _rec("child", parent_id="root")])
-    store.defer("root", clock.t + 10, reason="low memory")
-    store.defer("child", clock.t + 20, reason="low memory")
+    store.defer("root", wait=10, reason="low memory")
+    store.defer("child", wait=20, reason="low memory")
     assert store.next_eligible_at(model.KIND_SUBAGENT) == clock.t + 10
     assert store.next_eligible_at(model.KIND_SUBAGENT, exclude_ids=["root"]) == clock.t + 20
     assert store.next_eligible_at(model.KIND_SUBAGENT, children_only=True) == clock.t + 20
@@ -394,7 +394,7 @@ def test_defer_keeps_row_queued_but_ineligible_until_clock_passes(
     store: TaskStore, clock: Clock
 ) -> None:
     store.accept([_rec("d")])
-    assert store.defer("d", clock.t + 30, reason="low memory") is True
+    assert store.defer("d", wait=30, reason="low memory") is True
     assert store.state_of("d") == model.QUEUED
     assert store.fetch_dispatchable(model.KIND_SUBAGENT, limit=10) == []
     assert store.count_pending(model.KIND_SUBAGENT) == 1
@@ -414,10 +414,10 @@ def test_deferred_longer_than_counts_the_time_a_row_was_parked(
     kind = model.KIND_SUBAGENT
     store.accept([_rec("w"), _rec("fresh"), _rec("lapsed"), _rec("slot")])
     for rid in ("w", "lapsed", "slot"):
-        store.defer(rid, clock.t + 30, reason="low memory")
+        store.defer(rid, wait=30, reason="low memory")
     clock.t += 30
-    store.defer("w", clock.t + 30, reason="low memory")  # a re-check, same wait
-    store.defer("fresh", clock.t + 30, reason="low memory")
+    store.defer("w", wait=30, reason="low memory")  # a re-check, same wait
+    store.defer("fresh", wait=30, reason="low memory")
     clock.t += 10  # "lapsed" and "slot" are eligible again; "w" is still parked
     assert [r.id for r in store.deferred_longer_than(kind, 40)] == ["w"]
     assert store.deferred_longer_than(kind, 41) == []
@@ -427,7 +427,7 @@ def test_deferred_longer_than_counts_the_time_a_row_was_parked(
     # "slot" queued 600 s for a slot after its deferral lapsed, then is parked
     # again: only its 30 + 5 s parked count, not the 610 s since it was first.
     clock.t += 600
-    store.defer("slot", clock.t + 30, reason="low memory")
+    store.defer("slot", wait=30, reason="low memory")
     clock.t += 5
     assert "slot" not in [r.id for r in store.deferred_longer_than(kind, 36)]
     assert "slot" in [r.id for r in store.deferred_longer_than(kind, 35)]
@@ -436,7 +436,7 @@ def test_deferred_longer_than_counts_the_time_a_row_was_parked(
     assert claimed is not None
     assert store.transition("w", model.QUEUED, generation=claimed.generation)
     clock.t += 5
-    store.defer("w", clock.t + 30, reason="low memory")
+    store.defer("w", wait=30, reason="low memory")
     clock.t += 3
     assert "w" not in [r.id for r in store.deferred_longer_than(kind, 4)]
     assert "w" in [r.id for r in store.deferred_longer_than(kind, 3)]
@@ -455,7 +455,7 @@ def test_deferred_longer_than_bounds_every_state_defer_parks(
         _rec("backoff", state=model.RETRY_WAIT, attempts=1, next_run_at=clock.t + 600)
     )
     for rid in ("rec", "retry"):
-        assert store.defer(rid, clock.t + 60, reason="low memory") is True
+        assert store.defer(rid, wait=60, reason="low memory") is True
     clock.t += 50
     assert sorted(r.id for r in store.deferred_longer_than(kind, 50)) == ["rec", "retry"]
     assert store.deferred_longer_than(kind, 51) == []
@@ -518,7 +518,7 @@ def test_owed_reports_pages_after_a_cursor(store: TaskStore, clock: Clock) -> No
 def test_defer_on_terminal_row_is_a_noop(store: TaskStore, clock: Clock) -> None:
     store.accept([_rec("t")])
     assert store.cancel("t") == model.QUEUED
-    assert store.defer("t", clock.t + 5, reason="x") is False
+    assert store.defer("t", wait=5, reason="x") is False
 
 
 def test_conditional_cancel_refuses_a_row_that_left_the_callers_states(
@@ -1188,3 +1188,47 @@ async def test_unstarted_index_read_takes_no_connection_on_the_loop(
         assert store.is_unstarted("t") is True
         assert store.is_unstarted("absent") is False
     assert store.loop_thread_calls == before
+
+
+class _ReadAdvancingClock(Clock):
+    """A clock that moves 1 µs on every read, as a real one moves between
+    two reads made a few statements apart."""
+
+    step = 1e-6
+
+    def __call__(self) -> float:
+        self.t += self.step
+        self.last = self.t
+        return self.t
+
+
+@pytest.mark.parametrize(
+    ("start", "wait", "bound"),
+    [
+        (100000.123, 30, 90),
+        (1759708800.123457, 30, 90),
+    ],
+)
+def test_a_bound_of_whole_admit_waits_ends_the_row_on_the_recheck_that_reaches_it(
+    tmp_path: Path, start: float, wait: float, bound: float
+) -> None:
+    """A row parked for *wait* and re-checked at the end of each park has been
+    parked three waits when its third re-check lands. A sweep in that same
+    clock tick must end it at a bound of three waits, on a clock that moves
+    between any two reads before it.
+
+    Each start sits far enough inside its power-of-two range that ``ts + wait``
+    stays in the same binade, which is what makes ``(ts + wait) - ts`` exact.
+    An epoch clock always does; a start just below a power of two would not."""
+    clock = _ReadAdvancingClock(start)
+    for store in open_task_store(tmp_path, clock, name="tasks/tasks.db", window=4):
+        kind = model.KIND_SUBAGENT
+        store.accept([_rec("w")])
+        assert store.defer("w", wait=wait, reason="low memory") is True
+        for _ in range(3):
+            rec = store.get("w")
+            assert rec is not None
+            clock.t = rec.next_run_at  # the re-check fires at the planned end
+            assert store.defer("w", wait=wait, reason="low memory") is True
+        clock.t, clock.step = clock.last, 0.0  # the sweep reads the re-check's tick
+        assert [r.id for r in store.deferred_longer_than(kind, bound)] == ["w"]

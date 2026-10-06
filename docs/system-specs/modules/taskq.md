@@ -921,15 +921,17 @@ the health sampler.
 
 ## Deferral (memory pressure)
 
-`defer(task_id, until, reason)` sets `next_run_at` on a claimable row and
-appends `deferred`; the state does not change and the row holds nothing. The
-subagent adapter calls it — instead of refusing — when the memory floor
-(`check_memory_available`) says no, with `until = now + agent.admit_wait_secs`,
-and arms a pump wake-up for then. The caller receives a `queued` id. With no
-store (the feature is off) or no row to defer (an incognito or temporary
-spawn), the start waits in the in-memory window instead, not eligible until the
-same admit wait passes. A durable defer the store could not write (a `_queue`
-entry it never saw, or the store unavailable) is refused as a store failure
+`defer(task_id, *, wait, reason)` sets `next_run_at` on a claimable row to the
+event's own `ts` plus *wait*, from one clock read, so the park spans exactly
+*wait*, and appends `deferred` with that `until`; the state does not change and
+the row holds nothing. The subagent adapter calls it — instead of
+refusing — when the memory floor (`check_memory_available`) says no, with
+`wait = agent.admit_wait_secs`, and arms a pump wake-up for then. The caller
+receives a `queued` id. With no store (the feature is off) or no row to defer
+(an incognito or temporary spawn), the start waits in the in-memory window
+instead, not eligible until the same admit wait passes. A durable defer the
+store could not write (a `_queue` entry it never saw, or the store unavailable)
+is refused as a store failure
 (`task_store_unavailable`), never as a capacity verdict. Spawns do not read the posture tier
 (`cached_admission_check`); `agent.admission_gate=false` turns it off for cron.
 The macOS kernel memory-pressure hold is not a deferral: it

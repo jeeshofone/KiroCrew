@@ -3244,10 +3244,10 @@ async def test_admitting_id_is_held_until_the_posted_defer_landed(
     real_defer = store.defer
     seen: dict[str, Any] = {}
 
-    def _slow_defer(task_id, until, *, reason):
+    def _slow_defer(task_id, *, wait, reason):
         assert gate.wait(5)
-        seen["until"] = until
-        return real_defer(task_id, until, reason=reason)
+        seen["wait"] = wait
+        return real_defer(task_id, wait=wait, reason=reason)
 
     monkeypatch.setattr(store, "defer", _slow_defer)
     task = asyncio.ensure_future(mgr.spawn_async("pressure", parent_session_key="web-1"))
@@ -3264,7 +3264,10 @@ async def test_admitting_id_is_held_until_the_posted_defer_landed(
     assert info is not None and info.queued
     assert not admitting, "cleared only once the defer landed"
     rec = store.get(info.id)
-    assert rec is not None and rec.next_run_at == seen["until"] > store.now()
+    assert seen["wait"] == mgr._admission.taskq_admit_wait_secs()
+    assert rec is not None and rec.next_run_at > store.now()
+    (deferred,) = [e for e in store.events(info.id) if e.kind == "deferred"]
+    assert rec.next_run_at == deferred.ts + seen["wait"], "until comes from the defer's own read"
     await mgr.cancel_all()
 
 

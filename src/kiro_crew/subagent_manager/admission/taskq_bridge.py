@@ -582,7 +582,7 @@ class _TaskqBridgeMixin(ManagerComponent):
             return False
         wait = self.taskq_admit_wait_secs()
         try:
-            ok = store.defer(agent_id, store.now() + wait, reason=reason)
+            ok = store.defer(agent_id, wait=wait, reason=reason)
         except _taskq.TaskStoreUnavailable:
             _glue_logger.warning("taskq: defer of %s failed", agent_id, exc_info=True)
             return False
@@ -604,7 +604,7 @@ class _TaskqBridgeMixin(ManagerComponent):
             return
         wait = self.taskq_admit_wait_secs()
         task = self._post_store_write(
-            store, f"defer {agent_id}", store.defer, agent_id, store.now() + wait, reason=reason
+            store, f"defer {agent_id}", store.defer, agent_id, wait=wait, reason=reason
         )
         if task is not None:
             pending = getattr(self._manager, "_pending_defers", None)
@@ -704,7 +704,7 @@ class _TaskqBridgeMixin(ManagerComponent):
         if store is not None:
 
             def _defer_then_read(live: "_taskq.TaskStore") -> "tuple[bool, Any]":
-                if live.defer(point.agent_id, live.now() + wait, reason=point.reason):
+                if live.defer(point.agent_id, wait=wait, reason=point.reason):
                     return True, None
                 return False, live.get(point.agent_id)
 

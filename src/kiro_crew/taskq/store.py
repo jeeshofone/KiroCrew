@@ -827,7 +827,13 @@ class TaskStore:
     # -- events --------------------------------------------------------------
 
     def _append_event_in_tx(
-        self, conn: sqlite3.Connection, task_id: str, kind: str, data: dict[str, Any]
+        self,
+        conn: sqlite3.Connection,
+        task_id: str,
+        kind: str,
+        data: dict[str, Any],
+        *,
+        ts: float | None = None,
     ) -> None:
         seq_row = conn.execute(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM task_events WHERE task_id=?", (task_id,)
@@ -835,7 +841,13 @@ class TaskStore:
         seq = int(seq_row[0]) if seq_row else 1
         conn.execute(
             "INSERT INTO task_events(task_id, seq, ts, kind, data_json) VALUES(?,?,?,?,?)",
-            (task_id, seq, self.now(), kind, json.dumps(data, sort_keys=True, default=str)),
+            (
+                task_id,
+                seq,
+                self.now() if ts is None else ts,
+                kind,
+                json.dumps(data, sort_keys=True, default=str),
+            ),
         )
 
     def append_event(self, task_id: str, kind: str, data: dict[str, Any] | None = None) -> None:
@@ -1465,14 +1477,21 @@ class TaskStore:
         emit_counter(TASKQ_COMPLETIONS, {"outcome": CANCELLED})
         return old
 
-    def defer(self, task_id: str, until: float, *, reason: str) -> bool:
-        """Keep a waiting row waiting, but not eligible before *until*.
+    def defer(self, task_id: str, *, wait: float, reason: str) -> bool:
+        """Keep a waiting row waiting, but not eligible for *wait* more seconds.
 
         The memory-posture gate uses this instead of refusing: the row stays
         accepted, holds nothing, and the dispatcher skips it until the clock
         passes ``next_run_at``.
+
+        ``next_run_at`` is the event's own ``ts`` plus *wait*, both from one
+        clock read, so the park spans exactly *wait* in
+        :meth:`deferred_longer_than`, for whole-second waits on an epoch clock.
+        A caller-computed ``now() + wait`` could not promise that: the clock
+        moves between the caller's read and this one.
         """
         ts = self.now()
+        until = ts + float(wait)
         with self._lock:
             conn = self._c()
             try:
@@ -1484,7 +1503,11 @@ class TaskStore:
                 )
                 if cur.rowcount == 1:
                     self._append_event_in_tx(
-                        conn, task_id, "deferred", {"until": float(until), "reason": reason}
+                        conn,
+                        task_id,
+                        "deferred",
+                        {"until": float(until), "reason": reason},
+                        ts=ts,
                     )
                 conn.execute("COMMIT")
             except sqlite3.Error as exc:

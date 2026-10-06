@@ -80,7 +80,7 @@ async def test_a_deferred_spawn_is_readable_until_it_starts(monkeypatch) -> None
         # on the registry answers for it, so the queued read must not.
         free["gb"] = 32.0
         mgr._taskq_admit_wait_secs = 0.05
-        await mgr._taskq.run(mgr._taskq.defer, info.id, 0.0, reason="test: eligible now")
+        await mgr._taskq.run(mgr._taskq.defer, info.id, wait=-1.0, reason="test: eligible now")
         for _ in range(250):
             if started.is_set():
                 break
@@ -313,7 +313,7 @@ def test_an_old_deferral_sentence_does_not_describe_a_later_wait(tmp_path) -> No
         store.accept([_row("d1"), _row("d2")])
         later = time.time() + 600
         for rid in ("d1", "d2"):
-            assert store.defer(rid, later, reason=sentence)
+            assert store.defer(rid, wait=600, reason=sentence)
         store.append_event("d1", "claimed", {})
         _force(store, "d1", "recovering", attempts=1, next_run_at=later)
         rows, _ = _read_queued_rows(store, session_key="dash:vis", app=None, exclude_ids=[])

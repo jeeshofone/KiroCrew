@@ -1104,7 +1104,7 @@ class RunnerAdmission:
                 await self._db(
                     store.defer,
                     task_id,
-                    self.now() + self._admit_wait,
+                    wait=self._admit_wait,
                     reason=reason,
                 )
             except TaskStoreUnavailable:

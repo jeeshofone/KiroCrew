@@ -410,7 +410,7 @@ async def test_a_durable_floor_defer_refills_as_a_floor_wait_the_pick_leaves_to_
         assert info.queued_reason == "low_memory"
         assert not hz.mgr._queue and info.id in hz.mgr._floor_deferred_ids
         # Its admit wait has passed: the next pass refills it from the store.
-        hz.store.defer(info.id, hz.store.now() - 1.0, reason="test: admit wait passed")
+        hz.store.defer(info.id, wait=-1.0, reason="test: admit wait passed")
         with patch.object(
             hz.mgr, "_memory_pressure_holds", wraps=hz.mgr._memory_pressure_holds
         ) as holds:
