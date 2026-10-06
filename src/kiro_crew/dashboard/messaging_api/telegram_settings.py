@@ -10,8 +10,8 @@ token values are write-only (rotate at @BotFather if ever needed).
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
-import os
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
@@ -27,7 +27,7 @@ if TYPE_CHECKING:
         _mask_secret,
         _sel,
         _threshold_pct_rejection,
-        _write_env_off_loop,
+        _write_env_or_roll_back,
         channel_restart_required,
         clean_session_folder,
         ensure_channel_folder,
@@ -389,35 +389,12 @@ async def _telegram_config_save_locked(request: web.Request) -> web.Response:
             except ConfigReadError:
                 return _deny("config.json is corrupt", status=500)
         if env_updates:
-            # Off-loop: the .env write is blocking file IO (lock, temp write,
-            # owner-only lockdown, replace) and must not block the event loop.
-            # A failed write undoes the config commit above, legacy
-            # ``bot_token`` included, so a refused save changes nothing.
-            #
-            # Cancellation guard: see Teams save for the full rationale. Only
-            # roll config back when the .env write actually failed, not when
-            # cancellation arrived after the write already committed.
-            env_write: asyncio.Task[None] = asyncio.ensure_future(_write_env_off_loop(env_updates))
-            try:
-                await asyncio.shield(env_write)
-            except asyncio.CancelledError:
-                await asyncio.gather(env_write, return_exceptions=True)
-                env_exc = env_write.exception() if not env_write.cancelled() else None
-                if env_exc is not None and cfg_write is not None:
-                    await cfg_write.rollback("Telegram")
-                raise
-            except BaseException:
-                if cfg_write is not None:
-                    await cfg_write.rollback("Telegram")
-                raise
-            # Keep the live process environment in sync with the new .env state
-            # (load_credentials() lets os.environ win over .env — see the Slack
-            # save handler for the full rationale).
-            for key, new_val in env_updates.items():
-                if new_val is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = new_val
+            # A failed .env write undoes the config commit above, so a refused
+            # save changes nothing (see _write_env_or_roll_back).
+            rollback = (
+                functools.partial(cfg_write.rollback, "Telegram") if cfg_write is not None else None
+            )
+            await _write_env_or_roll_back(env_updates, rollback)
 
     # Create the configured session folder now, on this user-initiated save,
     # so the reconcile path never has to write the folder store. Best-effort:

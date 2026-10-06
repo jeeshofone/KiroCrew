@@ -12,8 +12,8 @@ write-only. The UI maps WECOM_SECRET onto the shared panel's primary secret
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
-import os
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
@@ -26,7 +26,7 @@ if TYPE_CHECKING:
         _mask_secret,
         _sel,
         _threshold_pct_rejection,
-        _write_env_off_loop,
+        _write_env_or_roll_back,
         channel_restart_required,
         clean_session_folder,
         ensure_channel_folder,
@@ -311,9 +311,16 @@ async def _wecom_config_save_locked(request: web.Request) -> web.Response:
             except ConfigReadError:
                 return _deny("config.json is corrupt", status=500)
 
-        # Create the configured session folder now, on this user-initiated save,
-        # so the reconcile path never has to write the folder store. Best-effort:
-        # a failure leaves conversations unfiled until the next save.
+        if env_updates:
+            # A failed .env write undoes the config commit above, so a refused
+            # save changes nothing (see _write_env_or_roll_back).
+            rollback = functools.partial(_cfg_write.rollback, "WeCom") if staged else None
+            await _write_env_or_roll_back(env_updates, rollback)
+
+        # Create the configured session folder only once the .env write above has
+        # landed, so a refused save leaves no new or renamed folder. Doing it on this
+        # user-initiated save means the reconcile path never writes the folder store.
+        # Best-effort: a failure leaves conversations unfiled until the next save.
         _folder_name = stored_folder_name(wc_cfg.get("session_folder"))
         if _folder_name:
             _state = request.app.get("state")
@@ -324,41 +331,6 @@ async def _wecom_config_save_locked(request: web.Request) -> web.Response:
                     _folder_name,
                     relabel="session_folder" in staged,
                 )
-        if env_updates:
-            # Off-loop: the .env write is blocking file IO (lock, temp write,
-            # owner-only lockdown, replace) and must not block the event loop.
-            #
-            # Cancellation guard: see Teams save for the full rationale. Only
-            # roll config back when the .env write actually failed, not when
-            # cancellation arrived after the write already committed.
-            _env_write_task_wc: asyncio.Task[None] = asyncio.ensure_future(
-                _write_env_off_loop(env_updates)
-            )
-            try:
-                await asyncio.shield(_env_write_task_wc)
-            except asyncio.CancelledError:
-                await asyncio.gather(_env_write_task_wc, return_exceptions=True)
-                _env_exc_wc = (
-                    _env_write_task_wc.exception() if not _env_write_task_wc.cancelled() else None
-                )
-                if _env_exc_wc is not None:
-                    if staged:
-                        await _cfg_write.rollback("WeCom")
-                raise
-            except BaseException:
-                # Roll config back so a failed .env write cannot leave the NEW
-                # metadata paired with the OLD credentials on disk.
-                if staged:
-                    await _cfg_write.rollback("WeCom")
-                raise
-            # Keep the live process environment in sync with the new .env state
-            # (load_credentials() lets os.environ win over .env — see the Slack
-            # save handler for the full rationale).
-            for key, new_val in env_updates.items():
-                if new_val is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = new_val
 
     _sel().log_api_access(
         caller=caller,

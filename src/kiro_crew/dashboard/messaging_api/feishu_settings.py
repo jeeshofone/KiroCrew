@@ -20,7 +20,6 @@ import asyncio
 import functools
 import importlib.util
 import json
-import os
 from typing import TYPE_CHECKING
 
 from aiohttp import web
@@ -34,7 +33,7 @@ if TYPE_CHECKING:
         _pip_install_channel_available,
         _sel,
         _threshold_pct_rejection,
-        _write_env_off_loop,
+        _write_env_or_roll_back,
         channel_restart_required,
         clean_session_folder,
         ensure_channel_folder,
@@ -470,39 +469,10 @@ async def _feishu_config_save_locked(request: web.Request) -> web.Response:
                 return _corrupt_config()
 
         if env_updates:
-            # Off-loop: the .env write is blocking file IO (lock, temp write,
-            # owner-only lockdown, replace) and must not block the event loop.
-            #
-            # Cancellation guard: see the WeCom save for the full rationale. Only
-            # roll config back when the .env write actually failed, not when
-            # cancellation arrived after the write already committed.
-            _env_write_task_fs: asyncio.Task[None] = asyncio.ensure_future(
-                _write_env_off_loop(env_updates)
-            )
-            try:
-                await asyncio.shield(_env_write_task_fs)
-            except asyncio.CancelledError:
-                await asyncio.gather(_env_write_task_fs, return_exceptions=True)
-                _env_exc_fs = (
-                    _env_write_task_fs.exception() if not _env_write_task_fs.cancelled() else None
-                )
-                if _env_exc_fs is not None and staged:
-                    await _rollback_config()
-                raise
-            except BaseException:
-                # Roll config back so a failed .env write cannot leave the NEW
-                # metadata paired with the OLD credentials on disk.
-                if staged:
-                    await _rollback_config()
-                raise
-            # Keep the live process environment in sync with the new .env state
-            # (load_credentials() lets os.environ win over .env — see the Slack save
-            # handler for the full rationale).
-            for key, new_val in env_updates.items():
-                if new_val is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = new_val
+            # A failed .env write undoes the config commit above, so a refused
+            # save changes nothing (see _write_env_or_roll_back).
+            rollback = _rollback_config if staged else None
+            await _write_env_or_roll_back(env_updates, rollback)
 
     # Create the configured session folder now, on this user-initiated save, so
     # the reconcile path never has to write the folder store. Best-effort: a

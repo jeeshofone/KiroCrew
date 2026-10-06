@@ -1518,7 +1518,8 @@ also keeps the Slack pin, reaction, profile and manifest routes,
 `api_notification_agent_push`, `api_teams_activity`, the iMessage save entry, the
 channel-folder backfill, the browser routes, `_run_belongs_to_caller`,
 `parent_work_supported` and the shared channel-config transaction
-(`_LockedSectionWrite`, `_write_env_off_loop`).
+(`_LockedSectionWrite`, `_write_env_off_loop`, and `_write_env_or_roll_back`, the
+one `.env` write, rollback and environment sync every channel saver calls).
 
 ## Telegram dashboard-session resume
 

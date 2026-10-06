@@ -538,6 +538,80 @@ class TestDashboardChannelSave:
         assert asyncio.run(_run()) >= 500
         assert json.loads(cfg.read_text(encoding="utf-8"))[channel] == section_before
 
+    @pytest.mark.parametrize("write_fails", [True, False], ids=["refused", "landed"])
+    @pytest.mark.parametrize(
+        ("channel", "body", "cred_keys"),
+        [
+            ("teams", {"app_password_clear": True}, ("MICROSOFT_APP_PASSWORD",)),
+            ("webex", {"bot_token_clear": True}, ("WEBEX_BOT_TOKEN",)),
+            ("wecom", {"bot_token_clear": True}, ("WECOM_SECRET",)),
+        ],
+    )
+    def test_the_session_folder_is_filed_only_after_the_env_write_lands(
+        self,
+        channel: str,
+        body: dict[str, object],
+        cred_keys: tuple[str, ...],
+        write_fails: bool,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # A refused save changes nothing, the sidebar folder included: the
+        # folder is created (or renamed) only once the .env half has landed.
+        # The landed case proves the folder step is still reached.
+        import asyncio
+        import json
+
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from kiro_crew.dashboard.handlers import messaging
+
+        ep = tmp_path / ".env"
+        ep.write_text("", encoding="utf-8")
+        cfg = tmp_path / "config.json"
+        cfg.write_text(json.dumps({channel: {"session_folder": "Old chats"}}), encoding="utf-8")
+        monkeypatch.setattr(loader, "env_path", lambda: ep)
+        monkeypatch.setattr(loader, "config_path", lambda: cfg)
+        monkeypatch.setattr(messaging, "is_direct_local_request", lambda req: True)
+        for key in cred_keys:
+            monkeypatch.delenv(key, raising=False)
+
+        def _write(_updates: object) -> None:
+            if write_fails:
+                raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(messaging, "_write_env_updates", _write)
+        filed: list[tuple[str, str, bool]] = []
+
+        async def _record_folder(
+            _state: object, namespace: str, name: str, *, relabel: bool = False
+        ) -> str:
+            filed.append((namespace, name, relabel))
+            return "folder-id"
+
+        monkeypatch.setattr(messaging, "ensure_channel_folder", _record_folder)
+
+        async def _run() -> int:
+            app = web.Application()
+            app["state"] = SimpleNamespace()
+            app.router.add_put(
+                f"/api/{channel}/config", getattr(messaging, f"api_{channel}_config_save")
+            )
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.put(
+                    f"/api/{channel}/config", json={**body, "session_folder": "New chats"}
+                )
+                return resp.status
+
+        status = asyncio.run(_run())
+        if write_fails:
+            assert status >= 500
+            assert filed == []
+        else:
+            assert status == 200
+            assert filed == [(channel, "New chats", True)]
+
 
 class TestMigrate:
     @pytest.fixture(autouse=True)

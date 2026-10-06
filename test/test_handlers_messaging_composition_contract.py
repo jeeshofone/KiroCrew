@@ -601,6 +601,7 @@ _FACADE_DEFS = (
     "_threshold_pct_rejection",
     "_wide_env_refusal",
     "_write_env_off_loop",
+    "_write_env_or_roll_back",
     "_write_env_updates",
     "_write_env_updates_locked",
 )

@@ -17,6 +17,7 @@ import os
 import platform
 import re
 import time
+from collections.abc import Awaitable
 from pathlib import Path
 from typing import Any, Callable, cast  # noqa: F401
 
@@ -2212,9 +2213,9 @@ async def _write_env_off_loop(updates: dict[str, str | None]) -> None:
     (:func:`_write_env_updates_locked` never overwrites a file it cannot
     parse). That refusal is raised here as a 409 carrying the fix, so every
     channel save answers it the same way instead of with an opaque 500. Every
-    caller (Slack, Teams, Webex, WeCom, Feishu, Discord and Telegram) rolls its
-    config write back on a failed ``.env`` write, because it catches every
-    exception, so on every channel the 409 means nothing was saved.
+    saver (Slack, Teams, Webex, WeCom, Feishu, Discord and Telegram) reaches
+    this through :func:`_write_env_or_roll_back`, which rolls the config write
+    back on any failure, so on every channel the 409 means nothing was saved.
     """
     fut = asyncio.ensure_future(asyncio.to_thread(_write_env_updates, updates))
     try:
@@ -2224,6 +2225,49 @@ async def _write_env_off_loop(updates: dict[str, str | None]) -> None:
         raise
     except _loader.EnvFileWideEncodingError as exc:
         raise _wide_env_refusal(exc) from exc
+
+
+async def _write_env_or_roll_back(
+    env_updates: dict[str, str | None],
+    rollback: Callable[[], Awaitable[None]] | None,
+) -> None:
+    """Write a channel save's ``.env`` half, undoing its config half on failure.
+
+    Every channel saver commits ``config.json`` first and then calls this, so the
+    second half of the transaction exists once and a new saver cannot copy only
+    part of it. *rollback* undoes the config commit; pass ``None`` when the save
+    wrote no config.
+
+    A failed write runs *rollback* and re-raises, so a refused save (the wide
+    ``.env`` 409 included) changes nothing. A cancellation drains the write
+    first and runs *rollback* only when the write itself failed: a write that
+    landed before the cancel arrived already pairs with the committed config,
+    and rolling the config back would split the pair it means to keep. The
+    cancellation is re-raised either way.
+
+    On success the process environment is updated to match: ``load_credentials()``
+    lets ``os.environ`` win over ``.env``, so a replaced or cleared token would
+    otherwise keep reading as installed until restart, and spawned children
+    would inherit the stale value.
+    """
+    write = asyncio.ensure_future(_write_env_off_loop(env_updates))
+    try:
+        await asyncio.shield(write)
+    except asyncio.CancelledError:
+        await asyncio.gather(write, return_exceptions=True)
+        failed = not write.cancelled() and write.exception() is not None
+        if failed and rollback is not None:
+            await rollback()
+        raise
+    except BaseException:
+        if rollback is not None:
+            await rollback()
+        raise
+    for key, new_val in env_updates.items():
+        if new_val is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = new_val
 
 
 def _wide_env_refusal(exc: _loader.EnvFileWideEncodingError) -> web.HTTPConflict:

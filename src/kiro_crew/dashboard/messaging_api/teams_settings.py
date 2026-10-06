@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 from typing import TYPE_CHECKING
@@ -21,7 +22,7 @@ if TYPE_CHECKING:
         _sel,
         _threshold_pct_rejection,
         _ThresholdPairInverted,
-        _write_env_off_loop,
+        _write_env_or_roll_back,
         channel_restart_required,
         clean_session_folder,
         ensure_channel_folder,
@@ -536,9 +537,20 @@ async def _teams_config_save(request: web.Request) -> web.Response:
                         "nothing was saved — reload and try again",
                     )
 
-            # Create the configured session folder now, on this user-initiated save,
-            # so the reconcile path never has to write the folder store. Best-effort:
-            # a failure leaves conversations unfiled until the next save.
+            if env_updates:
+                # A failed .env write undoes the config commit above, so a refused
+                # save changes nothing (see _write_env_or_roll_back).
+                rollback = (
+                    functools.partial(_cfg_write.rollback, "Teams")
+                    if changes or blank_keys
+                    else None
+                )
+                await _write_env_or_roll_back(env_updates, rollback)
+
+            # Create the configured session folder only once the .env write above has
+            # landed, so a refused save leaves no new or renamed folder. Doing it on this
+            # user-initiated save means the reconcile path never writes the folder store.
+            # Best-effort: a failure leaves conversations unfiled until the next save.
             _folder_name = stored_folder_name(teams_cfg.get("session_folder"))
             if _folder_name:
                 _state = request.app.get("state")
@@ -549,46 +561,6 @@ async def _teams_config_save(request: web.Request) -> web.Response:
                         _folder_name,
                         relabel="session_folder" in changes,
                     )
-            if env_updates:
-                # Off-loop: the .env write is blocking file IO (lock, temp write,
-                # owner-only lockdown, replace) that would stall the gateway loop
-                # if run inline.
-                #
-                # Cancellation guard: _write_env_off_loop shields + drains its
-                # worker, so a CancelledError from it means the .env write has
-                # already finished (either succeeded or failed). Roll config back
-                # ONLY when the write actually failed; if it succeeded, the pair
-                # is consistent and rolling back would create a mismatch.
-                _env_write_task: asyncio.Task[None] = asyncio.ensure_future(
-                    _write_env_off_loop(env_updates)
-                )
-                try:
-                    await asyncio.shield(_env_write_task)
-                except asyncio.CancelledError:
-                    # Drain to completion WITHOUT propagating, so we can inspect the
-                    # outcome and roll back before re-raising (a second shield() would
-                    # re-raise CancelledError before the rollback ran).
-                    await asyncio.gather(_env_write_task, return_exceptions=True)
-                    _env_exc = (
-                        _env_write_task.exception() if not _env_write_task.cancelled() else None
-                    )
-                    if _env_exc is not None:
-                        # .env write failed — roll config back for consistency.
-                        if changes or blank_keys:
-                            await _cfg_write.rollback("Teams")
-                    raise
-                except BaseException:
-                    # Genuine .env write failure — roll the config metadata back so
-                    # a failed write cannot leave the NEW metadata paired with the
-                    # OLD credential on disk.
-                    if changes or blank_keys:
-                        await _cfg_write.rollback("Teams")
-                    raise
-                for key, new_val in env_updates.items():
-                    if new_val is None:
-                        os.environ.pop(key, None)
-                    else:
-                        os.environ[key] = new_val
 
     _sel().log_api_access(
         caller=caller,

@@ -824,3 +824,58 @@ def test_teams_cancellation_after_successful_env_write_does_not_rollback_config(
     assert (
         "new-pass" in env_text
     ), f"Expected .env to contain new-pass after successful write; got: {env_text!r}"
+
+
+def test_slack_cancellation_after_successful_env_write_does_not_rollback_config(
+    tmp_path, monkeypatch
+) -> None:
+    """A Slack save cancelled AFTER its .env write committed keeps the config.
+
+    The token landed, so rolling ``config.json`` back would pair the new token
+    with the old settings, the split the rollback exists to prevent. Only a
+    write that itself failed is rolled back.
+    """
+    import json
+
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    env = tmp_path / ".env"
+    env.write_text("SLACK_BOT_TOKEN=xoxb-OLD\n", encoding="utf-8")
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"slack": {"command": "old"}}), encoding="utf-8")
+    monkeypatch.setattr(loader, "env_path", lambda: env)
+    monkeypatch.setattr(loader, "config_path", lambda: cfg)
+    monkeypatch.setattr(mod, "is_direct_local_request", lambda req: True)
+
+    async def _accept(key, token):
+        return None
+
+    monkeypatch.setattr(mod, "_validate_slack_token", _accept)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-OLD")
+    real_write = mod._write_env_updates
+
+    async def _write_then_cancel(updates):
+        real_write(updates)
+        raise asyncio.CancelledError("cancelled after the write committed")
+
+    monkeypatch.setattr(mod, "_write_env_off_loop", _write_then_cancel)
+
+    class _FakeRequest:
+        app: dict = {"state": None}
+
+        async def json(self) -> dict:
+            return {"bot_token": "xoxb-NEW", "command": "new"}
+
+        def get(self, key, default=None):
+            return default
+
+    async def _run() -> bool:
+        try:
+            await mod.api_slack_config_save(_FakeRequest())
+        except asyncio.CancelledError:
+            return True
+        return False
+
+    assert asyncio.run(_run()) is True
+    assert "SLACK_BOT_TOKEN=xoxb-NEW" in env.read_text(encoding="utf-8")
+    assert json.loads(cfg.read_text(encoding="utf-8"))["slack"]["command"] == "new"

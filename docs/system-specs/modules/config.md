@@ -2440,20 +2440,21 @@ dispatch also drops the old client's mirror registration synchronously and
 schedules its reconnect, so a request that follows the response (a WhatsApp QR
 start, a mirror send) is never handed the client about to be closed.
 
-**A two-file save runs under `live.hold()`.** A saver that writes `config.json`
-and then `.env`, and rolls the config back when the credential write fails
-(Slack, Teams, Webex, WeCom, Feishu), wraps the whole transaction — snapshot through
-rollback and the `os.environ` sync — in `with live.hold():`. Without it the
+**A two-file save runs under `live.hold()`.** Every channel saver that writes
+`config.json` and then `.env` (Slack, Teams, Webex, WeCom, Feishu, Discord,
+Telegram) rolls the config back when the credential write fails, through the one
+shared `_write_env_or_roll_back` in `handlers/messaging.py`, and wraps the whole
+transaction — snapshot through rollback and the `os.environ` sync — in
+`with live.hold():`. Without it the
 config write's own kick (`_atomic_json_write` → `notify_config_written`) wakes
 the watcher while the handler is still awaiting the `.env` write, and a widened
 allow-list the committed state never granted is applied to the running transport
 for the length of the failing write. Under a hold the cycle records that a
 reload is owed and returns without loading; the release wakes it on the
-committed (or restored) file. The Discord and Telegram savers commit `config.json`
-and then `.env` with no rollback, so they have no rollback window and need no hold.
-Pinned for WeCom by `test_wecom_config_handlers.py`
-(`test_the_config_and_env_writes_run_under_the_live_config_hold`) and for the
-watcher itself by `test_config_live.py`.
+committed (or restored) file. Pinned for WeCom by `test_wecom_config_handlers.py`
+(`test_the_config_and_env_writes_run_under_the_live_config_hold`), for Discord,
+Telegram and the shared rollback step by `test_channel_env_write_off_loop.py`, and
+for the watcher itself by `test_config_live.py`.
 
 Tests: `test/test_config_live.py` (diff, registry, lifecycle, fingerprint,
 dispatch order and scope, every write path, the schema/handler agreement, the
