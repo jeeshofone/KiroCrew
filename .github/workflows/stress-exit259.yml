@@ -1,0 +1,63 @@
+name: Stress exit259 helper attach
+on:
+  push:
+    branches: [stress/exit259-helper-attach]
+permissions:
+  contents: read
+jobs:
+  stress:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - name: Install
+        run: uv pip install --system -e ".[voice,desktop]" --group dev
+      - name: Fixed test under load
+        run: bash stress/exit259.sh fixed 6
+      - name: Mutant, helper starts before the child is ready (old ordering)
+        run: |
+          python - <<'EOF'
+          p = "test/test_runtime_cleanup_windows.py"
+          s = open(p, encoding="utf-8").read()
+          old = "            await wait_for_file(ready)\n"
+          assert s.count(old) == 1
+          open(p, "w", encoding="utf-8").write(s.replace(old, ""))
+          EOF
+          bash stress/exit259.sh mutant-no-ready-wait 6
+          git checkout -- test/test_runtime_cleanup_windows.py
+      - name: Mutant, helper attaches to a process with no console
+        run: |
+          python - <<'EOF'
+          p = "test/test_runtime_cleanup_windows.py"
+          s = open(p, encoding="utf-8").read()
+          old = "                str(process.pid),\n                str(attached),\n"
+          assert s.count(old) == 1
+          s = s.replace(old, "                str(4),\n                str(attached),\n")
+          open(p, "w", encoding="utf-8").write(s)
+          EOF
+          bash stress/exit259.sh mutant-wrong-pid 1
+          git checkout -- test/test_runtime_cleanup_windows.py
+      - name: Mutant, drain reads a 259 exit as running (product guard)
+        run: |
+          python - <<'EOF'
+          p = "src/kiro_crew/platform_compat.py"
+          s = open(p, encoding="utf-8").read()
+          old = "        waited = int(kernel32.WaitForSingleObject(process_handle, 0))\n"
+          assert s.count(old) == 1
+          open(p, "w", encoding="utf-8").write(s.replace(old, "        waited = -1\n"))
+          EOF
+          bash stress/exit259.sh mutant-259-reads-running 1
+          git checkout -- src/kiro_crew/platform_compat.py
+      - name: Summary
+        if: always()
+        run: |
+          cat stress-summary.txt
+          echo "--- distinct failure messages"
+          grep -hoE "(helper did not attach[^\"]*|an exit status of 259 reads back as running|fixture never wrote [a-z]+|AssertionError: [^\r]{0,120})" stress-*.log | sort | uniq -c | head -40
