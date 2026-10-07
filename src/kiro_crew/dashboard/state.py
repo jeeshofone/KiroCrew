@@ -7216,6 +7216,8 @@ class DashboardState:
         approval_id: str,
         approved: bool,
         decision: str = "",
+        *,
+        instance: str = "",
     ) -> None:
         """Audit and broadcast one approval decision."""
         _approvals_for(self).audit_and_broadcast(
@@ -7225,6 +7227,7 @@ class DashboardState:
             approved,
             decision,
             audit_provider=sel,
+            instance=instance,
         )
 
     def _audit_approval(
