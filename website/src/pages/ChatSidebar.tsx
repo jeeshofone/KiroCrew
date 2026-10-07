@@ -125,6 +125,7 @@ import { useLineageAvailable, useConductorLane, citedCreatorOf } from './chat-si
 import { useShortcutOrder } from './chat-sidebar/shortcuts'
 import { useFolderDropOps, useSidebarMoveUndo, useSidebarDragHandlers, useNativeSessionDrag } from './chat-sidebar/dnd/useSidebarDrag'
 import { useSidebarReveal } from './chat-sidebar/reveal'
+import { useHoldPinnedHeaderOnCollapse } from './chat-sidebar/stickyCollapse'
 import { useFolderChatCreate, useSessionCreate } from './chat-sidebar/create'
 
 /**
@@ -2964,6 +2965,16 @@ function ChatSidebar({
   const {
     createFolderMutation, deleteFolderMutation, updateFolderMutation, toggleCollapse,
   } = useFolderMutations({ queryClient, setFolderActionError, folders })
+  // The list view's toggle. Its folder headers are sticky, so a collapse also
+  // moves the lane to keep a pinned header where it is painted, in the commit
+  // that hides the body (see stickyCollapse.ts); `from` is the pressed control,
+  // inside the folder block.
+  const { armHold, disarm: disarmHold } = useHoldPinnedHeaderOnCollapse(laneScrollRef, folders)
+  const toggleListFolderCollapse = (folder: ChatFolder, from: HTMLElement) => {
+    if (folder.collapsed) disarmHold()
+    else armHold(folder.id, from.closest<HTMLElement>('[data-folder-drop]'))
+    toggleCollapse(folder.id)
+  }
 
   const { clearBoardCollapse, boardFolderCollapsed, toggleColumnCollapse } = useBoardFolderCollapse()
 
@@ -3819,7 +3830,7 @@ function ChatSidebar({
                 type: 'button' as const,
                 'aria-expanded': !collapsed,
                 'aria-label': collapsed ? i18nT('pages.chatSidebar.expand_folder_name', { name: folder.name }) : i18nT('pages.chatSidebar.collapse_folder_name', { name: folder.name }),
-                onClick: () => toggleCollapse(folder.id),
+                onClick: (e: React.MouseEvent<HTMLElement>) => toggleListFolderCollapse(folder, e.currentTarget),
               })}>
               {/* An inert row's glyph says "inactive" by WEIGHT, not by shape. The
                *  closed shape is this product's "collapsed, click to expand"
@@ -4056,7 +4067,7 @@ function ChatSidebar({
     const emptyBody = hideEmptyFolderBody && childNodes.length === 0
     const wrapped = childNodes.length > 0 ? (
       <div key={`folder-children-${folder.id}`} className={FOLDER_BODY_CLS}>
-        <FolderRail name={folder.name} id={folder.id} onToggle={() => toggleCollapse(folder.id)} />
+        <FolderRail name={folder.name} id={folder.id} onToggle={e => toggleListFolderCollapse(folder, e.currentTarget)} />
         {childNodes}
       </div>
     ) : emptyBody || listNarrowed ? null : (

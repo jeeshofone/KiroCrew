@@ -11,9 +11,13 @@ import { useEffect, useState } from 'react'
  * Two properties are needed for the closed state, and they cannot both apply at
  * the same moment:
  *
- *   - `visibility: hidden` stops the closed rows PAINTING. It flips with `open`,
- *     so the shrinking track reads as empty space closing rather than rows
- *     sliding away.
+ *   - `visibility: hidden` plus `opacity: 0` stop the closed rows PAINTING.
+ *     Both flip with `open`, so the shrinking track reads as empty space
+ *     closing rather than rows sliding away. `visibility` alone is not enough:
+ *     it is inherited, and a row control that transitions `all` carries the
+ *     inherited value through its own transition, so the rows would paint for
+ *     the whole close. `opacity` is not inherited, so it hides them at once;
+ *     `visibility` stays for hit testing and the accessibility tree.
  *   - `content-visibility: hidden` stops them occupying LAYOUT. Without it the
  *     clipped rows still contribute scrollable overflow to the nearest scroll
  *     container, which is what let a collapsed folder leave ~3000px of dead
@@ -86,6 +90,7 @@ export function FolderBody({
         minHeight: 0,
         minWidth: 0,
         visibility: open ? 'visible' : 'hidden',
+        opacity: open ? 1 : 0,
         contentVisibility: layoutSuppressed ? 'hidden' : 'visible',
         padding: open ? padding : 0,
       }}>{children}</div>
