@@ -648,6 +648,26 @@ def _fresh_reexec_environment(_floor_monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _fresh_response_outcome(_floor_monkeypatch):
+    """Start every test with no dispatched MCP call armed in this process.
+
+    ``mcp_shared`` keeps the in-flight call's response arm, a thread-local copy
+    of it, and whether this process has dispatched a call at all. A dispatch
+    loop one test drives would otherwise make a later test's direct tool call
+    read as a call on a thread the dispatcher cannot answer for.
+    """
+    import threading
+
+    from kiro_crew import mcp_shared
+
+    _floor_monkeypatch.setattr(mcp_shared, "_response_outcome_arms", {})
+    _floor_monkeypatch.setattr(mcp_shared, "_response_outcome_local", threading.local())
+    _floor_monkeypatch.setattr(mcp_shared, "_response_outcome_dispatching", False)
+    # A hook one test leaves running must not hold the next test's exit join.
+    _floor_monkeypatch.setattr(mcp_shared, "_outcome_hook_threads", set())
+
+
+@pytest.fixture(autouse=True)
 def _a_shared_monkeypatch_first(monkeypatch):  # flake-ok: patches nothing; only fixes setup order
     """Build the test's shared ``monkeypatch`` before every other autouse fixture here.
 
@@ -2322,6 +2342,7 @@ def _reset_create_rate_limit_buckets():
 _REAL_MCP_POST_MODULES = frozenset(
     {
         "test_ephemeral_sessions",
+        "test_inline_collection_report_deadline",
         "test_mcp_api_base_resolution",
         "test_mcp_core",
         "test_mcp_core_coverage",
