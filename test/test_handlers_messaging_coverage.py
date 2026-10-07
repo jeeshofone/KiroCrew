@@ -583,14 +583,25 @@ class TestApiSpawnMarkCollected:
         assert _payload(_run(mod.api_spawn_mark_collected, req)) == {"status": "no_slot"}
 
     def test_records_ids_bounded_and_skips_non_strings(self) -> None:
-        slot = SimpleNamespace(_subagents_inline_collected=set(), _queue=[])
-        state = _state()
+        from kiro_crew.subagent_inline_collection import InlineCollections
+
+        registry = InlineCollections()
+        slot = SimpleNamespace(_queue=[])
+        state = _state(
+            subagents=SimpleNamespace(inline_collections=registry, get=lambda _aid: object())
+        )
         state.get_slot.return_value = slot
-        ids: list[Any] = [f"a{i}" for i in range(250)] + ["", 7]
+        cap = mod._COLLECTED_IDS_CAP
+        ids: list[Any] = ["", 7] + [f"a{i}" for i in range(cap + 50)]
         req = _Req(state, {"ids": ids, "parent_session": "dashboard:chat-1"})
         resp = _run(mod.api_spawn_mark_collected, req)
         assert _payload(resp) == {"status": "ok", "marked": len(ids)}
-        assert len(slot._subagents_inline_collected) == 200
+        kept = [
+            f"a{i}"
+            for i in range(cap + 50)
+            if registry.consume_collected("dashboard:chat-1", f"a{i}")
+        ]
+        assert len(kept) == cap - 2
 
 
 # ── result paging helpers ──

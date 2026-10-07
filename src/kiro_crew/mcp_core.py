@@ -1429,6 +1429,39 @@ def _transport_failure(message: str, mark: bool) -> dict:
 # gateway feel hung.
 _REFUSED_RETRY_BACKOFFS: tuple[float, ...] = (0.25, 0.5)
 
+#: The read size :func:`_read_by` re-arms the socket timeout between.
+_DEADLINE_READ_CHUNK = 64 * 1024
+
+
+class _DeadlinePassed(Exception):
+    """Raised by :func:`_send` before a dial its caller's deadline cannot fit."""
+
+
+def _read_by(resp: Any, deadline: float) -> bytes:
+    """Read *resp*'s body by the absolute monotonic *deadline*, in wall time.
+
+    A socket timeout bounds each ``recv``, so a reply that drips one byte per
+    timeout could run for many timeouts. Reading in chunks and re-arming the
+    socket's timeout to the time left before each one bounds the whole body.
+    The socket is reached through the response's file object, looked up again
+    before every chunk: ``http.client`` drops that object and closes the socket
+    the moment the body is exhausted, so a reply read in full is never re-armed.
+    A response without one (a test double) is still checked against the
+    deadline between chunks.
+    """
+    chunks: list[bytes] = []
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise socket.timeout("gateway reply not finished by its deadline")
+        sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+        if sock is not None:
+            sock.settimeout(left)
+        chunk = resp.read(_DEADLINE_READ_CHUNK)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
 
 def _refused_message(refused_base: str, exc: BaseException) -> str:
     """Actionable text for a base that refused every attempt.
@@ -1457,6 +1490,7 @@ def _send(
     method: str = "GET",
     timeout: float = 30,
     mark_transport_error: bool = False,
+    deadline: float | None = None,
 ) -> dict:
     """Send one gateway request, recovering from a refused connection.
 
@@ -1474,16 +1508,34 @@ def _send(
     Every verb goes through here. Keeping both layers in one place is what stops
     PATCH-shaped calls from staying pinned to a base that POST already learned
     was wrong.
+
+    ``deadline``, when given, is an absolute ``time.monotonic()`` reading that
+    bounds the WHOLE call: every dial gets at most the time left, every refused
+    retry's pause is clipped to it (no re-dial is started once it has passed),
+    and the reply body is read against it in wall time, not per ``recv``. A
+    caller with an outer wait of its own (a SIGTERM join) passes it, because
+    ``timeout`` alone bounds each attempt, and the refused retry makes several.
     """
+
+    def _time_left() -> float | None:
+        """Seconds this attempt may use, or ``None`` once the deadline passed."""
+        if deadline is None:
+            return timeout
+        left = deadline - time.monotonic()
+        return min(timeout, left) if left > 0 else None
 
     def _once(target: tuple[str, str], hdrs: dict[str, str] | None = None) -> dict:
         base, socket_path = target
+        dial_timeout = _time_left()
+        if dial_timeout is None:
+            # Nothing is dialled, so nothing can reach the gateway.
+            raise _DeadlinePassed
         req = urllib.request.Request(
             f"{base}{path}", data=data, headers=hdrs if hdrs is not None else headers, method=method
         )
         # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- URL is the loopback gateway (_resolve_api_target(): 127.0.0.1 plus a port from config/env or a run-marker whose ownership is re-verified per request) + a fixed internal path; never user-controlled  # noqa: E501
-        with _api_urlopen(req, timeout=timeout, unix_socket_path=socket_path) as resp:
-            return json.loads(resp.read())
+        with _api_urlopen(req, timeout=dial_timeout, unix_socket_path=socket_path) as resp:
+            return json.loads(resp.read() if deadline is None else _read_by(resp, deadline))
 
     def _refreshed_headers(base: str) -> dict[str, str]:
         """*headers* with the credential re-read for *base*, caller's dict intact.
@@ -1537,7 +1589,14 @@ def _send(
         dialled-and-refused exhaustion.
         """
         for backoff in _REFUSED_RETRY_BACKOFFS:
+            if deadline is not None:
+                # Clip the pause, and start no re-dial the deadline cannot fit.
+                backoff = min(backoff, deadline - time.monotonic())
+                if backoff <= 0:
+                    break
             time.sleep(backoff)
+            if _time_left() is None:
+                break
             # Re-prove ownership AFTER the sleep, never before it: the whole
             # point is that the gateway may have gone during the pause.
             proven = _reverify_refused_target(refused[0])
@@ -1551,6 +1610,8 @@ def _send(
             # built with would earn a 403 instead of the retry this exists for.
             try:
                 return _once(proven, _refreshed_headers(proven[0]))
+            except _DeadlinePassed:
+                break
             except urllib.error.HTTPError as exc:
                 return _http_error_body(exc)
             except urllib.error.URLError as exc:
@@ -1568,6 +1629,8 @@ def _send(
     base = target[0]
     try:
         return _once(target)
+    except _DeadlinePassed:
+        return {"error": "gateway request not sent: its deadline had passed", "refused": True}
     except urllib.error.HTTPError as e:
         # urlopen raises HTTPError on 4xx/5xx; str(e) is only "HTTP Error 400:
         # Bad Request" — the structured {"error": ...} body lives in e.read().
@@ -1591,6 +1654,8 @@ def _send(
             return _retry_refused(target, e)
         try:
             return _once(retry_target)
+        except _DeadlinePassed:
+            return {"error": _refused_message(base, e), "refused": True}
         except urllib.error.HTTPError as retry_exc:
             return _http_error_body(retry_exc)
         except urllib.error.URLError as retry_exc:
@@ -1620,6 +1685,7 @@ def _post(
     *,
     timeout: float = 30,
     session_key: str | None = None,
+    deadline: float | None = None,
 ) -> dict:
     """POST a gateway endpoint.
 
@@ -1631,6 +1697,9 @@ def _post(
     ancestor slot, which for an app-owned session means the write arrives
     looking like the unconfined person. Such a caller must pass the key it
     verified. It is still validated by ``_session_key_header_error``.
+
+    ``deadline``: an absolute ``time.monotonic()`` bound on the whole call, as
+    in :func:`_send`.
     """
     data = json.dumps(body or {}).encode()
     headers = {
@@ -1656,6 +1725,7 @@ def _post(
         method="POST",
         timeout=timeout,
         mark_transport_error=True,
+        deadline=deadline,
     )
 
 

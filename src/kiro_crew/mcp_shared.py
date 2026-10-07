@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import atexit
 import collections
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -199,6 +201,167 @@ class ToolCancelled(Exception):
     """Raised by cooperative tools when ``is_tool_cancelled()`` returns True."""
 
     pass
+
+
+# What the dispatcher did with each dispatched call's response. A call is ARMED
+# when its thread starts running it and SETTLED once the dispatcher wrote or
+# dropped its response. Arms are kept per request id, so calls in flight at once
+# each hear only their own outcome. The arm is also kept on the running thread
+# after the settle, so a hook the call registers late still learns the real
+# outcome. The lock guards an arm between that thread, which registers, and the
+# loop, which settles.
+_response_outcome_lock = threading.Lock()
+#: Armed calls not yet settled, by request id.
+_response_outcome_arms: dict[str, _ResponseArm] = {}
+_response_outcome_local = threading.local()
+#: Set once this process dispatches its first call. From then on a thread with
+#: no arm cannot learn an outcome, so it is told the response was dropped.
+_response_outcome_dispatching = False
+
+
+class _ResponseArm:
+    __slots__ = ("req", "hook", "outcome")
+
+    def __init__(self, req: str) -> None:
+        self.req = req
+        #: The call's one callback, if it registered one.
+        self.hook: Callable[[bool], None] | None = None
+        #: None while the response is undecided; then whether it was written.
+        self.outcome: bool | None = None
+
+
+def on_response_outcome(hook: Callable[[bool], None]) -> bool | None:
+    """Learn whether the dispatcher wrote this tool call's response.
+
+    ``hook(delivered)`` is called once the dispatcher has answered the call:
+    ``delivered`` is True only once the call's whole response frame is written
+    to the client, and False when the dispatcher drops it (the call was
+    cancelled, before or after it returned), the write tore, or the client went
+    away. It runs on its own daemon thread, after the call returned, so it may
+    block, and under a copy of the registering thread's context, so the call's
+    caller identity (``current_caller()``, the gateway-forwarded session token a
+    pooled backend authenticates with) reaches what the hook sends. Process exit
+    waits for a running hook, bounded (``_join_outcome_hooks``). Returns None
+    when the hook will be called. Otherwise nothing is
+    registered and the result is ``delivered`` itself:
+
+    * the recorded outcome when the dispatcher already answered this call (a
+      hook registered after an EOF, for example);
+    * False from a thread no dispatched call runs on, once this process
+      dispatches calls, or for a second registration by the same call: neither
+      can learn the outcome, so neither may commit;
+    * True when this process never dispatched a call (a direct call): the
+      result is already the caller's.
+    """
+    arm: _ResponseArm | None = getattr(_response_outcome_local, "arm", None)
+    with _response_outcome_lock:
+        if arm is None:
+            return not _response_outcome_dispatching
+        if arm.outcome is None:
+            if arm.hook is not None:
+                return False  # one callback per call
+            ctx = contextvars.copy_context()
+            arm.hook = lambda delivered: ctx.run(hook, delivered)
+            return None
+        return arm.outcome
+
+
+def _arm_response_outcome(req_id: Any) -> None:
+    """Arm request *req_id*, run by the CURRENT thread. Other armed calls are untouched."""
+    global _response_outcome_dispatching
+    arm = _ResponseArm(str(req_id))
+    with _response_outcome_lock:
+        # A reused id replaces an arm nothing can answer for any more.
+        stale = _response_outcome_arms.pop(arm.req, None)
+        _response_outcome_arms[arm.req] = arm
+        _response_outcome_dispatching = True
+    _response_outcome_local.arm = arm
+    if stale is not None:
+        _drop_arm(stale)
+
+
+def _settle_response_outcome(req_id: Any, delivered: bool) -> None:
+    """Record *req_id*'s outcome and run its hook, once; a no-op for any other request."""
+    with _response_outcome_lock:
+        arm = _response_outcome_arms.pop(str(req_id), None)
+        if arm is None or arm.outcome is not None:
+            return
+        arm.outcome = bool(delivered)
+        hook, arm.hook = arm.hook, None
+    if hook is not None:
+        _start_outcome_hook(hook, bool(delivered))
+
+
+def _drop_unsettled_arms() -> None:
+    """Settle every call still armed as dropped: the loop is ending and writes nothing more."""
+    with _response_outcome_lock:
+        arms = list(_response_outcome_arms.values())
+        _response_outcome_arms.clear()
+    for arm in arms:
+        _drop_arm(arm)
+
+
+def _drop_arm(arm: _ResponseArm) -> None:
+    with _response_outcome_lock:
+        if arm.outcome is not None:
+            return
+        arm.outcome = False
+        hook, arm.hook = arm.hook, None
+    if hook is not None:
+        _start_outcome_hook(hook, False)
+
+
+#: Outcome hooks still running. A hook reports AFTER the response is written,
+#: and a client that has its answer may end this process at once (EOF, or a
+#: script cron's ``close()``), so exit waits for them, bounded, before it ends.
+_outcome_hook_threads: set[threading.Thread] = set()
+_outcome_hook_threads_lock = threading.Lock()
+#: Exit's wait: room for a slow report and a second one queued behind it.
+OUTCOME_HOOK_EXIT_WAIT_SECS = 20.0
+#: SIGTERM's wait, under the 5 s a script cron's ``close()`` gives
+#: ``terminate()`` before it kills the server. A collection report bounds its
+#: own retries by ``mcp_tools.spawn.COLLECTION_REPORT_DEADLINE_SECS``, which
+#: is shorter, so this wait covers a report's worst case.
+OUTCOME_HOOK_SIGNAL_WAIT_SECS = 4.0
+
+
+def _start_outcome_hook(hook: Callable[[bool], None], delivered: bool) -> None:
+    # Daemon, so a hung hook cannot hold exit past the bounded wait.
+    thread = threading.Thread(target=_run_outcome_hook, args=(hook, delivered), daemon=True)
+    with _outcome_hook_threads_lock:
+        _outcome_hook_threads.add(thread)
+    thread.start()
+
+
+def _run_outcome_hook(hook: Callable[[bool], None], delivered: bool) -> None:
+    try:
+        hook(delivered)
+    except Exception:
+        logger.warning("a tool's response-outcome hook failed", exc_info=True)
+    finally:
+        with _outcome_hook_threads_lock:
+            _outcome_hook_threads.discard(threading.current_thread())
+
+
+def _join_outcome_hooks(budget_secs: float) -> int:
+    """Wait up to *budget_secs* in total for running outcome hooks; return how many are left."""
+    deadline = time.monotonic() + budget_secs
+    with _outcome_hook_threads_lock:
+        live = list(_outcome_hook_threads)
+    for thread in live:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    left = sum(1 for thread in live if thread.is_alive())
+    if left:
+        logger.warning(
+            "%d response-outcome report(s) still running at exit; their results "
+            "are delivered again once the claim expires",
+            left,
+        )
+    return left
+
+
+# Interpreter exit joins only non-daemon threads, and runs this after them.
+atexit.register(_join_outcome_hooks, OUTCOME_HOOK_EXIT_WAIT_SECS)
 
 
 # The framing the client's first accepted message used, and so the framing of
@@ -1117,10 +1280,14 @@ _UNRESOLVED_REFUSES_CALL = frozenset(
 )
 
 
-def respond(req_id: Any, result: Any, error: dict | None = None) -> None:
-    """Write a validated JSON-RPC response to stdout."""
+def respond(req_id: Any, result: Any, error: dict | None = None) -> bool:
+    """Write a validated JSON-RPC response to stdout.
+
+    True once the whole frame is written; False when there was nothing to
+    write to (no id) or the write tore, so the client holds no complete answer.
+    """
     if req_id is None:
-        return
+        return False
     resp: dict[str, Any] = {"jsonrpc": "2.0", "id": req_id}
     if error:
         resp["error"] = error
@@ -1156,7 +1323,7 @@ def respond(req_id: Any, result: Any, error: dict | None = None) -> None:
         if fd is not None:
             try:
                 _write_all(fd, frame)
-                return
+                return True
             except OSError as exc:
                 # The dup'd fd is unusable (client pipe closed). Fall back to
                 # sys.stdout ONLY if nothing was written, so a genuinely broken
@@ -1173,13 +1340,14 @@ def respond(req_id: Any, result: Any, error: dict | None = None) -> None:
                         len(frame),
                         exc.__class__.__name__,
                     )
-                    return
+                    return False
     if _framing == "content-length":
         sys.stdout.buffer.write(frame)
         sys.stdout.buffer.flush()
     else:
         sys.stdout.write(frame.decode("utf-8"))
         sys.stdout.flush()
+    return True
 
 
 def _audit_safe_args(value: Any) -> Any:
@@ -1433,8 +1601,17 @@ def _hard_exit_on_signal(_signum: int, _frame: Any) -> None:
     crash dialog on macOS) during a provider's group teardown. Same fix as the
     gateway stub's ``_hard_exit``: drain logging, flush stderr, ``os._exit``.
     stdout is NOT flushed: another thread may hold its lock, and waiting on it
-    here would keep the process from ever exiting.
+    here would keep the process from ever exiting. A response-outcome report
+    still running gets a bounded wait first, since ``os._exit`` skips the
+    ``atexit`` join. One window remains: a signal that lands between
+    ``respond()`` returning and ``_start_outcome_hook`` registering the thread
+    finds nothing to join, so that report is lost and its claim expires into
+    a duplicate delivery, as any lost report does.
     """
+    try:
+        _join_outcome_hooks(OUTCOME_HOOK_SIGNAL_WAIT_SECS)
+    except Exception:  # pragma: no cover - never block exit on the join
+        pass
     try:
         logging.shutdown()
     except Exception:  # pragma: no cover - never block exit on log teardown
@@ -1506,6 +1683,8 @@ def run_mcp_stdio_loop(
             error_prefix_is_error=error_prefix_is_error,
         )
     finally:
+        # A call the loop never answered can have no response written now.
+        _drop_unsettled_arms()
         set_internal_caller(_prior_caller)
         release_stdout_fd()
         # Restore, so repeated loops in one process (the test suite) do not
@@ -1698,6 +1877,7 @@ def _run_stdio_dispatch_loop(
         # gateway could not name reads it instead of a process-global fallback.
         # Cleared in the same places as the caller.
         set_current_tenant_nonce(tenant_nonce)
+        _arm_response_outcome(req_id)
         try:
             result_text = call_tool_fn(tool_name, tool_args)
         except ToolCancelled:
@@ -2163,6 +2343,7 @@ def _run_stdio_dispatch_loop(
                 # caller identity (an escaped exception would kill the loop).
                 set_current_caller(_caller_ctx)
                 set_current_tenant_nonce(_tenant_nonce)
+                _arm_response_outcome(req_id)
                 try:
                     result_text = call_tool_fn(tool_name, tool_args)
                 except Exception as exc:
@@ -2176,7 +2357,11 @@ def _run_stdio_dispatch_loop(
                 finally:
                     set_current_caller(None)
                     set_current_tenant_nonce("")
-                respond(req_id, _tool_response(result_text))
+                written = False
+                try:
+                    written = respond(req_id, _tool_response(result_text)) is True
+                finally:
+                    _settle_response_outcome(req_id, written)
             else:
                 # Dispatch tool in worker thread so we can receive cancel notifications
                 _cancel_event = threading.Event()
@@ -2226,22 +2411,29 @@ def _run_stdio_dispatch_loop(
         if _worker_thread is not None:
             _worker_thread.join(timeout=join_timeout)
         _worker_thread = None
-        with _result_lock:
-            if _result_box and str(_current_req_id) not in _cancelled_ids:
-                respond(_current_req_id, _result_box[0])
-            elif _result_box and not _worker_audited[0]:
-                # Boxed result dropped due to cancellation (cancel arrived
-                # after the worker delivered) -- audit it.
-                _sel_audit(
-                    "cancelled",
-                    _current_tool_name,
-                    _current_req_id,
-                    _current_caller_key,
-                )
-            _result_box.clear()
-            # Consumed: drop the id so a completed request never lingers
-            # in the cancelled set.
-            _cancelled_ids.discard(str(_current_req_id))
+        req_id = _current_req_id
+        answered = False
+        try:
+            with _result_lock:
+                if _result_box and str(_current_req_id) not in _cancelled_ids:
+                    answered = respond(_current_req_id, _result_box[0]) is True
+                elif _result_box and not _worker_audited[0]:
+                    # Boxed result dropped due to cancellation (cancel arrived
+                    # after the worker delivered) -- audit it.
+                    _sel_audit(
+                        "cancelled",
+                        _current_tool_name,
+                        _current_req_id,
+                        _current_caller_key,
+                    )
+                _result_box.clear()
+                # Consumed: drop the id so a completed request never lingers
+                # in the cancelled set.
+                _cancelled_ids.discard(str(_current_req_id))
+        finally:
+            # Only once the response is written (or dropped): a hook that settles
+            # what the response carried must never run for one the client lost.
+            _settle_response_outcome(req_id, answered)
         _current_req_id = None
         _cancel_event = None
         _result_ready.clear()
@@ -2258,9 +2450,11 @@ def _run_stdio_dispatch_loop(
                 continue
             req = _read_message(sys.stdin)
             if req is None:
-                # EOF: wait for worker then exit
+                # EOF: wait for worker then exit. Its response is never
+                # written, so a hook waiting on it hears that it was dropped.
                 if _worker_thread:
                     _worker_thread.join(timeout=5.0)
+                _settle_response_outcome(_current_req_id, False)
                 break
             if isinstance(req, _Skipped):
                 # One iteration per dropped frame, so a finished worker's

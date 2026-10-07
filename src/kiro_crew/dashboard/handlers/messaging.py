@@ -160,6 +160,7 @@ from kiro_crew.dashboard.messaging_api.run_control import (  # noqa: F401
     _queued_runs,
     _retry_failed_run,
     _spawn_scope_refusal,
+    _take_queued_collected,
     api_spawn_delete,
     api_spawn_lost,
     api_spawn_mark_collected,
@@ -279,6 +280,8 @@ from kiro_crew.subagent import (  # noqa: F401
     effort_drop_reason,
     parent_spawn_allowlists,
 )
+from kiro_crew.subagent_inline_collection import MAX_IDS_PER_PARENT as _INLINE_IDS_PER_PARENT
+from kiro_crew.subagent_inline_collection import InlineCollections  # noqa: F401
 from kiro_crew.subagent_manager.admission.types import (  # noqa: F401
     QueuedReadUnavailable,
     QueuedRun,
@@ -617,11 +620,12 @@ def parent_work_supported(state: Any, parent_session: str) -> bool:
     )
 
 
-#: Bounds on the inline-collected ids a slot retains: each id's length (run ids
-#: are 16 hex characters), and the set as a whole, since only a completion that
-#: matches an id evicts it.
+#: Bounds on the inline-collected ids one ``mark-collected`` call names: each
+#: id's length (run ids are 16 hex characters), and the list as a whole. The
+#: list's bound is the one the inline-collection registry keeps per parent
+#: (``subagent_inline_collection.MAX_IDS_PER_PARENT``).
 _COLLECTED_ID_MAX_LEN = 128
-_COLLECTED_IDS_CAP = 1000
+_COLLECTED_IDS_CAP = _INLINE_IDS_PER_PARENT
 
 
 _SPAWN_STATUS_MAX_LINES = 2000  # cap lines returned per spawn_status page
