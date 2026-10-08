@@ -34,8 +34,8 @@ describe('the shrink-only lists', () => {
     for (const file of actWarningBaseline) expect(existsSync(resolve(process.cwd(), file)), file).toBe(true)
   })
 
-  it('keeps the storage carry-over list at its two files', () => {
-    expect(STORAGE_CARRYOVER_FILES.size).toBeLessThanOrEqual(2)
+  it('keeps the storage carry-over list at its one file', () => {
+    expect(STORAGE_CARRYOVER_FILES.size).toBeLessThanOrEqual(1)
   })
 })
 

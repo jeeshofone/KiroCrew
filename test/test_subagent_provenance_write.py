@@ -600,7 +600,12 @@ async def test_recovery_gate_respects_live_drain_latch() -> None:
             ),
             patch.object(manager, "_write_tombstone"),
         ):
-            await manager._run(info)
+            if expect_recovery:
+                # A hand-off to recovery ends the original run cancelled.
+                with pytest.raises(asyncio.CancelledError):
+                    await manager._run(info)
+            else:
+                await manager._run(info)
 
         assert bool(recovery_calls) is expect_recovery, (
             f"latch={latch}: expected recovery_scheduled={expect_recovery}, "
@@ -1579,11 +1584,11 @@ def test_no_on_loop_update_state_inside_a_coroutine() -> None:
     Scope-aware, so it is deterministic rather than a substring heuristic: only
     the INNERMOST enclosing frame counts, which is what makes a synchronous
     helper nested inside a coroutine (the shape a worker thread runs) not an
-    offender. The two retention writers -- ``_promote_conversation_impl`` and
-    ``release_conversation_impl`` -- are synchronous ``def``s, so they are
-    outside this gate's reach by that same rule; moving them is the rest of
-    this work and needs its own change (their other work, the ``SessionMap``
-    mutation, is required to stay on the loop).
+    offender. The retention writers are synchronous ``def``s, so they are
+    outside this gate's reach by that same rule: release's disk half
+    (``_release_disk_sync``) runs on a worker thread from every event-loop
+    caller, and ``_promote_conversation_impl`` stays on the loop by design (its
+    busy check, promotion and admission must commit with no await between).
     """
     import ast
     from pathlib import Path

@@ -1,6 +1,7 @@
 /** What a finished turn (`chat_done`) means once its row has been finalized:
  *  the turn-done chime, the opt-in native toast, the unread badge or read
- *  relay, the run status, the slot refresh and the pull-request refresh. */
+ *  relay, the run status, the slot refresh, the pull-request refresh and the
+ *  session-control status refresh. */
 import { useMemo, type MutableRefObject } from 'react'
 import type { QueryClient } from '@tanstack/react-query'
 import { store, type AppDispatch } from '../../store'
@@ -13,7 +14,7 @@ import { normalizeRunSessionKey } from '../../apps/workflows/runModel'
 import { dashboardAutomationSlotKey } from '../../monitoring/automation'
 import { i18nT } from '../../i18n/t'
 import { attendArrival } from './attention'
-import { refreshPullRequestsAfterTurn } from './serverState'
+import { refreshPullRequestsAfterTurn, refreshSessionControlStatusesAfterTurn } from './serverState'
 import type { FrameData } from './frames'
 
 export interface TurnCompletionDeps {
@@ -100,12 +101,14 @@ export function useTurnCompletion({ dispatch, queryClient, reconnectingRef }: Tu
       }
       if (data.slot) dispatch(refreshSlot(data.slot))
       if (data.slot) {
+        const isActive = data.slot === store.getState().chat.activeSlot
         refreshPullRequestsAfterTurn(
           queryClient,
           store.getState().dashboard.slots,
           data.slot,
-          data.slot === store.getState().chat.activeSlot,
+          isActive,
         )
+        refreshSessionControlStatusesAfterTurn(queryClient, data.slot, isActive)
       }
     },
   }), [dispatch, queryClient, reconnectingRef])

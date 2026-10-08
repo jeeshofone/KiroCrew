@@ -1,4 +1,6 @@
 import { api } from '../../api/client'
+import { noteUserChat } from '../../api/membersQuery'
+import { queryClient } from '../../api/queryClient'
 import { confirmedDelivered, readSendReceipt, SendReceiptBody } from '../../utils/sendDelivery'
 
 /** Stop waiting on a send's response. Reaching this bound says only that no
@@ -132,6 +134,8 @@ export async function sendTurn(opts: SendTurnOptions): Promise<SendReceipt> {
     }
     // Only an IMMEDIATE dispatch is a delivery receipt for an optimistic
     // bubble: the busy branch sets BOTH flags, so `ok` alone proves nothing.
+    // Accepted either way: the Crewmates list orders by the user's own sends.
+    noteUserChat(queryClient, opts.slot)
     if (confirmedDelivered(body)) return { status: 'dispatched', body }
     return { status: 'queued', body }
   } catch (e: unknown) {

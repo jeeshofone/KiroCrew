@@ -104,7 +104,7 @@ export interface FeatureVideoStatus {
   downloading: string | null
 }
 
-export function createFeatureDiscoveryEndpoints({ get, post, j, jNullable }: ClientTransport) {
+export function createFeatureDiscoveryEndpoints({ get, post, j, jfetch: fetch, jNullable }: ClientTransport) {
   const suggestions = {
     // Items are a bare string (legacy / cached payloads) or `{ text, kind }`.
     suggestions: (force?: boolean) => fetch(`/api/suggestions${force ? '?force=1' : ''}`).then(j) as Promise<{ suggestions: SuggestionItem[]; generated_at: number; stale: boolean }>,

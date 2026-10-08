@@ -2464,6 +2464,15 @@ class AcpProvider(LLMProvider):
         return {}
 
     @property
+    def member_dispatch_mounted(self) -> bool | None:
+        # Both transports answer from the composition that built THIS session's
+        # array: the shared runtime records it on the handle, the direct client
+        # on itself.
+        if isinstance(self._client, (AcpSessionProvider, AcpClient)):
+            return self._client.member_dispatch_mounted
+        return None
+
+    @property
     def native_steering(self) -> bool:
         # Kiro ACP manual/fileMatch support depends on version and engine;
         # the fallback keeps those guides reachable without a false capability.

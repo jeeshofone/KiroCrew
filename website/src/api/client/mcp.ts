@@ -83,7 +83,7 @@ export type McpManagedServer = {
   recommendation?: McpShareRecommendation
 }
 
-export function createMcpEndpoints({ get, post, put, j }: ClientTransport) {
+export function createMcpEndpoints({ get, post, put, j, jfetch: fetch }: ClientTransport) {
   const probeCache = {
     mcpProbeCache: () => fetch('/api/mcp/probe').then(j),
   }

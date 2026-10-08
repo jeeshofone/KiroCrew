@@ -35,6 +35,9 @@ import type { KiroCrewAgent } from '../components/AgentSelector'
  *   pages, the keyboard cycle). A member wins the fold because the backend's
  *   name-first resolution answers a bare name with the alias, so the template
  *   the fold hides is exactly the one a bare name could not reach anyway.
+ * @returns `displayAgents` — `agents` as of the last successful load, NOT
+ *   emptied on a scope switch. Display-only (the chat sidebar's agent tint and
+ *   inherited row colour); never a source for a selection.
  * @returns `error` — the catalog fetch FAILED, as distinct from an install that
  *   genuinely has one agent. The two used to be the same observation: the fetch
  *   swallowed its rejection and left `agents` empty, so every caller rendered a
@@ -51,6 +54,13 @@ import type { KiroCrewAgent } from '../components/AgentSelector'
  */
 export function useAgents(refreshTrigger: number, sessionKey?: string, projectDir?: string) {
   const [choices, setChoices] = useState<KiroCrewAgent[]>([])
+  // The last roster that actually LOADED, kept across a scope switch. `choices`
+  // is emptied on a switch so the picker cannot offer the old scope's agents,
+  // but surfaces that only DESCRIBE agents (the sidebar's agent-label tint, the
+  // row's inherited session colour) must not go blank for that window: every row
+  // briefly lost its agent colour on each session switch and flashed back once
+  // the new fetch resolved. Never use this to pick or send an agent.
+  const [displayChoices, setDisplayChoices] = useState<KiroCrewAgent[]>([])
   const [defaultAgent, setDefaultAgent] = useState('')
   // Closed until the config says otherwise: a missing or failed read keeps
   // the templates-only pop-up the gateway ships with.
@@ -92,6 +102,7 @@ export function useAgents(refreshTrigger: number, sessionKey?: string, projectDi
     api.agentCatalog(sessionKey).then(d => {
       if (cancelled) return
       setChoices(d.agents || [])
+      setDisplayChoices(d.agents || [])
       setDefaultAgent(d.default_agent || '')
       setError(false)
       setReloading(false)
@@ -110,6 +121,7 @@ export function useAgents(refreshTrigger: number, sessionKey?: string, projectDi
   }, [refreshTrigger, sessionKey, projectDir, reloadTick])
 
   const agents = useMemo(() => foldByName(choices), [choices])
+  const displayAgents = useMemo(() => foldByName(displayChoices), [displayChoices])
   // Filtered AFTER the fold, so hiding a member from the pop-up never changes
   // which row a bare name resolves to for the name-only consumers.
   const pickerChoices = useMemo(
@@ -117,7 +129,7 @@ export function useAgents(refreshTrigger: number, sessionKey?: string, projectDi
     [choices, memberChoices],
   )
 
-  return { agents, choices: pickerChoices, defaultAgent, error, reload, reloading }
+  return { agents, displayAgents, choices: pickerChoices, defaultAgent, error, reload, reloading }
 }
 
 /**

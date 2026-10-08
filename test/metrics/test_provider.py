@@ -259,6 +259,60 @@ def test_otlp_reader_degrades_without_logging_endpoint(monkeypatch, caplog):
     assert "token=hidden" not in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("endpoint", "signal"),
+    [
+        ("https://cloud.langfuse.com/api/public/otel/v1/traces", "traces"),
+        ("http://localhost:4318/v1/traces/", "traces"),
+        ("http://localhost:4318/V1/TRACES", "traces"),
+        ("https://user:super-secret@example.test/v1/logs?token=hidden", "logs"),
+    ],
+)
+def test_otlp_reader_warns_on_another_signals_route(monkeypatch, caplog, endpoint, signal):
+    """Kiro Crew emits metrics only. An endpoint aimed at a tracing backend's
+    /v1/traces (e.g. Langfuse) gets every batch rejected and no trace ever
+    arrives, so the reader says so once at WARNING, by destination name only."""
+    import logging
+
+    from kiro_crew.config.loader import TelemetryConfig
+    from kiro_crew.metrics import provider as provider_mod
+
+    monkeypatch.setattr(provider_mod, "_load_otel", lambda: False)
+    cfg = TelemetryConfig(enabled=True, otlp_endpoint=endpoint)
+    with caplog.at_level(logging.WARNING):
+        provider_mod._build_otlp_reader(_dest(endpoint, name="dest-x"), cfg)
+    hits = [r.getMessage() for r in caplog.records if "metrics only" in r.getMessage()]
+    assert len(hits) == 1, caplog.text
+    assert f"OTLP {signal} route" in hits[0]
+    assert "'dest-x'" in hits[0]
+    assert endpoint not in caplog.text
+    assert "super-secret" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://localhost:4318/v1/metrics",
+        "https://traces.example.test/v1/metrics",
+        "https://example.test/v1/metrics?route=/v1/traces",
+        "http://localhost:4318",
+        "not a url at all",
+    ],
+)
+def test_otlp_reader_does_not_warn_on_a_metrics_route(monkeypatch, caplog, endpoint):
+    """Host names and query strings mentioning traces are not a traces route."""
+    import logging
+
+    from kiro_crew.config.loader import TelemetryConfig
+    from kiro_crew.metrics import provider as provider_mod
+
+    monkeypatch.setattr(provider_mod, "_load_otel", lambda: False)
+    cfg = TelemetryConfig(enabled=True, otlp_endpoint=endpoint)
+    with caplog.at_level(logging.WARNING):
+        provider_mod._build_otlp_reader(_dest(endpoint), cfg)
+    assert "metrics only" not in caplog.text
+
+
 def test_otlp_constructor_failure_never_logs_endpoint(monkeypatch, caplog):
     """Constructor errors must not echo credential-bearing endpoint URLs."""
     import sys

@@ -110,6 +110,17 @@ keeps the draft dirty until the page unmounts, so a second ask was a second live
 confirm — one whose "keep my draft" cancelled a hand-off the first ask had
 already accepted. An ungated caller still asks through the navigator.
 
+A failed run is a hand-off source too, not only a failed request (#7403). An
+expanded `failure` or `timeout` row in a scheduled job's history (`LogEntry`)
+renders `AskAgentButton` with a report built by `utils/cronRunReport.prompt.ts`:
+job name and id, run id, trigger, start time, the row's summary, and the TAIL of
+the run's trace (scrubbed by `redactSecrets` before the cut, capped at
+`MAX_TRACE_TAIL`), so the agent receives the reason a run failed, which a run
+reports at the end. The job and run ids let the agent read more history itself.
+`cancelled` and `success` rows offer nothing. The hand-off goes to the ordinary
+chat with no per-job "debug agent" setting: the agent that opens is the one the
+user would otherwise paste the log into, and a history row holds no draft.
+
 ## Backend Error Classification
 
 `acp/transport_errors.py` (re-exported by `acp/client.py`) rewrites raw JSON-RPC

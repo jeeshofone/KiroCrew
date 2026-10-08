@@ -49,6 +49,20 @@ export const membersRosterQuery = {
   },
 }
 
+/** The user just sent `slot` a message: stamp `last_chat_ts` on the roster row
+ *  bound to that slot, so the Crewmates list and its reopen pick read the send
+ *  without waiting for a refetch, and mark the roster stale so the next read
+ *  picks up a send to a crew in a normal chat (whose row has no slot). The
+ *  server records the same send (`crew_recency`); this is its local echo. */
+export function noteUserChat(queryClient: QueryClient, slot: string | undefined, nowTs = Date.now() / 1000): void {
+  if (slot) {
+    queryClient.setQueryData<MemberRosterRow[]>(MEMBERS_ROSTER_QUERY_KEY, (rows) =>
+      rows?.map((r) => (r.slot_key === slot ? { ...r, last_chat_ts: Math.max(nowTs, r.last_chat_ts ?? 0) } : r)),
+    )
+  }
+  void queryClient.invalidateQueries({ queryKey: MEMBERS_ROSTER_QUERY_KEY, refetchType: 'none' })
+}
+
 /** Recent-activity pointers for one member's drawer. Keyed by the exact
  *  member NAME as well as the slug — slugs are lossy, and the backend's
  *  member filter exists precisely so two names sharing a slug keep distinct

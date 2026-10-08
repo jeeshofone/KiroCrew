@@ -318,8 +318,23 @@ def schemas() -> list[dict[str, Any]]:
                     },
                     "tasks": {
                         "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Multiple tasks to run in parallel",
+                        "items": {
+                            "type": ["string", "object"],
+                            "properties": {
+                                "task": {"type": "string"},
+                                "model": {"type": "string"},
+                                "reasoning_effort": {"type": "string"},
+                            },
+                            "required": ["task"],
+                            "additionalProperties": False,
+                        },
+                        "description": (
+                            "Multiple tasks to run in parallel as one wave. Each entry is a "
+                            "prompt string, or an object {task, model?, "
+                            "reasoning_effort?} whose fields override the call's batch-wide "
+                            "value for that task only, e.g. the same review prompt on two "
+                            "models, delivered together."
+                        ),
                     },
                     "agent": {
                         "type": "string",
@@ -669,7 +684,9 @@ def _is_unknown_agent_refusal(resp: Mapping[str, Any], agent: str) -> bool:
     )
 
 
-def _collapse_effort_verdicts(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+def _collapse_effort_verdicts(
+    pairs: list[tuple[str, tuple[str, str]]],
+) -> list[tuple[str, tuple[str, str]]]:
     """Group (subagent id, verdict text) pairs into (id list, verdict text) rows.
 
     ``reasoning_effort`` and ``model`` are batch-wide, so a wide fan-out
@@ -681,7 +698,7 @@ def _collapse_effort_verdicts(pairs: list[tuple[str, str]]) -> list[tuple[str, s
     preserve first-seen dispatch order, and ids keep their dispatch order
     within a group, so the collapsed output remains deterministic.
     """
-    grouped: dict[str, list[str]] = {}
+    grouped: dict[tuple[str, str], list[str]] = {}
     for sid, text in pairs:
         grouped.setdefault(text, []).append(sid)
     return [(", ".join(ids), text) for text, ids in grouped.items()]
@@ -693,11 +710,25 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
     tasks = args.get("tasks")
     task = args.get("task")
 
-    # Support both single task and batch tasks
+    # Support both single task and batch tasks. A ``tasks`` entry is a prompt
+    # string or an object carrying per-task overrides; both
+    # normalise to (prompt, overrides) here so the dispatch loop has one shape.
+    task_overrides: list[dict[str, str]] = []
     if tasks and isinstance(tasks, list):
-        task_list = [t for t in tasks if isinstance(t, str) and t.strip()]
+        task_list = []
+        for t in tasks:
+            if isinstance(t, dict):
+                prompt = t.get("task") or ""
+                if not prompt.strip():
+                    continue
+                task_list.append(prompt)
+                task_overrides.append({k: v for k, v in t.items() if k != "task" and v})
+            elif isinstance(t, str) and t.strip():
+                task_list.append(t)
+                task_overrides.append({})
     elif task:
         task_list = [task]
+        task_overrides = [{}]
     else:
         return "Error: task or tasks is required"
 
@@ -747,10 +778,10 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
     # (subagent id, reason) pairs from the server's effort verdict — the
     # gateway resolves the effective model (per-call value, else role pin,
     # else unpinned) and reports when the requested effort cannot apply.
-    effort_drops: list[tuple[str, str]] = []
+    effort_drops: list[tuple[str, tuple[str, str]]] = []
     # (subagent id, note) pairs for the delivery mirror: the resolved model and
     # the family settings key a requested effort is delivered under.
-    effort_applies: list[tuple[str, str]] = []
+    effort_applies: list[tuple[str, tuple[str, str]]] = []
     agent_tasks: list[str] = []
     # subagent id -> the gate's reason, for members the gateway accepted but
     # answered ``status: "queued"`` (deferred, not started).
@@ -802,7 +833,10 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
     # one invented name.
     refused_agents: dict[str, str] = {}
     for i, t in enumerate(task_list):
+        over = task_overrides[i]
         a = agents_list[i] if agents_list else agent
+        t_model = over.get("model") or model
+        t_effort = over.get("reasoning_effort") or reasoning_effort
         if a in refused_agents:
             # Short line on purpose: the full roster is already on the first
             # refusal above, and repeating it once per remaining member would
@@ -822,10 +856,10 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
             body["max_turns"] = max_turns
         if cwd:
             body["cwd"] = cwd
-        if model:
-            body["model"] = model
-        if reasoning_effort:
-            body["reasoning_effort"] = reasoning_effort
+        if t_model:
+            body["model"] = t_model
+        if t_effort:
+            body["reasoning_effort"] = t_effort
         if keep:
             body["keep"] = True
         if not inc_memory:
@@ -876,9 +910,9 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
                 d.get("reason_detail") or d.get("reason") or "deferred by the spawn gate"
             )
         if d.get("effort_dropped"):
-            effort_drops.append((str(d.get("id", "?")), str(d["effort_dropped"])))
+            effort_drops.append((str(d.get("id", "?")), (t_effort, str(d["effort_dropped"]))))
         if d.get("effort_applied"):
-            effort_applies.append((str(d.get("id", "?")), str(d["effort_applied"])))
+            effort_applies.append((str(d.get("id", "?")), (t_effort, str(d["effort_applied"]))))
 
     spawn_lines: list[str] = []
     # Server-computed effort verdicts (never a rejection — gated on agent_ids
@@ -889,13 +923,13 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
     # the default case where no per-call model was passed and the effort
     # would otherwise be dropped silently.
     if agent_ids:
-        for drop_ids, drop_reason in _collapse_effort_verdicts(effort_drops):
+        # A verdict is keyed by (effort, text): a tasks[] object may override
+        # the batch-wide level, so each line names the level its tasks asked for.
+        for drop_ids, (lvl, drop_reason) in _collapse_effort_verdicts(effort_drops):
+            spawn_lines.append(f"ℹ reasoning_effort='{lvl}' dropped for {drop_ids}: {drop_reason}")
+        for applied_ids, (lvl, applied_note) in _collapse_effort_verdicts(effort_applies):
             spawn_lines.append(
-                f"ℹ reasoning_effort='{reasoning_effort}' dropped for {drop_ids}: {drop_reason}"
-            )
-        for applied_ids, applied_note in _collapse_effort_verdicts(effort_applies):
-            spawn_lines.append(
-                f"✓ reasoning_effort='{reasoning_effort}' applied for {applied_ids} ({applied_note})"
+                f"✓ reasoning_effort='{lvl}' applied for {applied_ids} ({applied_note})"
             )
     if not parent_session and agent_ids:
         # Orphan alert: without a parent session key the subagents cannot

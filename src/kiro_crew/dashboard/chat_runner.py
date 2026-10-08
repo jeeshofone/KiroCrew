@@ -174,10 +174,12 @@ from kiro_crew.dashboard.chat_turn.directives import (  # noqa: F401
 from kiro_crew.dashboard.chat_turn.file_changes import (  # noqa: F401
     _PATH_TRUNCATION_MARKER,
     _apply_turn_snapshot_budget,
+    _classify_str_replace_before,
     _line_change_input,
     _note_reply_row,
-    _reconstruct_str_replace_before,
+    _pending_str_replace_payload,
     _record_turn_snapshot,
+    _resolve_pending_str_replace,
     _safe_read_snapshot,
     _Snapshot,
     _snapshot_write_target,
@@ -420,6 +422,7 @@ from kiro_crew.dashboard.turn_dispatch import (
     spawn_guarded_turn,
     tool_approval_timeout_secs,
 )
+from kiro_crew.dashboard.urls import is_loopback
 from kiro_crew.deny_guidance import (  # noqa: F401
     DENY_CLASS_AWS_CREDENTIAL,
     DENY_CLASS_SSO_CREDENTIAL,
@@ -1959,16 +1962,32 @@ def _cap_redacted(text: str, limit: int, marker: str) -> tuple[str, bool]:
 
 
 def _flush_file_changes(
-    slot: "_ChatSlot", turn_boundary: int = 0, turn_start_mid: str | None = None
+    slot: "_ChatSlot",
+    turn_boundary: int = 0,
+    turn_start_mid: str | None = None,
+    turn_had_shell: bool = False,
 ) -> None:
     """Attach accumulated file changes to this turn's last assistant message.
 
-    Dedups by path (first before, last after), reads the AFTER content from
-    disk, and writes the list to message meta as ``file_changes``. Files the
-    turn budget dropped are counted in ``file_changes_omitted_files``, a plain
-    int present only when it is non-zero. Called on
-    every exit path (success / cancel / error) so users always see what was
-    modified, even on aborted turns.
+    Dedups by canonical path (first before, last after), reads the AFTER content
+    from disk, and settles a ``pending_str_replace`` snapshot against that
+    turn-end after-content by content ALONE — only the pre-write hypothesis is
+    resolvable, so a settled before is always content captured from disk at
+    snapshot time, never a value synthesised from the turn-end state. A pending
+    snapshot is settled only when the turn-end state is attributable to a single
+    tracked write: ``_record_turn_snapshot`` drops the pending hypothesis when a
+    second (or unknown) WRITE TOOL touches the same canonical path, and
+    ``turn_had_shell`` drops ALL pending resolution for the turn when a shell
+    tool ran — a shell command is opaque, can write any path, and never passes
+    through ``_record_turn_snapshot``, so a post-write snapshot followed by a
+    shell edit could otherwise leave the resolver settling an intermediate state
+    as the before. Both cases fall back to the fragment rather than a wrong
+    before (see ``_resolve_pending_str_replace`` for the resolution rule and
+    ``_record_turn_snapshot`` for the write-tool gate). Writes the list
+    to message meta as ``file_changes``. Files the turn budget dropped are
+    counted in ``file_changes_omitted_files``, a plain int present only when it
+    is non-zero. Called on every exit path (success / cancel / error) so users
+    always see what was modified, even on aborted turns.
 
     Only rows appended by this turn are scanned (see ``_turn_rows`` for the
     two ways the turn's start is identified), so a turn that changed files but
@@ -1992,30 +2011,53 @@ def _flush_file_changes(
     # Dedup: keep first before for each path (truest "before") since a file
     # may be modified multiple times in one turn.
     deduped: dict[str, dict[str, Any]] = {}
+    pending_by_path: dict[str, dict[str, Any]] = {}
     for write_order, fc in enumerate(slot._file_changes):
         p = fc["path"]
-        if p not in deduped:
-            deduped[p] = {
+        # ``/tmp/f`` and ``/tmp/./f`` share one bucket: the key is the canonical
+        # path ``_snapshot_write_target`` computes off the event loop at snapshot
+        # time, so this loop resolves no path itself. One bucket keeps the first
+        # before for a file written under two spellings.
+        key = fc.get("canonical_path") or p
+        if key not in deduped:
+            deduped[key] = {
                 "path": p,
                 "before": fc["content"],
                 "after": "",
                 "_before_truncated": bool(fc.get("truncated", False)),
             }
+            if fc.get("pending_str_replace"):
+                pending_by_path[key] = fc["pending_str_replace"]
         # The accumulator moves a path's first snapshot to the tail on every
         # write, so its position carries last-write recency without extra rows.
         # Assigning on every occurrence also supports directly supplied repeats.
-        deduped[p]["_last_write"] = write_order
+        deduped[key]["_last_write"] = write_order
     # Read after-content once per path. Uses _safe_read_snapshot so sensitive
     # paths and unreadable files yield empty after rather than crashing or
     # leaking credentials.
-    for entry in deduped.values():
+    for key, entry in deduped.items():
+        before_truncated = entry.pop("_before_truncated")
         after = _safe_read_snapshot(entry["path"])
-        if after is None:
-            entry["after"] = ""
-            after = _Snapshot("", False)
-        else:
-            entry["after"] = after.content
-        if entry.pop("_before_truncated") or after.truncated:
+        entry["after"] = after.content if after is not None else ""
+        pending = pending_by_path.get(key)
+        # Resolve a deferred strReplace against the turn-end content. The
+        # resolver settles only the pre-write hypothesis, so a resolved before
+        # is always the content captured from disk at snapshot time. The
+        # pending payload is present here only when a single known write tool
+        # touched the path this turn — _record_turn_snapshot already dropped it
+        # if a second or unknown WRITE TOOL did. A shell tool is opaque and
+        # never recorded there, so a shell write after a post-write snapshot
+        # could shape the turn-end read into a false pre-write match: when a
+        # shell ran this turn (turn_had_shell), skip resolution entirely and
+        # keep the fragment rather than trust an unattributable turn-end state.
+        if pending is not None and after is not None and not turn_had_shell:
+            resolved = _resolve_pending_str_replace(pending, after.content)
+            if resolved is not None:
+                # Already _MAX_SNAPSHOT-capped by _pending_str_replace_payload;
+                # re-truncating would append a second marker.
+                entry["before"] = resolved.content
+                before_truncated = resolved.truncated
+        if before_truncated or (after is not None and after.truncated):
             entry.update(truncated=True, snapshot_limit_chars=_MAX_SNAPSHOT)
     # Scrub exfil URLs and credentials from path/before/after BEFORE attaching
     # to message meta. _save_slot_to_history runs _redact_meta on persist, but
@@ -2310,6 +2352,31 @@ def _emit_mcp_oauth_request(
             "error": "URL contained credential or exfiltration pattern",
             "remedy": "oauth_endpoints.json",
         }
+        if endpoint is not None and is_loopback(endpoint[0]):
+            # An authorize URL on this machine. The oauth_endpoints.json remedy
+            # cannot apply here: the file refuses loopback hosts, and the gate
+            # never relaxes http or an explicit port. In practice this is the
+            # MCP client's own OAuth fallback after a local, no-auth server
+            # failed one connect, so the advice is a retry. The guard verdict
+            # above is unchanged; only the advice differs. The failed banner
+            # renders meta["error"], so the advice must ride there.
+            rejected_host, rejected_path = endpoint
+            rejected_meta.pop("remedy")
+            loopback_advice = (
+                f"sign-in URL on this machine ({rejected_host}{rejected_path}) was "
+                "rejected. A local MCP server that needs no sign-in usually lands "
+                "here when its first connection attempt failed and the MCP client "
+                "fell back to OAuth. Check the server is running, then start a new "
+                "chat to reconnect."
+            )
+            rejected_meta["error"] = loopback_advice[0].upper() + loopback_advice[1:]
+            slot.append(
+                "mcp_oauth",
+                f"🚫 {label}: {loopback_advice}",
+                "msg msg-warn",
+                meta=rejected_meta,
+            )
+            return
         endpoint_detail = ""
         if endpoint is not None:
             rejected_host, rejected_path = endpoint
@@ -7878,6 +7945,7 @@ async def _persist_abnormal_turn_usage(
     elapsed_ms: int,
     stop_reason: str,
     since: object = _NO_PRIOR_STATS,
+    usage: TurnUsage | None = None,
 ) -> bool:
     """Write the usage row for a turn ending without ``EVENT_COMPLETE``.
 
@@ -7916,9 +7984,14 @@ async def _persist_abnormal_turn_usage(
     row has been written, so the caller marks the turn recorded and this stays
     once-per-turn across the seam's callers. Never raises -- these are
     best-effort analytics, as the complete path's own persist is.
+
+    ``usage`` is the turn's billing when the caller already read it (the Stop
+    footer shares the one read, because ``provider_last_turn_usage`` consumes
+    the accumulated total); ``None`` reads it here.
     """
     try:
-        usage = provider_last_turn_usage(client, since=since)
+        if usage is None:
+            usage = provider_last_turn_usage(client, since=since)
         if not usage_has_billing(usage):
             return False
         _provider_name = capabilities_of(client).provider_seam
@@ -8242,6 +8315,10 @@ async def _run_chat(
     # makes every emitter call a no-op.
     _crew_log_sid = ""
     _turn_msg_boundary = 0
+    # True once dispatch has captured this turn's message boundary. Before it,
+    # the boundary still reads 0 and would scope a footer write to the WHOLE
+    # window, so the stopped-turn footer is gated on it.
+    _turn_boundary_set = False
     # Identity of the window's tail row when the turn began ("" for an empty
     # window), so the file-change flush can find this turn's rows after a
     # front-trim moved every index. Re-captured at dispatch with the boundary.
@@ -8610,15 +8687,57 @@ async def _run_chat(
             return
         if slot._acp_client is None:
             return
+        _elapsed_ms = int((time.monotonic() - _turn_t0) * 1000)
+        # Read the turn's billing ONCE: ``provider_last_turn_usage`` consumes the
+        # accumulated multi-attempt total, so a second read for the footer would
+        # see only the last attempt. The row and the footer share this value.
+        _usage = provider_last_turn_usage(client, since=_turn_stats0)
+        if reason == STOP_REASON_CANCELLED and _turn_boundary_set:
+            # A Stop press is the one abnormal end the user caused on purpose,
+            # and the partial reply it leaves is a reply they read: give it the
+            # same footer a completed turn gets, so what the stopped turn cost
+            # is visible where the turn ended. A Stop before dispatch has no
+            # boundary yet, and attaching then would overwrite the previous
+            # turn's footer, so it writes only the usage row.
+            _attach_stopped_turn_stats(_usage, _elapsed_ms)
         if await _persist_abnormal_turn_usage(
             slot,
             client,
             session_key,
-            elapsed_ms=int((time.monotonic() - _turn_t0) * 1000),
+            elapsed_ms=_elapsed_ms,
             stop_reason=reason or _stop_reason or STOP_REASON_CANCELLED,
             since=_turn_stats0,
+            usage=_usage,
         ):
             _turn_usage_persisted = True
+
+    def _attach_stopped_turn_stats(usage: TurnUsage, elapsed_ms: int) -> None:
+        """Put ``meta.turn_stats`` on a stopped turn's last reply row.
+
+        Same writer and the same shape as a completed turn
+        (``_attach_turn_stats`` -> ``turn_stats_meta``), so the footer renders
+        exactly what it renders for a finished turn: elapsed always, credits or
+        cost only when the provider reported a non-zero figure. Scoped to this
+        turn's rows by ``_turn_msg_boundary``, which the caller only trusts once
+        dispatch has set it; a turn stopped before it wrote any reply row gets no
+        footer, because there is no row to carry one.
+
+        The row is mutated in place; it reaches disk because the turn's
+        ``finally`` runs ``_flush_file_changes``, which marks the slot dirty on
+        every exit. Best-effort: a failure never disturbs the cancel teardown or
+        the usage row.
+        """
+        try:
+            _attach_turn_stats(
+                slot,
+                elapsed_ms,
+                float(usage.credits or 0.0),
+                float(usage.cost_usd or 0.0),
+                turn_boundary=_turn_msg_boundary,
+                model=read_turn_model(client) or "",
+            )
+        except Exception:
+            logger.debug("Failed to attach stopped-turn stats for slot %s", slot.key, exc_info=True)
 
     def _flush_text_stream() -> None:
         """Emit the redactor's withheld tail as a final chat_chunk before a
@@ -11417,6 +11536,7 @@ async def _run_chat(
         _turn_cost_usd = 0.0
         _turn_model = ""
         _turn_msg_boundary = len(slot.messages)
+        _turn_boundary_set = True
         _turn_start_mid = row_mid(slot.messages[-1]) if slot.messages else ""
         # The crew log ordinal is the ABSOLUTE durable position, not the window
         # length. `slot.messages` is front-trimmed at `_MAX_SLOT_MESSAGES`, so past
@@ -11922,7 +12042,11 @@ async def _run_chat(
                     diff_path=event.diff_path,
                 )
                 if _file_snapshot:
-                    _record_turn_snapshot(slot, _file_snapshot)
+                    _record_turn_snapshot(
+                        slot,
+                        _file_snapshot,
+                        _tcid_identity_key(getattr(event, "tool_call_id", None)),
+                    )
                 state.broadcast_ws(
                     "tool_call",
                     _tool_payload,
@@ -12143,7 +12267,11 @@ async def _run_chat(
                         diff_path=event.diff_path,
                     )
                     if _file_snapshot_upd:
-                        _record_turn_snapshot(slot, _file_snapshot_upd)
+                        _record_turn_snapshot(
+                            slot,
+                            _file_snapshot_upd,
+                            _tcid_identity_key(getattr(event, "tool_call_id", None)),
+                        )
                     # Refresh the toolLog entry (sseToolActivity merges by id).
                     state.broadcast_ws(
                         "tool_call",
@@ -16716,7 +16844,10 @@ async def _run_chat(
                 slot._carried_ttft_clock = None
             # Attach accumulated file changes to this turn's assistant row before persist
             _flush_file_changes(
-                slot, turn_boundary=_turn_msg_boundary, turn_start_mid=_turn_start_mid
+                slot,
+                turn_boundary=_turn_msg_boundary,
+                turn_start_mid=_turn_start_mid,
+                turn_had_shell=bool(_shell_tool_calls),
             )
             # The reply is in the window, so this save is the durable clear of
             # the in-flight marker: retire it first and the omission rides the
@@ -18782,7 +18913,10 @@ async def _run_chat(
         # bug this fix prevents.
         try:
             _flush_file_changes(
-                slot, turn_boundary=_turn_msg_boundary, turn_start_mid=_turn_start_mid
+                slot,
+                turn_boundary=_turn_msg_boundary,
+                turn_start_mid=_turn_start_mid,
+                turn_had_shell=bool(_shell_tool_calls),
             )
         except Exception:
             logger.debug("_flush_file_changes failed", exc_info=True)

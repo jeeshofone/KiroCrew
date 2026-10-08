@@ -37,7 +37,7 @@ function themeConsentSha(colorTheme?: string): string | null {
   return stored
 }
 
-export function createChatEndpoints({ post, put, del, patch, j, sessionKeyHeader: _sk, sendResponseAuthRecovery }: ClientTransport) {
+export function createChatEndpoints({ post, put, del, patch, j, jfetch: fetch, sessionKeyHeader: _sk, sendResponseAuthRecovery }: ClientTransport) {
   const summaries = {
     /** Intent summary for the chat summary panel.
      *

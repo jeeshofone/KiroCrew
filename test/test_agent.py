@@ -1139,9 +1139,15 @@ class TestInstallAgent:
 
 
 class TestAtomicJsonWrite:
-    """Test 1.3: _atomic_json_write preserves permissions and handles new files."""
+    """_atomic_json_write is owner-only on POSIX and handles new files.
 
-    def test_preserves_existing_permissions(self, tmp_path: Path):
+    Agent specs carry the vault's projected secrets (a pre-registered
+    ``oauth.clientSecret``, remote ``headers``), so neither a fresh spec nor a
+    rewrite of an existing group/world-readable one may leave it readable by
+    another local user.
+    """
+
+    def test_existing_file_keeps_owner_bits_and_drops_group_other(self, tmp_path: Path):
         from kiro_crew.agent import _atomic_json_write
 
         target = tmp_path / "test.json"
@@ -1156,10 +1162,24 @@ class TestAtomicJsonWrite:
         if sys.platform != "win32":
             # Windows has no POSIX mode bits; the content contract below is
             # what this writer guarantees there.
-            assert stat.S_IMODE(target.stat().st_mode) == 0o664
+            assert stat.S_IMODE(target.stat().st_mode) == 0o600
         assert json.loads(target.read_text(encoding="utf-8")) == {"key": "value"}
 
-    def test_new_file_gets_0o644(self, tmp_path: Path):
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+    def test_existing_owner_only_mode_is_preserved(self, tmp_path: Path):
+        from kiro_crew.agent import _atomic_json_write
+
+        target = tmp_path / "test.json"
+        target.write_text("{}")
+        target.chmod(0o700)
+
+        _atomic_json_write(target, {"key": "value"})
+
+        import stat
+
+        assert stat.S_IMODE(target.stat().st_mode) == 0o700
+
+    def test_new_file_is_owner_only(self, tmp_path: Path):
         from kiro_crew.agent import _atomic_json_write
 
         target = tmp_path / "new.json"
@@ -1168,8 +1188,32 @@ class TestAtomicJsonWrite:
         import stat
 
         if sys.platform != "win32":
-            assert stat.S_IMODE(target.stat().st_mode) == 0o644
+            assert stat.S_IMODE(target.stat().st_mode) == 0o600
         assert json.loads(target.read_text(encoding="utf-8")) == {"new": True}
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+    def test_a_projected_client_secret_is_not_world_readable(self, tmp_path: Path):
+        """A default spec already on disk at 0o644 is
+        rewritten with a pre-registered client secret projected into it."""
+        from kiro_crew.agent import _atomic_json_write
+
+        target = tmp_path / "kirocrew.json"
+        target.write_text("{}")
+        target.chmod(0o644)
+        spec = {
+            "mcpServers": {
+                "github": {
+                    "url": "https://api.githubcopilot.com/mcp/",
+                    "oauth": {"clientId": "cid", "clientSecret": "s3cret"},
+                }
+            }
+        }
+
+        _atomic_json_write(target, spec)
+
+        import stat
+
+        assert stat.S_IMODE(target.stat().st_mode) & 0o077 == 0
 
     def test_a_contended_rename_is_retried_on_windows(self, tmp_path: Path, monkeypatch):
         """The rename this writer ends on is the one Windows can refuse.

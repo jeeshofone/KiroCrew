@@ -18,7 +18,6 @@ if TYPE_CHECKING:
         PROVIDER_LABEL_DEFAULT,
         Any,
         SubagentInfo,
-        _cleanup_session_files_sync,
         _redact,
         _subagents_dir,
         agent_dir_for_display,
@@ -1122,12 +1121,18 @@ class ContinuationCoordinator(ManagerComponent):
         except Exception:
             logger.debug("follow_up audit failed", exc_info=True)
 
-    def release_conversation_impl(self, conv_id: str) -> tuple[bool, str]:
-        """Release conversation *conv_id*: forget the sid and delete files.
+    def _release_prefix(self, conv_id: str) -> Any:
+        """The on-loop half of a release, shared by both entry points.
 
-        Refuses (``conversation_busy``) while a run is in flight. Returns
-        ``(ok, detail)``.
+        Returns ``(False, detail)`` when the release is refused, otherwise
+        ``(sid, provider_label, original)`` after the ``SessionMap`` and TTL
+        registry have forgotten the conversation. No await happens inside it, so
+        the busy check and ``forget_conversation`` commit together, BEFORE the disk
+        demote (the ``SessionMap`` must only be touched on the loop).
         """
+        # Not an ``_impl``, so it keeps this module's globals: import here.
+        from ..subagent import PROVIDER_LABEL_DEFAULT
+
         conv_key = f"subagent:{conv_id}"
         busy = self._manager._conversation_busy(conv_key)
         if busy is not None:
@@ -1142,36 +1147,122 @@ class ContinuationCoordinator(ManagerComponent):
         )
         sid = self._manager._sessions.forget_conversation(conv_key)
         self._manager._conversations.pop(conv_key, None)
-        # Demote the persisted source of truth too: with the disk
-        # fallback in place, a stale keep=True would re-warm the continuable
-        # cache after release and resurrect the conversation on the next
-        # restart's registry rebuild.
-        try:
-            update_state(conv_id, keep=False)
-        except Exception:
-            logger.debug("release: failed to demote state for %s", conv_id, exc_info=True)
         original = self._manager._agents.get(conv_id)
         if original is None:
             original = next(
                 (info for info in self._manager._report_owners.values() if info.id == conv_id),
                 None,
             )
+        return sid or "", provider_label, original
+
+    def _release_forget_live_state(self, conv_id: str, original: SubagentInfo | None) -> None:
+        # After the demote, never before: while a live-state entry exists
+        # ``update_state`` writes into it, so forgetting it first would send the
+        # demote to disk instead.
         if original is not None:
             self._manager._run_events._forget_finished_live_state(original)
         else:
             self._persistence.forget_live_run_state(conv_id)
+
+    @staticmethod
+    def _release_disk_sync(conv_id: str, sid: str, provider_label: str) -> None:
+        """The disk half of a release: demote ``keep``, then delete session files.
+
+        Demoting the persisted source of truth matters: with the disk fallback in
+        place, a stale ``keep=True`` would re-warm the continuable cache after
+        release and resurrect the conversation on the next restart's registry
+        rebuild. Each step is best-effort. On a worker thread (the event-loop
+        entry, :meth:`release_conversation_async_impl`) ``update_state`` takes the
+        per-agent state lock like every other pool writer.
+        """
+        # Not an ``_impl``, so it keeps this module's globals: import at call
+        # time, which also keeps ``patch.object(subagent, ...)`` effective.
+        from ..subagent import _cleanup_session_files_sync, logger, update_state
+
+        try:
+            update_state(conv_id, keep=False)
+        except Exception:
+            logger.debug("release: failed to demote state for %s", conv_id, exc_info=True)
         if not sid:
-            return False, "conversation_gone: nothing to release"
+            return
         try:
             _cleanup_session_files_sync(sid, provider_label)
         except Exception:
             logger.debug("release_conversation: file cleanup failed", exc_info=True)
+
+    def release_conversation_impl(self, conv_id: str) -> tuple[bool, str]:
+        """Release conversation *conv_id*: forget the sid and delete files.
+
+        Refuses (``conversation_busy``) while a run is in flight. Returns
+        ``(ok, detail)``. Runs its disk I/O on the CALLING thread, so event-loop
+        callers use :meth:`release_conversation_async_impl` instead.
+        """
+        prefix = self._release_prefix(conv_id)
+        if prefix[0] is False:
+            return prefix
+        sid, provider_label, original = prefix
+        self._release_disk_sync(conv_id, sid, provider_label)
+        self._release_forget_live_state(conv_id, original)
+        if not sid:
+            return False, "conversation_gone: nothing to release"
         return True, "released"
 
-    def _sweep_conversations_impl(self, now: float) -> None:
-        """Reaper hook: expire continuable conversations idle past TTL."""
-        for conv_key, last_used in list(self._manager._conversations.items()):
-            if now - last_used < _CONVERSATION_TTL_SECS:
+    async def release_conversation_async_impl(self, conv_id: str) -> tuple[bool, str]:
+        """:meth:`release_conversation_impl` for event-loop callers.
+
+        The on-loop half (:meth:`_release_prefix`) runs first; the ``keep``
+        demote and the session-file unlink loop then run on a worker thread.
+
+        The conversation is HELD until that worker lands, through the same
+        ``_abandoned_state_writers`` record a run's detached writers use: while it
+        is held, ``_conversation_busy`` answers ``conversation_busy`` (retryable).
+        Without the hold a continuation arriving mid-release would re-seed the sid
+        from ``state.json`` (still ``keep=True``), promote it, and then have its
+        session files deleted under it. The worker is shielded, so cancelling the
+        caller (an aiohttp client disconnect, reaper shutdown) neither stops nor
+        un-holds it: the release already committed on the loop, it finishes, and
+        the worker's own done-callback releases the hold.
+        """
+        prefix = self._release_prefix(conv_id)
+        if prefix[0] is False:
+            return prefix
+        sid, provider_label, original = prefix
+        worker: asyncio.Future[Any] = asyncio.ensure_future(
+            asyncio.to_thread(self._release_disk_sync, conv_id, sid, provider_label)
+        )
+        self._manager._abandoned_state_writers.setdefault(conv_id, set()).add(worker)
+
+        def _settled(fut: "asyncio.Future[Any]", _mgr: Any = self._manager) -> None:
+            writers = _mgr._abandoned_state_writers.get(conv_id)
+            if writers is not None:
+                writers.discard(fut)
+                if not writers:
+                    del _mgr._abandoned_state_writers[conv_id]
+            self._release_forget_live_state(conv_id, original)
+            # Retrieve it so a failure never surfaces as "exception was never
+            # retrieved"; the disk half already logs its own best-effort misses.
+            if not fut.cancelled() and fut.exception() is not None:
+                logger.debug("release: disk half failed for %s: %r", conv_id, fut.exception())
+
+        worker.add_done_callback(_settled)
+        await asyncio.shield(worker)
+        if not sid:
+            return False, "conversation_gone: nothing to release"
+        return True, "released"
+
+    async def _sweep_conversations_async_impl(self, now: float) -> None:
+        """Reaper hook: expire continuable conversations idle past TTL.
+
+        Each expired conversation is released through
+        :meth:`release_conversation_async_impl`, so its disk I/O is off-loop.
+
+        Every release awaits, and a conversation can be continued or released
+        while it does, so each entry's timestamp is re-read from the live
+        registry right before its expiry check rather than taken from a snapshot.
+        """
+        for conv_key in list(self._manager._conversations):
+            last_used = self._manager._conversations.get(conv_key)
+            if last_used is None or now - last_used < _CONVERSATION_TTL_SECS:
                 continue
             if self._manager._conversation_busy(conv_key) is not None:
                 self._manager._conversations[conv_key] = now  # active — refresh
@@ -1181,7 +1272,7 @@ class ContinuationCoordinator(ManagerComponent):
                 logger.warning("Dropping malformed conversation registry key %r", conv_key)
                 self._manager._conversations.pop(conv_key, None)
                 continue
-            _ok, detail = self._manager.release_conversation(conv_id)
+            _ok, detail = await self._manager.release_conversation_async(conv_id)
             logger.info(
                 "Conversation %s expired after %ds idle: %s",
                 conv_id,

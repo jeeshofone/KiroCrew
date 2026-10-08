@@ -322,7 +322,7 @@ async def api_spawn_release(request: web.Request) -> web.Response:
             status=503,
         )
     conv_id = request.match_info["agent_id"]
-    ok, detail = state.subagents.release_conversation(conv_id)
+    ok, detail = await state.subagents.release_conversation_async(conv_id)
     if not ok:
         if detail.startswith("conversation_busy"):
             return web.json_response({"error": detail, "code": "conversation_busy"}, status=409)

@@ -159,7 +159,7 @@ export interface AcpBackendProbe {
   }
 }
 
-export function createConfigEndpoints({ post, put, j }: ClientTransport) {
+export function createConfigEndpoints({ post, put, j, jfetch: fetch }: ClientTransport) {
   const settings = {
     // Agent config
     agentConfig: () => fetch('/api/agent/config').then(j),

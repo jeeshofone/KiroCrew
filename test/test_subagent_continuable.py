@@ -1919,34 +1919,37 @@ class TestReleaseAndSweep:
         ok, detail = manager.release_conversation("c1")
         assert not ok and detail.startswith("conversation_gone")
 
-    def test_sweep_expires_only_idle_past_ttl(self) -> None:
+    @pytest.mark.asyncio
+    async def test_sweep_expires_only_idle_past_ttl(self) -> None:
         sessions = _mock_sessions()
         manager = _manager(sessions)
         now = time.time()
         manager._conversations["subagent:old1"] = now - 7 * 3600  # expired
         manager._conversations["subagent:new1"] = now - 60  # fresh
         with patch("kiro_crew.subagent._cleanup_session_files_sync"):
-            manager._sweep_conversations(now)
+            await manager._sweep_conversations_async(now)
         assert "subagent:old1" not in manager._conversations
         assert "subagent:new1" in manager._conversations
 
-    def test_sweep_drops_malformed_registry_key(self) -> None:
+    @pytest.mark.asyncio
+    async def test_sweep_drops_malformed_registry_key(self) -> None:
         manager = _manager()
         now = time.time()
         manager._conversations["malformed"] = now - 7 * 3600
-        with patch.object(manager, "release_conversation") as release:
-            manager._sweep_conversations(now)
+        with patch.object(manager, "release_conversation_async", AsyncMock()) as release:
+            await manager._sweep_conversations_async(now)
         assert "malformed" not in manager._conversations
         release.assert_not_called()
 
-    def test_sweep_refreshes_busy_conversation(self) -> None:
+    @pytest.mark.asyncio
+    async def test_sweep_refreshes_busy_conversation(self) -> None:
         sessions = _mock_sessions()
         manager = _manager(sessions)
         now = time.time()
         manager._conversations["subagent:busy1"] = now - 7 * 3600
         live = SubagentInfo(id="busy1", task="t")  # not done
         manager._agents["busy1"] = live
-        manager._sweep_conversations(now)
+        await manager._sweep_conversations_async(now)
         assert manager._conversations["subagent:busy1"] == now  # refreshed
 
 

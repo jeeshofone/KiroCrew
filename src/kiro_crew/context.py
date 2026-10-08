@@ -145,6 +145,7 @@ from kiro_crew.context_assembly.markers import (  # noqa: F401
 from kiro_crew.context_assembly.member import (  # noqa: F401
     _MEMBER_BRIEFING_ITEM,
     _MEMBER_BRIEFING_ITEM_UNAVAILABLE,
+    _MEMBER_DASHBOARD_ITEM,
     _MEMBER_HOW_YOU_WORK,
     _MEMBER_HOW_YOU_WORK_COMMON,
     _fit_folder_steering_into_envelope,
@@ -808,6 +809,23 @@ def _member_backend_can_dispatch(cfg: "KiroCrewConfig | None" = None) -> bool:
     except Exception:
         logger.debug("member backend capability check failed", exc_info=True)
         return False
+
+
+def _member_dispatch_held(mounted: bool | None, cfg: "KiroCrewConfig | None" = None) -> bool:
+    """Whether this member session actually holds the ``session_*`` tools.
+
+    *mounted* is the live session's own answer (``member_dispatch_mounted`` on
+    the context provider), recorded by the composer that built its MCP array. It
+    wins whenever it exists: the configured backend can be dispatch-capable while
+    THIS session withheld the mount (the dashboard server switched off, a
+    per-tool restriction on a withhold-only backend, a permission surface Crew
+    does not own, an unresolved entry), and teaching the block then would send
+    the member after tools it never received. ``None`` means no session evidence
+    reached the build, and only then does the configured capability decide.
+    """
+    if mounted is not None:
+        return mounted
+    return _member_backend_can_dispatch(cfg)
 
 
 # A fresh V1 prompt can query semantic, episodic, and lesson memory in order.
@@ -2527,6 +2545,7 @@ class ContextBuilder:
         execution_context: Any = None,
         steering_dirs: tuple[str, ...] = (),
         _v2_essentials: str | None = None,
+        member_dispatch_mounted: bool | None = None,
     ) -> str:
         """Build context for a new session (memory + skills + history).
 
@@ -2717,7 +2736,7 @@ class ContextBuilder:
         # deliberately silent there.
         effective_groups = _config_scoped_groups(context_groups, _cfg)
 
-        if mode == _member_mode and _member_backend_can_dispatch(_cfg):
+        if mode == _member_mode and _member_dispatch_held(member_dispatch_mounted, _cfg):
             append_required(_member.operating_mode_block(agent_label))
 
         # Legacy member-DM identity. Private V2 has already derived its owner
@@ -3190,8 +3209,12 @@ class ContextBuilder:
             blocks_reads or self._session_memory_modes.get(session_key or "") == "temporary"
         )
         native_documents: dict[str, str] = {}
+        # None = no session evidence; build_session_context then falls back to
+        # the configured member backend's capability.
+        member_dispatch_mounted: bool | None = None
         context_provider = context_provider_of(context_provider)
         if context_provider is not None:
+            member_dispatch_mounted = context_provider.member_dispatch_mounted
             candidate_delivery = context_provider.essential_delivery
             if isinstance(candidate_delivery, EssentialDelivery):
                 delivery = candidate_delivery
@@ -3360,6 +3383,7 @@ class ContextBuilder:
                     execution_context=execution_context,
                     steering_dirs=steering_dirs,
                     _v2_essentials=_essentials,
+                    member_dispatch_mounted=member_dispatch_mounted,
                 )
             if session_ctx:
                 # Scrub forgeable boundary markers from the UNTRUSTED content in

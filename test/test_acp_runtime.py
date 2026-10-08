@@ -6509,6 +6509,39 @@ class TestRuntimeMemberDispatchDisabled:
         names = [e["name"] for e in params["mcpServers"]]
         assert (server in names) is (not disabled), names
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("member", "disabled"), [(True, True), (True, False), (False, False)])
+    async def test_the_handle_records_the_mount(self, monkeypatch, tmp_path, member, disabled):
+        """The context builder teaches the session_* tools off this flag, so it
+        must carry exactly the answer the array got -- withheld, mounted, or a
+        non-member session that never had the entry."""
+        self._switch_off(monkeypatch, tmp_path, disabled=disabled)
+        rt, _, _ = _make_runtime()
+
+        async def _fake_send(method, params, timeout=None):
+            if method == METHOD_SESSION_NEW:
+                return {"sessionId": "sid-new", "modes": {"currentModeId": "kirocrew"}}
+            return {}
+
+        monkeypatch.setattr(rt, "_send_and_await", _fake_send)
+        handle = await rt.create_session(
+            cwd="/work",
+            agent="kirocrew",
+            member_session_key=self.MEMBER_KEY if member else "",
+        )
+        assert handle.member_dispatch_mounted is (member and not disabled)
+
+    def test_the_resume_path_records_the_mount_on_its_handle(self):
+        """The load half, pinned on its source for the reason the grant pin below gives:
+        driving a resume needs the re-attach bracket this fake transport does not answer."""
+        import inspect
+
+        from kiro_crew.acp.runtime import AcpRuntime
+
+        source = inspect.getsource(AcpRuntime.load_session)
+        assert "member_mounted = member_entry is not None" in source
+        assert "handle.member_dispatch_mounted = member_mounted" in source
+
     def test_the_scope_comes_from_the_one_decider(self):
         """The switch-off has to be read where this host resolves its agent.
 

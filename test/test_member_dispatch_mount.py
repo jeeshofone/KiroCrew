@@ -403,6 +403,34 @@ class TestClaudeMemberAppend:
     def _run(self, stub) -> list[dict]:
         return AcpClient._append_member_dispatch_server(stub, _base_servers())
 
+    @pytest.mark.parametrize(
+        ("tweak", "mounted"),
+        [
+            ({}, True),
+            ({"_session_key": "dashboard_abc123"}, False),
+            ({"_claude_settings_authored": False}, False),
+            ({"backend": ACP_BACKEND_KIRO}, False),
+        ],
+    )
+    def test_the_outcome_is_recorded_for_the_context_builder(self, tweak, mounted):
+        """The operating-mode block reads this, so it must match the array."""
+        stub = _ClientStub()
+        stub._member_dispatch_mounted = None
+        for name, value in tweak.items():
+            setattr(stub, name, value)
+        out = self._run(stub)
+        assert stub._member_dispatch_mounted is mounted
+        assert (out[-1]["name"] == MEMBER_DISPATCH_SERVER) is mounted
+
+    def test_an_unresolved_entry_records_not_mounted(self, monkeypatch):
+        import kiro_crew.members as members_mod
+
+        monkeypatch.setattr(members_mod, "member_dispatch_session_server", lambda *_a: None)
+        stub = _ClientStub()
+        stub._member_dispatch_mounted = True
+        assert self._run(stub) == _base_servers()
+        assert stub._member_dispatch_mounted is False
+
     def test_member_session_gains_the_entry(self):
         out = self._run(_ClientStub())
         assert [e["name"] for e in out][-1] == MEMBER_DISPATCH_SERVER

@@ -191,7 +191,7 @@ _BASE_NAMES = frozenset("""
         _prewarm_allowance _probe_fallback_restore_for_slot
         _probe_fallback_restore_for_slot_locked _prompt_read_within_root
         _publish_session_mcp_report _queue_entry_is_orchestration
-        _read_and_tighten_turn_execution _recipient_principal _reconstruct_str_replace_before
+        _read_and_tighten_turn_execution _recipient_principal _classify_str_replace_before
         _record_session_mcp_event _record_turn_snapshot _recover_app_agent_binding
         _recovery_delay _redact_acp_string _redact_display_text _redact_for_display
         _redact_meta_for_role _redact_segment _redact_segment_text _redact_tool_field
@@ -310,20 +310,30 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "(entries: 'list[dict[str, Any]]') -> 'tuple[list[dict[str, Any]], int, int]'",
         ),
         (
+            "_classify_str_replace_before",
+            "function",
+            "(path: 'str', raw_params: 'dict') -> 'tuple[str | None, str | None]'",
+        ),
+        (
             "_line_change_input",
             "function",
             "(fc: 'dict[str, Any]', after: '_Snapshot | None') -> 'dict[str, str] | None'",
         ),
         ("_note_reply_row", "function", "(slot: \"'_ChatSlot'\", row: 'dict[str, Any]') -> 'None'"),
         (
-            "_reconstruct_str_replace_before",
+            "_pending_str_replace_payload",
             "function",
-            "(path: 'str', raw_params: 'dict') -> 'str | None'",
+            "(content: 'str', old_str: 'str', new_str: 'str') -> 'dict[str, _Snapshot]'",
         ),
         (
             "_record_turn_snapshot",
             "function",
-            "(slot: \"'_ChatSlot'\", snapshot: 'dict[str, Any]') -> 'None'",
+            "(slot: \"'_ChatSlot'\", snapshot: 'dict[str, Any]', writer_key: 'str' = '') -> 'None'",
+        ),
+        (
+            "_resolve_pending_str_replace",
+            "function",
+            "(pending: 'dict[str, Any]', after: 'str') -> '_Snapshot | None'",
         ),
         ("_safe_read_snapshot", "function", "(path: 'str') -> '_Snapshot | None'"),
         (

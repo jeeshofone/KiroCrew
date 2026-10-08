@@ -41,7 +41,7 @@ export interface LeakedRuntimesReclaim {
   refused: { pid: number; reason: string }[]
 }
 
-export function createSystemEndpoints({ get, post, j }: ClientTransport) {
+export function createSystemEndpoints({ get, post, j, jfetch: fetch }: ClientTransport) {
   const statusAndStorage = {
     status: () => fetch('/api/status').then(j),
     tunnelStatus: () => fetch('/api/tunnel/status').then(j) as Promise<TunnelStatus>,

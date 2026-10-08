@@ -158,6 +158,7 @@ OWNERS: dict[str, tuple[str, ...]] = {
     # merge-mode driver, and the notification copy whose docstring records the ruling
     # for platforms without O_NOFOLLOW.
     "kiro_crew.snapshot": (
+        "EXIT_INCOMPLETE",
         "RedactionFailed",
         "_DASHBOARD_PORT",
         "_audit",

@@ -101,9 +101,21 @@ const switchSlotFailureReport = (
   const raw = errMessage(error)
   const endpoint = chatSlotDetailPath(key)
   // Same key normalization `findReport` applies (the journal stores redacted
-  // messages), newest first.
+  // messages), newest first. Transport-rejection entries (`code` network /
+  // timeout) are skipped: those share the browser's one `Failed to fetch`
+  // message across every endpoint, so a journal match on one is not evidence it
+  // is THIS request's — the notice must record its own entry carrying the
+  // localized sentence as the message and the raw error in `detail`, exactly as
+  // the journal-less path below does. (A transport rejection is still available
+  // to the hand-off through the report pinned on the error, but that entry's
+  // message is the bare `Failed to fetch`, not the sentence the pane shows.)
   const needle = redactSecrets(raw).trim()
-  const found = needle ? recentErrors().find(r => r.endpoint === endpoint && r.message.trim() === needle) : undefined
+  const found = needle
+    ? recentErrors().find(r =>
+        r.endpoint === endpoint
+        && r.code !== 'network' && r.code !== 'timeout'
+        && r.message.trim() === needle)
+    : undefined
   if (found) return { report: found }
   const status = (error as { status?: unknown } | null)?.status
   const cls = (error as { name?: unknown } | null)?.name

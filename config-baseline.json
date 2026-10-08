@@ -7143,6 +7143,7 @@
         "avatar": "",
         "merge_queued_messages": false,
         "title_refresh_every_turns": 0,
+        "title_ticket_prefix": false,
         "mcp_probe_timeout_secs": 15,
         "loop_stall_exit_after_secs": null,
         "chat_entry_cache_max_entries": 4096,
@@ -7506,6 +7507,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 0
+    },
+    {
+      "path": "dashboard.title_ticket_prefix",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Lead Auto Titles With The Ticket Key",
+      "help": "When a session's opening message names a ticket, such as PROJ-1234 or #123, its auto-generated title starts with that key: \"PROJ-1234: Increase regression shards\". The first key in the opening message is used, and the title is unchanged when there is none. Names like SHA-256 or ISO-8601 have the same shape and are read as keys too, which is why this is off by default. A title you renamed by hand is never changed. Takes effect on the next title; no restart.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
     },
     {
       "path": "dashboard.mcp_probe_timeout_secs",

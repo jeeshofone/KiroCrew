@@ -20,6 +20,7 @@ import { threadLiveStore, type ThreadReplyFrame } from '../../state/threadLiveSt
 import { threadQueryKey, threadsQueryKey } from '../../api/threads'
 import { applyStatusDelta, parseStatusDelta } from '../../utils/pullRequestStatusDelta'
 import { slotChangeUrls } from '../../utils/pullRequestLinks'
+import { dashboardSessionKey, SESSION_CONTROL_STATUS_KEY } from '../useSessionControls'
 import type { ChatSlot, PullRequestStatusBatch } from '../../types'
 import { emitArtifactDeleted } from './browserEvents'
 import type { FrameData } from './frames'
@@ -242,6 +243,31 @@ export function handleMemberProjection(data: FrameData): void {
   }
 }
 
+/** The query key prefix every open Dashboard tab reads under. Slug-only, so a
+ *  frame carrying no crew name still reaches `['member-dashboard', slug, member]`
+ *  -- the refetch re-asks the server, which re-checks ownership. */
+export const MEMBER_DASHBOARD_QUERY_PREFIX = 'member-dashboard'
+
+/** A crewmate's dashboard moved, so an open tab must re-read it.
+ *
+ *  Two frames reach here and both mean the same thing to this tab. A
+ *  `dashboard_value_written` is the crewmate filling one of its own agentic
+ *  fields. A `member_projection` is a FOLD advancing, which is where every other
+ *  number on the page comes from. The tab's read sets no finite staleTime (the
+ *  client's default is freshness-by-push), so without this a dashboard opened at
+ *  the start of a long turn still shows the numbers it had then -- which is the
+ *  one thing a live project report must not do.
+ *
+ *  Invalidate rather than write a value in: the page is composed server-side with
+ *  its data island, its agentic marks and its stale band already decided, so there
+ *  is no client-side shape to patch. */
+export function handleDashboardMoved(queryClient: QueryClient, data: FrameData): void {
+  const slug = String(((data ?? {}) as { slug?: unknown }).slug || '')
+  if (slug) {
+    queryClient.invalidateQueries({ queryKey: [MEMBER_DASHBOARD_QUERY_PREFIX, slug] })
+  }
+}
+
 /** Sent once per connection before any member_projection frame: the server's
  *  authoritative lastSeq per slug. Truncate held rows that ran ahead of it (a
  *  torn tail rolled back after a restart). */
@@ -339,6 +365,22 @@ export function handleSourceStatus(dispatch: AppDispatch, queryClient: QueryClie
   // delta), so there is no feedback loop.
   queryClient.invalidateQueries({ queryKey: ['pull-request-source', delta.url] })
   queryClient.invalidateQueries({ queryKey: ['pull-request-checks', delta.url] })
+}
+
+/** A finished turn re-asks the session's app-contributed control statuses.
+ *  The agent most often changes what a chip reports during a turn, and the
+ *  probes otherwise re-ask only when a control's popover closes (#10909).
+ *  Only probes of THIS session match. The composer shows the active chat
+ *  only, so the ACTIVE slot refetches its mounted probes now; a background
+ *  slot's are just marked stale, to be re-asked when the user switches to it
+ *  (the same split `refreshPullRequestsAfterTurn` below makes). */
+export function refreshSessionControlStatusesAfterTurn(queryClient: QueryClient, slot: string, isActive: boolean): void {
+  const sessionKey = dashboardSessionKey(slot)
+  if (!sessionKey) return
+  void queryClient.invalidateQueries({
+    queryKey: [SESSION_CONTROL_STATUS_KEY, sessionKey],
+    refetchType: isActive ? 'active' : 'none',
+  })
 }
 
 /** Turn boundary: the finished turn is the likeliest moment for this

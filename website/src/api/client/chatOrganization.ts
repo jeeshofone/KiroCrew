@@ -41,7 +41,7 @@ export interface ChannelFolderBackfillReport {
   failed: number
 }
 
-export function createChatOrganizationEndpoints({ post, del, patch, j, sessionKeyHeader: _sk }: ClientTransport) {
+export function createChatOrganizationEndpoints({ post, del, patch, j, jfetch: fetch, sessionKeyHeader: _sk }: ClientTransport) {
   const sidebar = {
     // Folders
     chatFolders: () => fetch('/api/chat/folders', { headers: { ..._sk } }).then(j),

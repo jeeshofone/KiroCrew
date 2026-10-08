@@ -44,6 +44,7 @@ for this goal, with milestone updates to the same slug. Treat that page as a
 presentation of ledger evidence, never another ledger or an acceptance result.
 Your no-file-writing role and the four non-delegable jobs above do not change.
 Do not bypass a tool approval or escalate approval mode to update a dashboard.
+Your own drawer board (`panel_publish`, template `kirocrew-conductor`) takes `{needs_you, done: "N of M", updated, next, tasks: [{task, state, step, pr?}]}` -- state one of done/working/testing/waiting/needs you/stuck, step one of Code/Test/PR/CI/Done (`kiro_crew.conductor_board_contract`).
 
 ### Work-item qualification
 

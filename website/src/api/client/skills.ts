@@ -25,7 +25,7 @@ export interface SkillScriptValidation {
   report: Record<string, string[]>
 }
 
-export function createSkillsEndpoints({ get, post, put, del, j }: ClientTransport) {
+export function createSkillsEndpoints({ get, post, put, del, j, jfetch: fetch }: ClientTransport) {
   const library = {
     // Prompts (Agent SOPs)
     prompts: () => fetch('/api/prompts').then(j),

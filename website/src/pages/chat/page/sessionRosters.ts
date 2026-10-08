@@ -20,7 +20,12 @@ interface SessionRostersOptions {
  * "set as default" write.
  */
 export function useSessionRosters({ activeSlot, activeSlotProject, refreshTrigger, dispatch }: SessionRostersOptions) {
-  const { agents: installedAgents, choices: catalogChoices, defaultAgent } = useAgents(refreshTrigger, activeSlot ?? undefined, activeSlotProject)
+  const { agents: installedAgents, displayAgents, choices: catalogChoices, defaultAgent } = useAgents(refreshTrigger, activeSlot ?? undefined, activeSlotProject)
+  // What the chat sidebar tints its rows from: the last LOADED roster, so a
+  // session switch (which empties `installedAgents` until the new slot's fetch
+  // lands) does not flash every agent label to muted and back. Falls back to
+  // the scoped list for roster sources that expose only `agents`.
+  const sidebarAgents = displayAgents ?? installedAgents
   // The picker lists every catalog row (a member and a template of one name
   // are two rows). A roster source that exposes only the folded list -- one
   // row per name -- is still a complete, if namespace-blind, catalog.
@@ -43,7 +48,7 @@ export function useSessionRosters({ activeSlot, activeSlotProject, refreshTrigge
   const filteredAgents = filteredAgentsByName
   const effectiveModels = useAvailableModels()
   return {
-    installedAgents, defaultAgent, effectiveAgents,
+    installedAgents, sidebarAgents, defaultAgent, effectiveAgents,
     defaultAgentFailed, toggleDefaultAgent,
     agentDropdown, setAgentDropdown, agentFilter, setAgentFilter, agentDropdownRef, agentInputRef, filteredAgents,
     effectiveModels,

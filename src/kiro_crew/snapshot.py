@@ -975,6 +975,13 @@ def _build_snapshot(
     return outfile
 
 
+#: Exit status of `kirocrew snapshot --strict` when the bundle was written but omits
+#: entries it was asked to carry. Distinct from 1 (no usable bundle) so a caller can
+#: tell "written but incomplete" apart from "failed". Without `--strict` such a run
+#: still exits 0, because existing callers treat any non-zero exit as a failed backup.
+EXIT_INCOMPLETE = 3
+
+
 def snapshot_main(
     argv: list[str] | None = None, *, parsed: argparse.Namespace | None = None
 ) -> int:
@@ -999,6 +1006,14 @@ def snapshot_main(
         )
         p.add_argument("--components", default=None)
         p.add_argument("--purpose", default=Purpose.BACKUP.value)
+        p.add_argument(
+            "--strict",
+            action="store_true",
+            help=(
+                "Exit 3 instead of 0 when the bundle was written but omits entries it "
+                "was asked to carry (see MANIFEST.json 'skipped'). The bundle is kept."
+            ),
+        )
         p.add_argument("--to", default=None, help=argparse.SUPPRESS)
         parsed = p.parse_args(argv)
     args = parsed
@@ -1240,6 +1255,11 @@ def snapshot_main(
 
     remaining = len(list(out.glob("kirocrew-snapshot-*.tar.gz")))
     print(f"📦 Snapshots in {out}: {remaining} (keep={args.keep})")
+    # Opt-in only. The same predicate that held the prune decides the exit, so a caller
+    # never has to re-classify `skipped` reasons itself.
+    if omitted and getattr(args, "strict", False):
+        print(f"⚠️  --strict: exiting {EXIT_INCOMPLETE} because this bundle is incomplete.")
+        return EXIT_INCOMPLETE
     return 0
 
 

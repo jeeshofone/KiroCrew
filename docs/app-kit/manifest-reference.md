@@ -421,6 +421,11 @@ before any request rather than sanitized -- so a control with an invalid
 `statusPath` is simply never polled. Polling fails closed: an app that is down is
 not retried, and an unrecognized payload is treated as `none`.
 
+**When the status is re-asked.** Once when the chat opens, again when the user
+closes the control's popover, and again each time a turn in that chat finishes.
+A change the app makes between turns (a cron job, another session) shows on the
+next of those moments, not before: there is no polling interval.
+
 The route base follows how the app serves its backend, and the dashboard derives
 it -- an app declaring `backend.entryPoint` runs its own process and is
 reverse-proxied at `/apps/<app>/api/`, while one declaring only

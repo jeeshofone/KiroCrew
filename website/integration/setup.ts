@@ -524,9 +524,6 @@ export const STORAGE_CARRYOVER_FILES: ReadonlySet<string> = new Set([
   // describes read its leftover. Owner: the ChatSidebar test scope's follow-up to
   // #17195 (de-flake W2-08).
   'src/test/ChatSidebar.sourceLinkChip.test.tsx',
-  // "while RELEASED, a silent displacement is re-covered in place" fails alone.
-  // Owner: the frontend burn-down (de-flake F16, batch 3).
-  'src/test/useVirtualChat.coverageWatchdog.test.tsx',
 ])
 type PolyfilledStorage = Storage & { _m: Map<string, string> }
 beforeEach(({ onTestFinished }) => {

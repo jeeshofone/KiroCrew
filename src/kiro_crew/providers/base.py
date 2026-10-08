@@ -130,6 +130,16 @@ class LLMProvider(ABC):
         """Exact documents supplied at native startup, empty without evidence."""
         return {}
 
+    @property
+    def member_dispatch_mounted(self) -> bool | None:
+        """Whether this session holds the member session-control tools.
+
+        ``None`` means no evidence: the context builder then falls back to the
+        configured member backend's capability. A provider that composes a
+        session's MCP array answers True/False from that composition.
+        """
+        return None
+
     @abstractmethod
     async def start(self) -> None:
         """Initialize the provider (spawn process, create client, etc.)."""

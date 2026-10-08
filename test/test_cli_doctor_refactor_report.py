@@ -597,6 +597,12 @@ def test_a_broken_host_reports_every_issue_in_order_and_exits_one(host, capsys) 
     host.kiro = None
     host.which.update(node="/usr/bin/node")
     host.runs[("/usr/bin/node", "-v")] = _done("v18.19.0\n")
+    # The frozen report asserts the DEFAULT (nodejs.org / nvm) node remedy. Pin a
+    # modern glibc so node_too_old_message does not switch to the old-glibc branch
+    # on an AL2 (glibc 2.26) developer host and redden this byte-for-byte report.
+    from kiro_crew import constants as _constants
+
+    host.mp.setattr(_constants, "_host_glibc_version", lambda: (2, 35))
     venv_py = host.tmp / "pkg" / ".venv" / "bin" / "python3"
     venv_py.parent.mkdir(parents=True)
     venv_py.write_text("", encoding="utf-8")

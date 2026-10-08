@@ -1,5 +1,7 @@
 import { QueryClient, QueryObserver, skipToken } from '@tanstack/react-query'
 import {
+  MEMBERS_ROSTER_QUERY_KEY,
+  noteUserChat,
   forgetUnobservedMemberThreads,
   memberProjectionsQuery,
   memberProjectionsQueryKey,
@@ -136,5 +138,26 @@ describe('memberProjectionsQuery', () => {
 
     memberProjectionStore.apply('fresh', 'roster', { name: 'Fresh' }, 1)
     expect(memberProjectionStore.get('fresh', 'roster')).toEqual({ name: 'Fresh' })
+  })
+})
+
+describe('noteUserChat', () => {
+  it('stamps last_chat_ts on the row bound to the slot and marks the roster stale', () => {
+    const qc = new QueryClient()
+    qc.setQueryData(MEMBERS_ROSTER_QUERY_KEY, [
+      { name: 'a', slug: 'a', slot_key: 'member-a', last_chat_ts: 0 },
+      { name: 'b', slug: 'b', slot_key: 'member-b', last_chat_ts: 50 },
+    ])
+    noteUserChat(qc, 'member-a', 1000)
+    const rows = qc.getQueryData<{ name: string; last_chat_ts?: number }[]>(MEMBERS_ROSTER_QUERY_KEY)!
+    expect(rows.map((r) => [r.name, r.last_chat_ts])).toEqual([['a', 1000], ['b', 50]])
+    expect(qc.getQueryState(MEMBERS_ROSTER_QUERY_KEY)?.isInvalidated).toBe(true)
+  })
+  it('a send to a slot no row holds (a normal chat) only marks the roster stale', () => {
+    const qc = new QueryClient()
+    qc.setQueryData(MEMBERS_ROSTER_QUERY_KEY, [{ name: 'a', slug: 'a', slot_key: 'member-a', last_chat_ts: 0 }])
+    noteUserChat(qc, 'chat-1', 1000)
+    expect(qc.getQueryData<{ last_chat_ts?: number }[]>(MEMBERS_ROSTER_QUERY_KEY)![0].last_chat_ts).toBe(0)
+    expect(qc.getQueryState(MEMBERS_ROSTER_QUERY_KEY)?.isInvalidated).toBe(true)
   })
 })

@@ -137,7 +137,7 @@ export function crewPeerUrl(instanceId: string, path: string): string {
   return '/api/instances/' + encodeURIComponent(instanceId) + '/proxy/' + path
 }
 
-export function createInstancesEndpoints({ get, post, del, patch, j, jInstancesDisabled, sessionKeyHeader: _sk }: ClientTransport) {
+export function createInstancesEndpoints({ get, post, del, patch, j, jfetch: fetch, jInstancesDisabled, sessionKeyHeader: _sk }: ClientTransport) {
   const registryAndTransfer = {
     // Instances (multi-instance management) — owner-only, gated by instances.enabled.
     // listInstances throws ApiError(403) when the feature is disabled; callers

@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 
+from kiro_crew import crew_recency
 from kiro_crew import members as members_mod
 from kiro_crew import model_registry
 from kiro_crew.acp.client import AcpModelUnavailable
@@ -1124,6 +1125,13 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         return web.json_response(
             {"error": "message is required", "code": "message_required"}, status=400
         )
+
+    if not request_app and not cron_creator:
+        # The person typed this (no app token, no cron attestation; a peer's
+        # `relay=1` was refused above): the one signal the Crewmates list orders
+        # and filters by (crew_recency). An empty slot agent is the default crew,
+        # recorded under "" and resolved by the roster read. Best-effort, off-loop.
+        await asyncio.to_thread(crew_recency.record_user_chat, slot.agent or "")
 
     if slot.turn_running or slot._turn_admission_reserved:
         # Mid-turn steer: inject into the RUNNING turn instead of queueing for

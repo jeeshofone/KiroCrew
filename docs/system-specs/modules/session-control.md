@@ -667,7 +667,7 @@ that is out of bounds is visible after the fact even though nothing happened.
 | Caller session cannot be identified | 403 | An unidentifiable caller makes the self-target guard blind |
 | Caller is an unattended session (`workflow-*`) | 403 | A `workflow-<run_id>` slot exists only once its originating tab is gone, so there is no owning session to fence it to. **Exception:** a cron slot (`cron-*` caller key) is admitted and fenced by creator ownership instead — see "Cron callers" below |
 | Caller is itself incognito, temporary, or app-scoped | 403 | Caller-side isolation — the direction the target-side checks cannot see |
-| Caller is an APP-owned cron (`created_by` starts `app:`), or a cron whose job cannot be found | 403 | `app_owned_cron_caller` / `cron_owner_unverifiable`. A cron tab is minted without `app=`, so the `_app` check above cannot see an app's own scheduled job; ownership is read from the JOB instead, and an unverifiable owner fails closed — see "Cron callers" below |
+| Caller is an APP-owned cron (`created_by` starts `app:`), a cron whose job cannot be found, or a cron whose authoring session is no longer open | 403 | `app_owned_cron_caller` / `cron_owner_unverifiable`. A cron tab is minted without `app=`, so the `_app` check above cannot see an app's own scheduled job; ownership is read from the JOB instead, and an unverifiable owner fails closed — see "Cron callers" below |
 | Caller is channel-linked (`linked_session_key` set) | 403 | The exfiltration direction: a linked caller's conversation IS a channel thread, so a read would hand a private dashboard transcript to that channel's readers. `CHANNEL_AGENT_BLOCKED_TOOLS` keys on the agent identity; a linked slot is a second route to the same surface. **Two exceptions:** a `cron:<job_id>` link, which names the job's own run transcript and republishes to nobody; and a 1:1 DM whose only human is the configured owner (`owner_dm_refusal` answering `""`) — see "Owner-DM channel callers" below |
 | Caller's own session is no longer open | 403 | Nothing to attribute the operation to |
 | Caller changed workspace while a creation was in flight | 403 | Creation resolves the workspace's project directory off-loop, so it suspends between authorizing the caller and allocating the slot. Both decisions that read the caller's workspace -- the memory boundary the child inherits, and whether the answering agent is bound to that workspace -- are invalidated by a move, and re-deciding the binding here is not available: it needs a config load, which must not run on the event loop |
@@ -1219,13 +1219,17 @@ cannot produce, or a registry that cannot answer, refuses with
 owner", and nothing legitimate is refused by it because a cron whose job is gone is
 not running.
 
-One residual is accepted rather than closed. When `session_key` names a session that
-is no longer open its `_app` cannot be read, and the refusal returns nothing for it.
-Refusing instead would disable dispatch for the ordinary case — a user-created job
-whose authoring tab has since been closed, which is most of them — so the
-fail-closed direction is wrong here in a way it is not for a missing job. What
-bounds the exposure is that the slot has to be gone: while an app's session is live,
-its jobs are refused.
+A job whose `session_key` names a session that is no longer open also refuses with
+`cron_owner_unverifiable` (#8335). Its `_app` lived only on that slot, because
+`cron_add` records the caller in `session_key` and never writes `created_by`, so
+allowing it would let an app create a cron, close its session, and have the job
+dispatch a persistent non-app session this gate can no longer recognise. The cost is
+accepted, not closed: a genuinely user-created dispatching job whose authoring tab
+has since been closed is refused too. The operator recovers one with
+`kirocrew cron adopt <id> --release` (or `--session-of` an open non-app tab); a
+released job carries no `session_key` and passes this gate. Restoring dispatch for
+such jobs without reopening the escape needs an ownership record the caller cannot
+influence, written at create time, and is tracked in #8449 together with #13583.
 
 Applied at both
 caller-side sites so the two halves stay mirrors, and scoped to cron callers so no

@@ -876,7 +876,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const activeSlotRemoteBound = slotIsRemoteBound(slots.find(s => s.key === activeSlot))
   // The agent and model rosters the pickers offer.
   const {
-    installedAgents, defaultAgent, effectiveAgents,
+    installedAgents, sidebarAgents, defaultAgent, effectiveAgents,
     defaultAgentFailed, toggleDefaultAgent,
     agentDropdown, setAgentDropdown, agentFilter, setAgentFilter, agentDropdownRef, agentInputRef, filteredAgents,
     effectiveModels,
@@ -5458,6 +5458,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             historyHasMore={historyHasMore}
             defaultAgent={defaultAgent}
             installedAgents={installedAgents}
+            rowAgents={sidebarAgents}
             mode={mode}
             onWidthChange={setSidebarWidth}
             onDragChange={setSidebarDragging}
@@ -5509,6 +5510,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           historyHasMore={historyHasMore}
           defaultAgent={defaultAgent}
           installedAgents={installedAgents}
+          rowAgents={sidebarAgents}
           mode={mode}
           onWidthChange={setSidebarWidth}
           onDragChange={setSidebarDragging}

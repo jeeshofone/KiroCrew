@@ -12,6 +12,7 @@ import pytest
 
 from conftest import make_dir_link, requires_symlinks
 from kiro_crew import context as context_module
+from kiro_crew import member_essential_context as _mec
 from kiro_crew import pinned_fs
 from kiro_crew.agent_sdk.provider_identity import PROVIDER_ACP, PROVIDER_CLAUDE_CODE
 from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
@@ -1199,6 +1200,160 @@ def test_glob_leaf_link_cannot_silently_drop_a_declared_guide(env):
         env.builder.build_message(
             "Continue", False, memory_store=env.store, member=env.member, project=str(env.project)
         )
+
+
+def _link_global_steering(env, tmp_path) -> Path:
+    """Make ``~/.kiro/steering/context/style.md`` a link into an outside repo."""
+    repo = tmp_path / "steering-repo"
+    repo.mkdir()
+    (repo / "style.md").write_text("LINKED_STEERING_BODY", encoding="utf-8")
+    context = Path.home() / ".kiro" / "steering" / "context"
+    context.mkdir(parents=True, exist_ok=True)
+    (Path.home() / ".kiro" / "steering" / "plain.md").write_text(
+        "PLAIN_STEERING_BODY", encoding="utf-8"
+    )
+    link = context / "style.md"
+    link.symlink_to(repo / "style.md")
+    return link
+
+
+@requires_symlinks
+def test_linked_global_steering_file_is_named_instead_of_refusing_the_turn(env, tmp_path):
+    """A steering link left out of the snapshot does not stop the member.
+
+    Global steering is read because it exists, like a project's ``AGENTS.md``,
+    so a link there is left out unread and named in-band; the regular steering
+    file beside it still loads.
+    """
+    link = _link_global_steering(env, tmp_path)
+    message = _member_message(env)
+    assert "LINKED_STEERING_BODY" not in message
+    assert "PLAIN_STEERING_BODY" in message
+    assert f"[Essential source: {_mec.ESSENTIAL_LINKED_SKIP_SOURCE}]" in message
+    assert str(link) in message
+    # kiro-cli may load the link natively, so the note must not tell the model to
+    # disregard it or ask the user to restructure a working setup.
+    assert "may still load linked steering natively" in message
+    note = _mec._skipped_linked_note([link])
+    assert note is not None and "Do not assume" not in note[1]
+
+
+@requires_symlinks
+def test_linked_global_steering_directory_is_named_not_enumerated(env, tmp_path):
+    repo = tmp_path / "steering-repo"
+    repo.mkdir()
+    (repo / "inner.md").write_text("LINKED_DIR_BODY", encoding="utf-8")
+    steering = Path.home() / ".kiro" / "steering"
+    steering.mkdir(parents=True, exist_ok=True)
+    make_dir_link(steering / "shared", repo)
+    message = _member_message(env)
+    assert "LINKED_DIR_BODY" not in message
+    assert str(steering / "shared") in message
+
+
+@requires_symlinks
+def test_linked_non_steering_entry_is_not_named(env, tmp_path):
+    """A link the glob would never have read (not ``*.md``) is not reported."""
+    steering = Path.home() / ".kiro" / "steering"
+    steering.mkdir(parents=True, exist_ok=True)
+    target = tmp_path / "notes.txt"
+    target.write_text("NOT_STEERING", encoding="utf-8")
+    (steering / "README.txt").symlink_to(target)
+    linked: list[Path] = []
+    _mec._matches(Path.home(), ".kiro/steering/**/*.md", linked=linked)
+    assert linked == []
+
+
+@requires_symlinks
+def test_linked_steering_entry_is_screened_before_its_target_is_probed(env, tmp_path, monkeypatch):
+    """A link whose target the path gate refuses is named without a following probe.
+
+    ``entry.is_dir()`` follows the link; on Windows a UNC target would be an
+    outbound SMB probe, so the gate must run first and short-circuit it.
+    """
+    from kiro_crew import member_essential_context as mec
+
+    steering = Path.home() / ".kiro" / "steering"
+    steering.mkdir(parents=True, exist_ok=True)
+    target = tmp_path / "remote-share"
+    target.mkdir()
+    link = steering / "shared"
+    link.symlink_to(target, target_is_directory=True)
+    real_validate = mec.validate_file_path
+    monkeypatch.setattr(
+        mec,
+        "validate_file_path",
+        lambda p, *a, **k: None if Path(p) == link else real_validate(p, *a, **k),
+    )
+    probed: list[str] = []
+    real_is_dir = os.DirEntry.is_dir
+
+    def _spy(entry, *, follow_symlinks=True):
+        if follow_symlinks and Path(entry.path) == link:
+            probed.append(entry.path)
+        return real_is_dir(entry, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(mec.os, "scandir", _wrap_scandir(os.scandir, _spy))
+    linked: list[Path] = []
+    mec._matches(Path.home(), ".kiro/steering/**/*.md", linked=linked)
+    assert linked == [link]
+    assert probed == []
+
+
+def _wrap_scandir(real_scandir, is_dir):
+    """``os.scandir`` whose entries route ``is_dir`` through *is_dir*."""
+
+    class _Entry:
+        def __init__(self, entry):
+            self._entry = entry
+            self.name = entry.name
+            self.path = entry.path
+
+        def is_dir(self, *, follow_symlinks=True):
+            return is_dir(self._entry, follow_symlinks=follow_symlinks)
+
+        def __getattr__(self, attr):
+            return getattr(self._entry, attr)
+
+    class _Iter:
+        """Usable as a context manager and as a plain iterator, like ``os.scandir``."""
+
+        def __init__(self, path):
+            self._it = real_scandir(path)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._it.close()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return _Entry(next(self._it))
+
+        def close(self):
+            self._it.close()
+
+    return _Iter
+
+
+@requires_symlinks
+def test_kiro_launch_documents_leaves_a_linked_global_steering_file_out(env, tmp_path):
+    """The spawn-time native list must not refuse the session start either."""
+    link = _link_global_steering(env, tmp_path)
+    sources = dict(_mec.kiro_launch_documents("writer-template", str(env.project)))
+    assert str(link) not in sources
+    assert "PLAIN_STEERING_BODY" in sources.values()
+
+
+@requires_symlinks
+def test_declared_glob_still_refuses_a_linked_steering_file(env, tmp_path):
+    """Only the implicit scan skips links; a template that declares them still refuses."""
+    _link_global_steering(env, tmp_path)
+    with pytest.raises(MemberEssentialContextError, match="linked document"):
+        _mec._matches(Path.home(), ".kiro/steering/**/*.md")
 
 
 @pytest.mark.parametrize("field, value", [("prompt", 42), ("resources", "file://guide.md")])

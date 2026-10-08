@@ -1036,9 +1036,11 @@ def update_state(agent_id: str, **fields: object) -> bool:
     non-blocking and returns RETRYABLE on contention, while off-loop promotion
     lets ``update_state`` acquire the lock normally. Thus no stale writer can
     roll back ``keep=True`` and no loop-side caller waits for a pool writer's
-    fsync. The remaining on-loop callers are the synchronous retention writers;
-    they still pay their own fsync on the loop, and moving that I/O while keeping
-    their ``SessionMap`` mutation on-loop remains outstanding.
+    fsync. Release runs its demote off-loop (``release_conversation_async``) while
+    its ``SessionMap`` mutation stays on the loop. The one remaining on-loop
+    caller is retention promotion, which stays there by design: its busy check,
+    promotion and spawn admission must commit with no await between them, and its
+    non-blocking probe already keeps a stale writer from rolling it back.
     """
     if _live_run_key(agent_id) in _LIVE_RUN_STATES:
         _LIVE_RUN_STATES[_live_run_key(agent_id)].update(fields)

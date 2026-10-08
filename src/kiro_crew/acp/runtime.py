@@ -6906,6 +6906,9 @@ class AcpRuntime:
             # snapshot.
             stub_token = ""
         member_withheld = False
+        # Whether the member session-control entry is IN the array, the one fact
+        # the context builder needs to teach the session_* tools truthfully.
+        member_mounted = False
         # False for every non-member session, set without an awaited call so the
         # Kiro construction path is untouched by this capability (H13).
         panel_mounted = False
@@ -6933,6 +6936,7 @@ class AcpRuntime:
                     member_dispatch_session_server, member_session_key, stub_token
                 )
             )
+            member_mounted = member_entry is not None
             if member_entry is not None:
                 # Session-level entries outrank same-named spec entries, so drop
                 # any stub for the same server rather than registering it twice.
@@ -7106,6 +7110,7 @@ class AcpRuntime:
                 late_adopter=late_adopter,
                 memory_mode=memory_mode,
                 session_key=session_key,
+                member_dispatch_mounted=member_mounted,
             )
             if collector is None:
                 permit.release()
@@ -7136,6 +7141,7 @@ class AcpRuntime:
             projected_sources=projected_sources,
             payload_snapshot=payload_snapshot,
             session_key=session_key,
+            member_dispatch_mounted=member_mounted,
         )
 
     def _collect_late_start(
@@ -7159,6 +7165,7 @@ class AcpRuntime:
         late_adopter: "Callable[[AcpSessionHandle], Awaitable[bool]] | None",
         memory_mode: str = "persistent",
         session_key: str = "",
+        member_dispatch_mounted: bool = False,
     ) -> StartCollector | None:
         """Hand a timed-out ``session/new`` to a :class:`StartCollector`.
 
@@ -7241,6 +7248,7 @@ class AcpRuntime:
                     projected_sources=projected_sources,
                     payload_snapshot=payload_snapshot,
                     session_key=session_key,
+                    member_dispatch_mounted=member_dispatch_mounted,
                 )
                 # A declining (or raising) adopter answers False and the
                 # collector performs the one teardown.
@@ -7338,6 +7346,7 @@ class AcpRuntime:
         payload_snapshot: Any,
         memory_mode: str = "persistent",
         session_key: str = "",
+        member_dispatch_mounted: bool = False,
     ) -> AcpSessionHandle:
         """Everything after a successful ``session/new``: queue, handle, mode, drain.
 
@@ -7372,6 +7381,7 @@ class AcpRuntime:
         # The token this session's stubs carry, so a later claim (warm-pool
         # rekey) can name THIS session instead of every session on the runtime.
         handle.stub_session_token = stub_token
+        handle.member_dispatch_mounted = member_dispatch_mounted
         # The projection's client obligation, on the driver that answers this
         # session's permission requests. Empty for a host with no mirror and for a
         # caller-supplied array, and the handle's check is a no-op on empty.
@@ -7784,6 +7794,9 @@ class AcpRuntime:
             )
             mcp_servers, stub_token = await self._own_stub_session(mcp_servers, session_key)
         member_withheld = False
+        # Whether the member session-control entry is IN the array, the one fact
+        # the context builder needs to teach the session_* tools truthfully.
+        member_mounted = False
         # False for every non-member session, set without an awaited call so the
         # Kiro construction path is untouched by this capability (H13).
         panel_mounted = False
@@ -7809,6 +7822,7 @@ class AcpRuntime:
                     member_dispatch_session_server, member_session_key, stub_token
                 )
             )
+            member_mounted = member_entry is not None
             if member_entry is not None:
                 mcp_servers = [e for e in mcp_servers if e.get("name") != member_entry["name"]] + [
                     member_entry
@@ -7960,6 +7974,7 @@ class AcpRuntime:
         )
         # Mirrors create_session: the resumed session's own stub token.
         handle.stub_session_token = stub_token
+        handle.member_dispatch_mounted = member_mounted
         # Mirrors create_session: the resumed session re-declares the array, so it
         # re-derives the deny set that array came with and re-checks the generation.
         handle.spec_denied_tools = denied_tools

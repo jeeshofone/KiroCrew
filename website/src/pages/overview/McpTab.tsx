@@ -339,7 +339,7 @@ function mcpStatusVariant(status: string, auth: McpAuthState): 'ok' | 'err' | 'w
  * what the row becomes — waits here, because it is only useful once the sign-in is
  * done, and an always-visible cell in a dense table pays for every sentence.
  */
-function mcpStatusHint(status: string, serverName: string, auth: McpAuthState): string | undefined {
+function mcpStatusHint(status: string, serverName: string, auth: McpAuthState, probeFailing = false): string | undefined {
   // "Online" is the gateway's OWN probe result: it started the server in the
   // gateway process, under the gateway's client identity. It says nothing about
   // whether any particular agent session mounted it, and reading it as if it did
@@ -348,6 +348,18 @@ function mcpStatusHint(status: string, serverName: string, auth: McpAuthState): 
   // so it carries it here rather than leaving the reader to assume the stronger
   // claim.
   if (status === 'ok') return i18nT('pages.overview.mcpTab.online_help')
+  // "Outdated" usually means the last result aged past the probe TTL
+  // (`_PROBE_TTL_SECS` in mcp_discovery.py -- the "30 minutes" in this copy is
+  // a second copy of that constant), and the refresh button re-probes it. A
+  // row past the consecutive-failure threshold is ALSO "outdated", because
+  // every probe pass skips it (docs/system-specs/modules/mcp-probe-quarantine.md
+  // §3), and refresh alone does nothing for it. That row always carries the
+  // Failing badge in the same cell, whose tip says probing stopped and names
+  // Reset count, so this badge stays silent there rather than repeat it or
+  // send the reader to a refresh that will not work (#15516).
+  if (status === 'outdated') {
+    return probeFailing ? undefined : i18nT('pages.overview.mcpTab.outdated_help')
+  }
   if (status !== 'needs_auth') return undefined
   if (auth === 'sign_in_required') return i18nT('pages.overview.mcpTab.sign_in_required_next')
   if (auth === 'signed_in') return i18nT('pages.overview.mcpTab.signed_in_help', { provider: serverName })
@@ -812,7 +824,8 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                     /* The hint rides a focusable InfoTip, not a hover-only
                        `title`: a native tooltip is unreachable by keyboard,
                        touch, and AT (#3626, #8359). `mcpStatusHint` returns a
-                       string only for `ok` (the host-check caveat) and
+                       string only for `ok` (the host-check caveat),
+                       `outdated` when not quarantined (why, and how to re-probe) and
                        `needs_auth`; every other status returns undefined and
                        so gets no InfoTip — this stays a named exception rather
                        than a blanket hint on every badge. */
@@ -832,7 +845,7 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                         {invalidValue ? i18nT('pages.overview.mcpTab.status_invalid_value') : mcpStatusLabel(s.status, mcpAuthState(s))}
                       </Badge>
                       {(() => {
-                        const hint = mcpStatusHint(s.status, s.name, mcpAuthState(s))
+                        const hint = mcpStatusHint(s.status, s.name, mcpAuthState(s), s.probeFailing === true)
                         return hint ? <InfoTip text={hint} placement="top" /> : null
                       })()}
                     </span>

@@ -5757,8 +5757,11 @@ class SubagentManager:
     def release_conversation(self, conv_id: str) -> tuple[bool, str]:
         return self._continuation.release_conversation_impl(conv_id)
 
-    def _sweep_conversations(self, now: float) -> None:
-        return self._continuation._sweep_conversations_impl(now)
+    async def release_conversation_async(self, conv_id: str) -> tuple[bool, str]:
+        return await self._continuation.release_conversation_async_impl(conv_id)
+
+    async def _sweep_conversations_async(self, now: float) -> None:
+        return await self._continuation._sweep_conversations_async_impl(now)
 
     def _drain_queue(self) -> None:
         return self._admission._drain_queue_impl()

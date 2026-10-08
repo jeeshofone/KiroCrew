@@ -2761,6 +2761,10 @@ class AcpClient:
         joins that set and mounts the server on one path while this one withholds it would
         refuse every dispatch call as a drifted server rather than run a plain chat.
         """
+        # Every exit below answers whether THIS composition mounted session
+        # control, so the context builder can teach the session_* tools only to a
+        # session that holds them (see :attr:`member_dispatch_mounted`).
+        self._member_dispatch_mounted = False
         if self.backend not in ACP_BACKENDS_MEMBER_DISPATCH:
             return servers
         # circular import: members' module graph is heavy; resolved at call time.
@@ -2785,7 +2789,19 @@ class AcpClient:
                 self._session_key,
             )
             return servers
+        self._member_dispatch_mounted = True
         return [e for e in servers if e.get("name") != entry["name"]] + [entry]
+
+    @property
+    def member_dispatch_mounted(self) -> bool | None:
+        """Whether this session's array carries the member session-control entry.
+
+        ``None`` until :meth:`_append_member_dispatch_server` has composed an
+        array for this client (no evidence yet); after that, the answer that
+        composition gave -- False on every withhold, on a non-member session and
+        on a backend outside ``ACP_BACKENDS_MEMBER_DISPATCH``.
+        """
+        return getattr(self, "_member_dispatch_mounted", None)
 
     def _member_mount_withheld(
         self,

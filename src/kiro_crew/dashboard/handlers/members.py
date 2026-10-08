@@ -26,6 +26,7 @@ from typing import Any
 from aiohttp import web
 
 import kiro_crew.dashboard.handlers as _h
+from kiro_crew import crew_recency
 from kiro_crew import members as members_mod
 from kiro_crew.config.loader import (
     KiroCrewConfig,
@@ -848,7 +849,89 @@ async def api_members(request: web.Request) -> web.Response:
         row["projections"] = _redact_projection_value(_roster_only(block))
         row["last_active_ts"] = _recency_for_row(block, row.get("last_active_ts"))
 
+    # When the PERSON last messaged each crew, in its DM or in a normal chat
+    # (`crew_recency`). `last_active_ts` above also moves for background work (a
+    # patrol turn, a reply), so the Crewmates list filters and orders by this one
+    # instead. 0 = never chatted. The default crew also owns a chat that picked
+    # no crew (recorded under "").
+    default_name = cfg.default_agent or "default"
+
+    def _chat_recency() -> dict[str, float]:
+        if not crew_recency.needs_seed():
+            return crew_recency.read_recency()
+        found = _seed_from_dm_threads(state, rows, bindings, has_message)
+        if found is None:
+            # A thread could not be read this time: serve what is recorded and
+            # leave the seed for a later read, never mark it done half-read.
+            return crew_recency.read_recency()
+        return crew_recency.seed(found)
+
+    recency = await asyncio.to_thread(_chat_recency)
+    for row in rows:
+        ts = recency.get(row["name"], 0.0)
+        if row["name"] == default_name:
+            ts = max(ts, recency.get("", 0.0))
+        row["last_chat_ts"] = ts
+
     return web.json_response({"members": rows})
+
+
+def _seed_from_dm_threads(
+    state: DashboardState | None,
+    rows: list[dict],
+    bindings: dict[str, dict | None],
+    has_message: set[str],
+) -> dict[str, float] | None:
+    """One-time backfill for `crew_recency`: the newest row the user typed in
+    each crew's DM thread, from before that record existed. ``None`` when a
+    thread could not be read (no log, a busy or unreadable transcript), so the
+    seed runs again on a later read; a withheld (restricted) thread is skipped.
+
+    Typed = a user-role speech row that is not an injected envelope. Everything
+    the gateway writes into a thread under the user role (a peer's
+    `[sent by session ...]`, a workflow or wake notice) opens with `[`, so such
+    rows are skipped. Runs once per data home (`crew_recency.needs_seed`).
+    """
+    from kiro_crew.dashboard.system_notices import is_speech_row
+    from kiro_crew.eventlog.members_projections import _parse_ts
+    from kiro_crew.history import TranscriptBusy, TranscriptWithheld
+
+    log = getattr(state, "conversation_log", None)
+    found: dict[str, float] = {}
+    if log is None:
+        return None
+    for row in rows:
+        if not row["slot_key"] or row["slot_key"] not in has_message:
+            continue
+        binding = bindings.get(row["slug"])
+        generation = binding.get("memory_store", "") if binding is not None else ""
+        key = members_mod.member_thread_session_alias(row["slug"], generation)
+        try:
+            messages = log.derive_messages(key)  # the derivation seam: a withheld log raises
+        except TranscriptBusy:  # a TranscriptWithheld subclass, but retryable
+            return None
+        except TranscriptWithheld:
+            continue
+        except Exception:
+            logger.debug("crew recency seed could not read %r", key, exc_info=True)
+            return None
+        for msg in reversed(messages):
+            content = msg.get("content")
+            if msg.get("role") != "user" or not isinstance(content, str):
+                continue
+            if content.lstrip().startswith("[") or not is_speech_row(
+                "user", content, msg.get("meta")
+            ):
+                continue
+            raw_ts = msg.get("ts")
+            try:
+                ts = float(raw_ts)  # the live row's epoch (a number or its string)
+            except (TypeError, ValueError):
+                ts = _parse_ts(raw_ts) or 0.0  # an ISO stamp
+            if 0 < ts < float("inf"):
+                found[row["name"]] = max(found.get(row["name"], 0.0), ts)
+            break
+    return found
 
 
 def _recency_for_row(block: dict, transcript_ts: Any) -> float:

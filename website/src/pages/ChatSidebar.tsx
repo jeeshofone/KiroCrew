@@ -44,6 +44,7 @@ import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useDndSensors } from '../hooks/useDndSensors'
 import { useSessionPalette } from '../hooks/useSessionPalette'
 import { ancestorsOf, descendantsOf, orphanCitation } from '../lib/sessionLineage'
+import { partitionBulkSwitch } from '../lib/bulkModelSwitch'
 import { useReducedMotion } from '../hooks/useReducedMotion'
 import { useSimplifiedToolNames } from '../hooks/useSimplifiedToolNames'
 import { useLanguage } from '../i18n/LanguageProvider'
@@ -2217,6 +2218,12 @@ interface ChatSidebarProps {
   historyHasMore: boolean
   defaultAgent: string
   installedAgents: AgentInfo[]
+  /** What row and history labels are TINTED from (agent colour, inherited
+   *  session colour). The host passes the last loaded roster so a session
+   *  switch, which empties `installedAgents` until the new fetch lands, does
+   *  not flash every label to muted and back. Display only: pickers such as
+   *  FolderConfigModal keep reading the scoped `installedAgents`. Defaults to it. */
+  rowAgents?: AgentInfo[]
   mode?: string
   onWidthChange?: (w: number) => void
   onDragChange?: (dragging: boolean) => void
@@ -2348,7 +2355,7 @@ function ChatSidebar({
   // only the binding is scoped, which forces every call site inside this file
   // to say which collection it means.
   slots: localSlots, activeSlot, unreadSlots, history, historyHasMore,
-  defaultAgent, installedAgents, mode, onWidthChange, onDragChange, fillsHost, onSelectSlot, onOpenSlotInNewTab, onOpenSource, onOpenPeerSession, collapsible,
+  defaultAgent, installedAgents, rowAgents, mode, onWidthChange, onDragChange, fillsHost, onSelectSlot, onOpenSlotInNewTab, onOpenSource, onOpenPeerSession, collapsible,
   chatDropTarget, onDropSessionRef, staticRows,
 }: ChatSidebarProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
@@ -2555,13 +2562,21 @@ function ChatSidebar({
     () => (bulkModelOptions.some(m => m.name === bulkModel) ? bulkModel : ''),
     [bulkModelOptions, bulkModel],
   )
-  const bulkRunningCount = useMemo(() => localSlots.filter(s => s.running).length, [localSlots])
-  // Count only slots that would actually change: model differs from the target
-  // (the backend leaves already-on-target slots as `unchanged`), minus running
-  // slots when skipping. Keeps the "Switch N" label + disable guard honest.
-  const bulkAffectedCount = useMemo(() => {
-    return localSlots.filter(s => (s.model ?? '') !== bulkModelPick && (!bulkSkipRunning || !s.running)).length
-  }, [localSlots, bulkModelPick, bulkSkipRunning])
+  // Count only slots that would actually change. Every slot left out lands in
+  // a named bucket the panel renders (see partitionBulkSwitch), so the
+  // "Switch N" label can be reconciled with the rows on screen.
+  const bulkPartition = useMemo(
+    () => partitionBulkSwitch(localSlots, bulkModelPick, bulkSkipRunning),
+    [localSlots, bulkModelPick, bulkSkipRunning],
+  )
+  const bulkAffectedCount = bulkPartition.affected
+  // Running sessions the switch could still touch. Before a pick every running
+  // session counts; after one, a running session already on the pick is in the
+  // "already use this model" line instead, so it is not counted twice.
+  const bulkRunningCount = useMemo(
+    () => (bulkModelPick ? bulkPartition.runningOffTarget : localSlots.filter(s => s.running).length),
+    [bulkModelPick, bulkPartition, localSlots],
+  )
   const bulkModelMutation = useMutation({
     // 'auto' goes on the wire verbatim (not collapsed to ''): '' doubles as the
     // "never chosen" state that every reader re-resolves to the agent template's
@@ -3391,14 +3406,15 @@ function ChatSidebar({
   const dragInFlight = !!activeDrag
   const activeDraggedKey = activeDrag?.type === 'session' ? activeDrag.id : null
   const activeDraggedPinnedIndex = activeDraggedKey !== null ? (pinnedRank.get(activeDraggedKey) ?? -1) : -1
+  const tintAgents = rowAgents ?? installedAgents
   const rowShell: RowShell = useMemo(() => ({
-    connected, mode, defaultAgent, installedAgents, tagById, paletteColors, boost, boostFor, colorMode, recentTintCount,
+    connected, mode, defaultAgent, installedAgents: tintAgents, tagById, paletteColors, boost, boostFor, colorMode, recentTintCount,
     // A session row on any touch screen (an iPad too) gets the single ⋯ menu,
     // not the overlay cluster.
     isMobile: isMobile || isTouchDevice,
     dragInFlight, activeDraggedKey, activeDraggedPinnedIndex,
   }), [
-    connected, mode, defaultAgent, installedAgents, tagById, paletteColors, boost, boostFor, colorMode, recentTintCount,
+    connected, mode, defaultAgent, tintAgents, tagById, paletteColors, boost, boostFor, colorMode, recentTintCount,
     isMobile, isTouchDevice, dragInFlight, activeDraggedKey, activeDraggedPinnedIndex,
   ])
   // What this render shows rows with. The row model reads the local-only members
@@ -4682,6 +4698,14 @@ function ChatSidebar({
               <input type="checkbox" aria-labelledby={bulkSkipRunningLabelId} checked={bulkSkipRunning} onChange={e => setBulkSkipRunning(e.target.checked)} />
               <span id={bulkSkipRunningLabelId}>{i18nT('pages.chatSidebar.skip')} {i18nT('pages.chatSidebar.running_session', { count: bulkRunningCount })}</span>
             </label>
+          )}
+          {/* The bucket the Switch count leaves out with no other surface:
+              sessions already on the pick. Without it a lower count, or a
+              disabled "Switch 0 sessions", cannot be reconciled with the rows. */}
+          {bulkModelPick && bulkPartition.onTarget > 0 && (
+            <div data-testid="bulk-model-on-target" role="status" className="text-[12px] text-muted mb-2">
+              {i18nT('pages.chatSidebar.already_on_model', { count: bulkPartition.onTarget })}
+            </div>
           )}
           {/* No hand-off: the chosen bulkModel/skipRunning selection is unsaved,
               and the navigation would discard it. Its own line, above the
@@ -6516,7 +6540,7 @@ function ChatSidebar({
                 // Derive agent color the same way renderSessionRow does so history rows
                 // match the session-row visual language (agent name tinted by source).
                 const agentColorFor = (agentName: string): string => {
-                  const meta = installedAgents.find(a => a.name === agentName)
+                  const meta = tintAgents.find(a => a.name === agentName)
                   if (meta?.source === 'package') return 'text-[var(--aim)]'
                   if (meta?.source === 'builtin') return 'text-muted'
                   return 'text-muted'

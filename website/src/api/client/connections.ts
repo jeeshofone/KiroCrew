@@ -90,7 +90,7 @@ export interface ConnectionTestResult {
   toolCount: number
 }
 
-export function createConnectionsEndpoints({ post, put, del, j }: ClientTransport) {
+export function createConnectionsEndpoints({ post, put, del, j, jfetch: fetch }: ClientTransport) {
   const accounts = {
     // Connections approval-URL mint. POST starts one; GET is the card's feed for it.
     connectionsMint: (slug: string) =>

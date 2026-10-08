@@ -3852,9 +3852,9 @@ class _ChatSlot:
         # overwriting (the default save skips archiving). Cleared on a
         # successful rewrite save.
         self._pending_rewrite: bool = False
-        self._file_changes: list[dict[str, str]] = (
+        self._file_changes: list[dict[str, Any]] = (
             []
-        )  # [{path, content}] before-snapshots accumulated per turn for file-chip diffs
+        )  # [{path, content, canonical_path, pending_str_replace?}] before-snapshots per turn for chips
         # ``meta.mid`` of every reply row the runner in flight appended this
         # turn (``chat_runner._flush_segment`` / ``_persist_partial_reply``).
         # ``_flush_file_changes`` attaches the turn's chips only to one of these

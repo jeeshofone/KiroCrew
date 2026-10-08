@@ -1037,6 +1037,95 @@ def _is_low_signal_title(title: str, messages: list[dict[str, Any]]) -> bool:
     return title == _fallback_title_from_messages(messages)
 
 
+# ``dashboard.title_ticket_prefix``: a ticket key in the session's opening
+# message leads its AUTO title as ``KEY: summary``. The model's job is unchanged
+# (it still writes the 3-6 word summary with no punctuation); the key is copied
+# from the user's own text and wrapped on deterministically, so it can be
+# neither hallucinated nor mistranscribed.
+#
+# Two key shapes, matched case-sensitively as whole tokens:
+# - a tracker key, ``PROJ-1234``: a 2-10 character upper-case project key
+#   starting with a letter, a hyphen, and at least two digits. The two-digit
+#   floor keeps ``UTF-8`` and ``GPT-4`` out; standard names with a longer
+#   number (``SHA-256``, ``ISO-8601``) still match, which is why the setting is
+#   opt-in;
+# - a GitHub reference, ``#123``, not preceded by a word character, ``/``,
+#   ``&`` or ``#`` (so URL fragments, HTML entities and ``##`` headings are
+#   not read as one).
+# The first match in the opening message wins.
+_TITLE_TRACKER_KEY = r"(?<![A-Za-z0-9_-])[A-Z][A-Z0-9]{1,9}-\d{2,10}(?![A-Za-z0-9_-])"
+_TITLE_GITHUB_REF = r"(?<![\w/&#])#\d{1,9}(?!\w)"
+_TITLE_TICKET_KEY_RE = re.compile(f"{_TITLE_TRACKER_KEY}|{_TITLE_GITHUB_REF}")
+_TITLE_TICKET_SEPARATOR = ": "
+
+
+def _title_ticket_prefix_enabled() -> bool:
+    """Read ``dashboard.title_ticket_prefix``; False on any failure.
+
+    **Call this OFF the event loop**, for the same reason as
+    :func:`_ui_language`. A failed read leaves titles exactly as they were
+    before the setting existed.
+    """
+    try:
+        return bool(KiroCrewConfig.load().dashboard.title_ticket_prefix)
+    except Exception:
+        logger.debug("title_ticket_prefix lookup failed; titling without a ticket key")
+        return False
+
+
+def _ticket_key_from_messages(messages: list[dict[str, Any]]) -> str:
+    """The first ticket key in the first user message, or ``""``.
+
+    Only the OPENING message is read: it is where a session that exists to work
+    one ticket names it, and a key mentioned later in passing must not relabel
+    the session. Attachment paths are stripped first, as for the prompt, so a
+    key inside an uploaded file's name is not taken for the session's own.
+    """
+    for m in messages:
+        if m.get("role") != "user":
+            continue
+        text = _title_text(m.get("content", ""), _message_attachment_paths(m))
+        match = _TITLE_TICKET_KEY_RE.search(text)
+        return match.group(0) if match else ""
+    return ""
+
+
+def _split_ticket_prefix(title: str) -> tuple[str, str]:
+    """Split ``KEY: summary`` into ``(KEY, summary)``; ``("", title)`` otherwise."""
+    key, sep, summary = title.partition(_TITLE_TICKET_SEPARATOR)
+    if sep and summary and _TITLE_TICKET_KEY_RE.fullmatch(key):
+        return key, summary
+    return "", title
+
+
+async def _ticket_key_if_enabled(key: str) -> str:
+    """*key* when ``dashboard.title_ticket_prefix`` is on, else ``""``.
+
+    The setting is read (one thread hop, off the event loop) only when there is
+    a key to apply, so a session that names no ticket costs nothing and its
+    titling runs exactly as it did before the setting existed.
+    """
+    if not key:
+        return ""
+    return key if await asyncio.to_thread(_title_ticket_prefix_enabled) else ""
+
+
+def _current_ticket_key(title: str, messages: list[dict[str, Any]]) -> str:
+    """The key an existing title leads with, else the opening message's."""
+    return _split_ticket_prefix(title)[0] or _ticket_key_from_messages(messages)
+
+
+def _with_ticket_prefix(summary: str, key: str) -> str:
+    """``KEY: summary``, or *summary* unchanged when there is no key to add.
+
+    A summary that already names the key is left alone rather than repeating
+    it: the key is visible either way.
+    """
+    if not key or not summary or key in summary:
+        return summary
+    return f"{key}{_TITLE_TICKET_SEPARATOR}{summary}"
+
+
 # The drain records lost provenance, not a restored claim about who sent it.
 RESTORED_TURN_META_KEY = "turnProvenanceRestored"
 
@@ -1113,12 +1202,17 @@ async def _maybe_auto_title(state: DashboardState, slot: _ChatSlot) -> None:
             # Gave up after repeated attempts — fall back to the truncated
             # first message with an ellipsis.
             messages = _titling_messages(slot)
-            slot.title = _fallback_title_from_messages(messages)
+            key = await _ticket_key_if_enabled(_ticket_key_from_messages(messages))
+            # A title may have landed during the config hop; it outranks ours.
+            if slot._titled or slot._title_in_flight:
+                return
+            summary = _fallback_title_from_messages(messages)
+            slot.title = _with_ticket_prefix(summary, key)
             slot._titled = True
             slot._title_origin = _TITLE_ORIGIN_AUTO
             # The fallback is an echo of the first message — flag it so the
             # refresh becomes due immediately rather than at the next milestone.
-            slot._title_low_signal = _is_low_signal_title(slot.title, messages)
+            slot._title_low_signal = _is_low_signal_title(summary, messages)
             await _persist_title(state, slot)
             state.push_slot_title(slot.key, slot.title)
         return
@@ -1138,6 +1232,9 @@ async def _maybe_auto_title(state: DashboardState, slot: _ChatSlot) -> None:
 
     cancelled = False
     try:
+        # Read before generation, so every write below stays behind the race
+        # guard that follows the generation await.
+        key = await _ticket_key_if_enabled(_ticket_key_from_messages(messages))
         title = await _generate_title_via_kiro(
             state, messages, session_key=effective_session_key(slot)
         )
@@ -1153,6 +1250,10 @@ async def _maybe_auto_title(state: DashboardState, slot: _ChatSlot) -> None:
             )
             return
         if title:
+            # The low-signal test reads the model's own summary: a key this
+            # wrapper adds is the user's chosen label, not an echo.
+            summary = title
+            title = _with_ticket_prefix(summary, key)
             # Animate the title in word-by-word, then finalize with the
             # complete title (full push + persist). The reveal is cosmetic-only
             # (it never assigns ``slot.title``) and stops if the epoch moves.
@@ -1170,7 +1271,7 @@ async def _maybe_auto_title(state: DashboardState, slot: _ChatSlot) -> None:
             # A title generated from a link/ticket-key opener can only restate
             # the link; flag it so the background refresh re-examines it as
             # soon as the first turn's transcript names the real topic.
-            slot._title_low_signal = _is_low_signal_title(title, messages)
+            slot._title_low_signal = _is_low_signal_title(summary, messages)
             await _persist_title(state, slot, still_current=still_current)
             if not still_current():
                 return
@@ -1185,7 +1286,8 @@ async def _maybe_auto_title(state: DashboardState, slot: _ChatSlot) -> None:
             # the end-of-turn retry can still upgrade the truncation to a real
             # LLM title.
             current = _titling_messages(slot)
-            slot.title = _fallback_title_from_messages(current)
+            summary = _fallback_title_from_messages(current)
+            slot.title = _with_ticket_prefix(summary, key)
             slot._titled = attempt_has_assistant
             if attempt_has_assistant:
                 slot._title_origin = _TITLE_ORIGIN_AUTO
@@ -1193,7 +1295,7 @@ async def _maybe_auto_title(state: DashboardState, slot: _ChatSlot) -> None:
                 # it so the refresh prompt (which reads the conversational tail
                 # and frames the task as keep-or-rename rather than
                 # title-or-SKIP) gets one immediate shot at a real name.
-                slot._title_low_signal = _is_low_signal_title(slot.title, current)
+                slot._title_low_signal = _is_low_signal_title(summary, current)
             await _persist_title(state, slot, still_current=still_current)
             if not still_current():
                 return
@@ -1363,12 +1465,21 @@ async def maybe_refresh_title(state: DashboardState, slot: _ChatSlot) -> None:
                 slot.key,
             )
             return
+        messages = _titling_messages(slot)
+        # The model judges the summary alone, as it wrote it; the key is
+        # carried over unchanged, so a long session keeps the label it opened
+        # with even after its opening message leaves the window.
+        key = await _ticket_key_if_enabled(_current_ticket_key(slot.title, messages))
+        current_title = slot.title
+        if key:
+            current_title = _split_ticket_prefix(slot.title)[1]
         title = await _generate_refreshed_title(
-            state, _titling_messages(slot), slot.title, session_key=effective_session_key(slot)
+            state, messages, current_title, session_key=effective_session_key(slot)
         )
         if not title:
             # KEEP/SKIP/prose/error — the current title stands.
             return
+        title = _with_ticket_prefix(title, key)
         # RACE GUARD: a manual rename landing during generation bumps the epoch
         # and flips the origin to "user" — its title outranks ours, keep it.
         # A session closed and reopened under the same key is a NEW slot with
@@ -1434,9 +1545,13 @@ async def api_chat_slot_generate_title(request: web.Request) -> web.Response:
         # auto-title path (which passes the full list and wants the opening
         # messages) is unaffected.
         convo = [m for m in slot.messages if m.get("role") in _TITLE_PROMPT_ROLES]
+        # Same label as the automatic paths: the key the title already leads
+        # with, else the opening message's.
+        key = await _ticket_key_if_enabled(_current_ticket_key(slot.title, convo))
         title = await _generate_title_via_kiro(
             state, convo[-_TITLE_PROMPT_WINDOW:], session_key=effective_session_key(slot)
         )
+        title = _with_ticket_prefix(title, key)
     except Exception:
         logger.debug("Title generation failed for slot %s", name, exc_info=True)
         title = _fallback_title_from_messages(slot.messages)

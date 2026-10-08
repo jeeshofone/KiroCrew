@@ -5,7 +5,7 @@
 
 import type { ClientTransport } from './transport'
 
-export function createApprovalsEndpoints({ post, j }: ClientTransport) {
+export function createApprovalsEndpoints({ post, j, jfetch: fetch }: ClientTransport) {
   const requests = {
     approvals: (): Promise<{ id: string; source?: string; tool?: string; tool_input?: string; tool_purpose?: string; tool_call_id?: string; slot?: string; ts?: number }[]> => fetch('/api/approvals').then(j),
     resolveApproval: (id: string, action: 'approve' | 'reject' | 'reject_once', target?: { origin: 'coordinator'; slot: string; instance: string }) => post('/api/approvals/' + encodeURIComponent(id) + '/' + action + (target ? '?' + new URLSearchParams(target) : ''), {}).then(j),

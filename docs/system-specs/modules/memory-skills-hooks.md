@@ -1662,7 +1662,12 @@ change the snapshot instead. The project root's implicit `AGENTS.md` and
 outside the project, a dangling link, a managed memory file, a hard link -- does
 not refuse the turn: the guide is not read, a warning is logged, and an in-band
 `#omitted` note names it so the agent does not assume its contents. A template
-that declares the same file still refuses, and an oversized guide still raises. There is no mtime-only content cache or automatic
+that declares the same file still refuses, and an oversized guide still raises.
+The implicit global and project `.kiro/steering/**/*.md` scan treats a link the
+same way: a linked steering file or directory is not followed or read, and one
+`essential-context#linked-skipped` note names it, so a member whose steering is
+symlinked into a repository still starts. kiro-cli follows the link natively. A
+template that declares a glob reaching the same link still refuses. There is no mtime-only content cache or automatic
 retrieval on the warm path.
 
 Structural-marker scanning copies contiguous ASCII segments without per-character

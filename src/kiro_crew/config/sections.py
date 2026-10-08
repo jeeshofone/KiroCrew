@@ -2857,6 +2857,19 @@ class DashboardConfig:
             "effect on the next turn; no restart.",
         ),
     )
+    title_ticket_prefix: bool = field(
+        default=False,
+        metadata=_meta(
+            "Lead Auto Titles With The Ticket Key",
+            "When a session's opening message names a ticket, such as PROJ-1234 "
+            "or #123, its auto-generated title starts with that key: "
+            '"PROJ-1234: Increase regression shards". The first key in the '
+            "opening message is used, and the title is unchanged when there is "
+            "none. Names like SHA-256 or ISO-8601 have the same shape and are read "
+            "as keys too, which is why this is off by default. A title you renamed "
+            "by hand is never changed. Takes effect on the next title; no restart.",
+        ),
+    )
     mcp_probe_timeout_secs: int = field(
         default=15,
         metadata=_meta(

@@ -319,8 +319,8 @@ backend checkout is depth 1 today, so the ratchet is a local, pre-push gate: run
   it, so restore them yourself.
   `unstubEnvs` resets every `vi.stubEnv` before each test, a `beforeAll` one included,
   so stub env in `beforeEach` or the test. Globals are not restored, so undo your own
-  `vi.stubGlobal`. A test that reads storage an earlier test wrote fails here; the two
-  files that still do are listed in `STORAGE_CARRYOVER_FILES` until they are fixed.
+  `vi.stubGlobal`. A test that reads storage an earlier test wrote fails here; the one
+  file that still does is listed in `STORAGE_CARRYOVER_FILES` until it is fixed.
 - **No absolute time budget under `--coverage`.** Instrumentation multiplies every
   executed line, so `expect(elapsed).toBeLessThan(N)` measures the instrumentation and
   the host. Assert the work (calls, items, frames) instead.

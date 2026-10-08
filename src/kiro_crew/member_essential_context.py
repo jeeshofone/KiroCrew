@@ -24,6 +24,9 @@ ESSENTIAL_OMISSION_SOURCE = "essential-context#omitted"
 #: Source-label prefix of the in-band notice that names wildcard entries pruned as
 #: managed state; the full label appends ``:<template>``.
 ESSENTIAL_MANAGED_SKIP_SOURCE = "essential-context#managed-skipped"
+#: Source label of the in-band notice that names linked entries the implicit
+#: steering scan left out instead of refusing the whole turn.
+ESSENTIAL_LINKED_SKIP_SOURCE = "essential-context#linked-skipped"
 _MAX_SKIPPED_LISTED = 10
 _MAX_DIRECTORY_ENTRIES = 2048
 _MAX_DOCUMENTS = 64
@@ -281,8 +284,45 @@ def _skipped_managed_note(skipped: list[Path], template: str) -> tuple[str, str]
     )
 
 
-def _matches(root: Path, pattern: str, skipped: list[Path] | None = None) -> list[Path]:
+def _skipped_linked_note(linked: list[Path]) -> tuple[str, str] | None:
+    """The in-band note naming steering links the implicit scan left out, or ``None``.
+
+    Global and project steering are read because they exist, not because a
+    template names them -- the same footing as the project-root ``AGENTS.md`` in
+    :func:`_read_implicit_guide`. A link there therefore must not refuse every
+    session start of the member; it is left out, still unread, and named here so
+    the agent does not assume its contents. kiro-cli itself follows the link and
+    may load the file natively.
+    """
+    unique = list(dict.fromkeys(linked))
+    if not unique:
+        return None
+    listed = ", ".join(str(path) for path in unique[:_MAX_SKIPPED_LISTED])
+    more = len(unique) - _MAX_SKIPPED_LISTED
+    if more > 0:
+        listed += f", and {more} more"
+    return (
+        ESSENTIAL_LINKED_SKIP_SOURCE,
+        f"LINKED STEERING NOT IN THIS SNAPSHOT. {len(unique)} "
+        f"entr{'y' if len(unique) == 1 else 'ies'} on the steering scan path "
+        f"{'is a link' if len(unique) == 1 else 'are links'}, which this snapshot does "
+        f"not read: {listed}. The host may still load linked steering natively, so its "
+        "text can appear elsewhere in your context; this note only says the snapshot "
+        "does not carry it.",
+    )
+
+
+def _matches(
+    root: Path,
+    pattern: str,
+    skipped: list[Path] | None = None,
+    linked: list[Path] | None = None,
+) -> list[Path]:
     """Expand a declared glob with bounded directory work and no link traversal.
+
+    A link the walk meets below *root* is refused, unless *linked* is given: then
+    it is appended there and left out, unread and not descended into. Only the
+    implicit steering scan passes *linked*; a declared resource keeps refusing.
 
     An entry the glob would have used but the managed-source check prunes for a
     prefix collision (a name like ``memory-notes`` that is not one of the store's
@@ -327,6 +367,9 @@ def _matches(root: Path, pattern: str, skipped: list[Path] | None = None) -> lis
             # project root must not exhaust a steering subtree's scan budget.
             path = directory / component
             if is_link_or_junction(path):
+                if linked is not None:
+                    linked.append(path)
+                    continue
                 raise MemberEssentialContextError(
                     f"Essential source {path}: linked document or directory"
                 )
@@ -380,6 +423,19 @@ def _matches(root: Path, pattern: str, skipped: list[Path] | None = None) -> lis
                                 logger.debug("Managed state %s pruned from %s", path, pattern)
                         continue
                     if is_link_or_junction(path):
+                        if linked is not None:
+                            # Name only a link the glob could have used: a document
+                            # matching the final component, or a directory to descend.
+                            # The directory probe follows the link, so the target is
+                            # screened first (a UNC target is never probed); a refused
+                            # target is named without probing.
+                            if (
+                                fnmatch.fnmatchcase(entry.name, pieces[-1])
+                                or validate_file_path(str(path)) is None
+                                or entry.is_dir()
+                            ):
+                                linked.append(path)
+                            continue
                         raise MemberEssentialContextError(
                             f"Essential source {path}: linked document or directory"
                         )
@@ -515,6 +571,7 @@ def documents_for_member(
     documents: list[tuple[str, str]] = []
     seen: set[Path] = set()
     skipped: list[Path] = []
+    linked: list[Path] = []
     project_root = _admitted_project_root(project)
 
     def _mark_core(source: str) -> None:
@@ -524,10 +581,15 @@ def documents_for_member(
     def _finish() -> list[tuple[str, str]]:
         # A native-only read lists what the host itself loads; the note is not
         # a host-native source, so it rides only in the essentials envelope.
-        note = None if native_only else _skipped_managed_note(skipped, template)
-        if note is not None:
-            documents.append(note)
-            _mark_core(note[0])
+        notes = (
+            ()
+            if native_only
+            else (_skipped_linked_note(linked), _skipped_managed_note(skipped, template))
+        )
+        for note in notes:
+            if note is not None:
+                documents.append(note)
+                _mark_core(note[0])
         return documents
 
     def add(path: Path, root: Path, *, steering: bool = False, body: str | None = None) -> None:
@@ -607,7 +669,7 @@ def documents_for_member(
     # the snapshot must not re-add the operator's global steering behind it.
     inherits = include_project and not native_only and inherits_default_resources
     if inherits:
-        for path in _matches(Path.home(), ".kiro/steering/**/*.md", skipped):
+        for path in _matches(Path.home(), ".kiro/steering/**/*.md", skipped, linked):
             add(path, Path.home(), steering=True)
 
     if project_root is not None and include_project and not native_only:
@@ -625,7 +687,7 @@ def documents_for_member(
                     if name == "SOUL.md":
                         _mark_core(str(path))
         if inherits:
-            for path in _matches(project_root, ".kiro/steering/**/*.md", skipped):
+            for path in _matches(project_root, ".kiro/steering/**/*.md", skipped, linked):
                 add(path, project_root, steering=True)
 
     spec_path = resolve_template_path(template, project)
@@ -828,7 +890,8 @@ def kiro_launch_documents(template: str, project: str | None) -> list[tuple[str,
             declared[source] = body
     if not inherits:
         return list(declared.items())
-    for path in _matches(Path.home(), ".kiro/steering/**/*.md"):
+    # A link here is left out, as in the snapshot: kiro-cli follows it natively.
+    for path in _matches(Path.home(), ".kiro/steering/**/*.md", linked=[]):
         body = _read(path, Path.home())
         fields, _ = split_frontmatter(body, STEERING_LOADER)
         if fields.get("inclusion", "always").strip().casefold() == "always":

@@ -248,6 +248,7 @@ choice blob makes the usage line unreadable.
 | `kirocrew security verify` | Verify SEL HMAC chain integrity |
 | `kirocrew snapshot` | Create a .tar.gz snapshot of all KiroCrew state |
 | `kirocrew snapshot --keep N` | Auto-prune to N most recent snapshots (default 7) |
+| `kirocrew snapshot --strict` | Exit 3 (not 0) when the written bundle omits entries it was asked to carry; see the retention note below |
 | `kirocrew snapshot --list` | List existing snapshots |
 | `kirocrew restore <file>` | Restore from a snapshot (auto-detects replace vs merge) |
 | `kirocrew restore <file> --mode replace\|merge` | Force restore mode; merge skips malformed incoming or local cron JSON with a file-specific warning, and never overwrites a `config` file the destination already has -- it names each settings file it kept (`↩️ <file>: kept the existing file ...`, pointing at `--mode replace --components config`) instead of printing `✅ config`, while host state (`session_map.json`, `project_dir`, `workspace_dir`) keeps this machine's copy silently; a bundle `ui-prefs.json` / `notification_settings.json` its own reader would refuse stops a replace before anything is installed, and stops a merge only where the destination has no such file (otherwise the destination's file is kept); a bundle's `config.local.json` is never installed even where the destination has none (`↩️ config.local.json: not applied ...`), since that overlay outranks `config.json` |
@@ -307,6 +308,14 @@ lacks something it was asked to carry. `--keep` does not prune after a run in th
 class, and prints which reasons applied. A reason code the split does not know counts as
 incomplete, because the alternative is pruning the operator's last complete backup on
 the strength of a code nobody has classified yet.
+
+The exit status follows the same predicate, but only on request. By default a run that
+wrote a bundle exits 0 whether or not it is complete, because existing unattended
+callers (the AWS Control app's off-host backup among them) treat any non-zero exit as a
+failed backup and would stop uploading a bundle that is written and restorable.
+`kirocrew snapshot --strict` exits `3` instead when `omits_wanted_data()` is true for any
+`skipped` entry; the bundle is still kept and the prune is still held. Exit `1` keeps
+meaning no usable bundle was produced.
 
 SQLite databases are **out of scope** for the pinned staging described here: they keep the
 `sqlite3.backup()` path they already had, which reopens the live name. Capturing a live

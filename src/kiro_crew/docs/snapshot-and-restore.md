@@ -15,6 +15,7 @@ kirocrew snapshot                                     # write to ~/.kiro/crew/sn
 kirocrew snapshot ~/my-snapshots --keep 3             # custom dir, prune to 3
 kirocrew snapshot --components memory                 # just memory, ~20 MB
 kirocrew snapshot --list                              # list existing snapshots
+kirocrew snapshot --strict                            # exit 3 if the bundle is incomplete
 kirocrew restore snapshot.tar.gz                      # auto-detects replace vs merge
 kirocrew restore snapshot.tar.gz --components memory,crons
 kirocrew restore snapshot.tar.gz --dry-run            # preview, write nothing

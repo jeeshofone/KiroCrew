@@ -970,7 +970,7 @@ class OrphanStallMonitor(ManagerComponent):
             except Exception:
                 logger.debug("Reaper: digest-hold sweep failed", exc_info=True)
             try:
-                self._manager._sweep_conversations(now)
+                await self._manager._sweep_conversations_async(now)
             except Exception:
                 logger.debug("Reaper: conversation sweep failed", exc_info=True)
             # Wait deadlines + due dependency scopes: the pump's own one-shot

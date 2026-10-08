@@ -379,8 +379,11 @@ describe('Decisions (Jev) preview card', () => {
     })
     decisionsSwitch().click()
     await waitFor(() => {
-      expect(screen.getByText(/could not save this setting/i)).toBeInTheDocument()
+      expect(screen.getByText(/could not save this change/i)).toBeInTheDocument()
     })
+    // The same notice serves the tier pickers, the history number box and the key
+    // field, none of which is a switch, so its words name no control.
+    expect(screen.getByTestId('decisions-save-error').textContent ?? '').not.toMatch(/switch/i)
     // The switch shows the keystone's value, not the click's, so a refused write
     // cannot leave the card claiming the preview is on.
     expect(decisionsSwitch().getAttribute('aria-checked')).toBe('false')
@@ -509,6 +512,37 @@ describe('Decisions (Jev) preview card', () => {
     await waitFor(() => {
       expect(pointRow('invented.point')).toBeInTheDocument()
     })
+  })
+
+  it('links to the Releases page when the gateway lists no points', async () => {
+    // An older gateway projects no rows. The notice tells the reader to update, so
+    // the place it names is a link there, not plain text.
+    stubGateway(consentOf(true, { points: [] }))
+    renderSection()
+    await waitFor(() => {
+      expect(screen.getByText(/does not list what Jev decides yet/i)).toBeInTheDocument()
+    })
+    const link = screen.getByRole('link', { name: 'Settings › Releases' })
+    expect(link.getAttribute('href')).toBe('/settings/releases')
+  })
+
+  it('says where Auto (Jev) is chosen for the model.route point', async () => {
+    stubGateway({ enabled: true })
+    renderSection()
+    await waitFor(() => {
+      expect(pointRow("Model for the turn's difficulty")).toBeInTheDocument()
+    })
+    openPoint("Model for the turn's difficulty")
+    // The panel sits behind the lazy `DecisionsPointPanel` boundary, so its chunk
+    // may still be loading on a cold run: give it an explicit deadline.
+    await waitFor(
+      () => {
+        expect(screen.getByRole('tabpanel').textContent ?? '').toContain(
+          "whose own model picker shows Auto (Jev)",
+        )
+      },
+      { timeout: 5000 },
+    )
   })
 
   it('carries the status as the EFFECTIVE answer, with its own word for a missing scope', async () => {

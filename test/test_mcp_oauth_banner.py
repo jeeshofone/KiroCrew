@@ -272,6 +272,57 @@ class TestEmitMcpOAuthRequest:
         assert "idp.example[REDACTED: credential]" in m["meta"]["error"]
         assert token not in json.dumps(m, ensure_ascii=False)
 
+    # A PKCE-shaped authorize URL the MCP client synthesizes for a local server
+    # after a failed connect: http, explicit port, ~250-char query.
+    _LOOPBACK_AUTHORIZE_QUERY = (
+        "?response_type=code&client_id=kiro-cli-mcp-client-0123456789abcdef"
+        "&redirect_uri=http%3A%2F%2Flocalhost%3A49954%2Foauth%2Fcallback"
+        "&state=Zk3mQ9pL2vX8rT5wN1bC7hJ4yA6sD0eF"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+    )
+
+    @pytest.mark.parametrize(
+        "host",
+        ["localhost:3100", "127.0.0.1:3100", "[::1]:3100"],
+    )
+    def test_loopback_rejection_points_at_a_retry_not_the_allowlist(self, host):
+        """A loopback authorize URL is still REJECTED, but the banner
+        must not send the user to ``oauth_endpoints.json`` -- that file refuses
+        loopback hosts and the gate never relaxes http/port, so the advice is
+        unactionable. It names the endpoint and suggests reconnecting."""
+        url = f"http://{host}/authorize{self._LOOPBACK_AUTHORIZE_QUERY}"
+        # Premise: the guard verdict itself is unchanged by this fix.
+        assert oauth_url_contains_credential(url)
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "tidal-knowledge", url)
+        m = slot.messages[0]
+        assert m["meta"]["failed"] is True
+        assert m["meta"]["rejected_url"] is True
+        assert "oauth_url" not in m["meta"]
+        assert "remedy" not in m["meta"]
+        assert "oauth_endpoints.json" not in m["content"]
+        # The failed banner renders meta["error"], not content: the retry
+        # advice and the endpoint must both ride there.
+        error = m["meta"]["error"]
+        assert "/authorize" in error
+        assert "start a new chat" in error
+        assert "credential or exfiltration pattern" not in error
+        assert "oauth_endpoints.json" not in error
+        serialized = json.dumps(m, ensure_ascii=False)
+        assert "Zk3mQ9pL2vX8rT5wN1bC7hJ4yA6sD0eF" not in serialized
+        assert "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM" not in serialized
+
+    def test_non_loopback_rejection_keeps_the_allowlist_remedy(self):
+        """The loopback branch must not swallow a real remote IdP rejection."""
+        url = f"https://idp.example/authorize{self._LOOPBACK_AUTHORIZE_QUERY}"
+        assert oauth_url_contains_credential(url)
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "self-hosted", url)
+        m = slot.messages[0]
+        assert m["meta"]["remedy"] == "oauth_endpoints.json"
+        assert "oauth_endpoints.json" in m["content"]
+
     def test_rejection_banner_survives_unparseable_url(self):
         """A URL that cannot be parsed to a hostname still rejects with the
         original unnamed banner — no endpoint fields, no crash."""

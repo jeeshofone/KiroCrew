@@ -902,7 +902,7 @@ async def test_reaper_sweep_reaps_at_the_base_deadline_under_a_crowd(monkeypatch
     mgr._sample_live_costs = MagicMock()  # type: ignore[method-assign]
     mgr._sweep_stuck_waves_async = AsyncMock()  # type: ignore[method-assign]
     mgr._sweep_digest_holds_async = AsyncMock()  # type: ignore[method-assign]
-    mgr._sweep_conversations = MagicMock()  # type: ignore[method-assign]
+    mgr._sweep_conversations_async = AsyncMock()  # type: ignore[method-assign]
     mgr._taskq_pump = MagicMock()  # type: ignore[method-assign]
     mgr._maybe_flag_stall = AsyncMock()  # type: ignore[method-assign]
     monkeypatch.setattr(subagent_mod, "_REAPER_INTERVAL", 0)
@@ -962,7 +962,7 @@ async def test_reaper_sweep_reaps_a_runtime_that_never_answers_its_first_prompt(
     mgr._sample_live_costs = MagicMock()  # type: ignore[method-assign]
     mgr._sweep_stuck_waves_async = AsyncMock()  # type: ignore[method-assign]
     mgr._sweep_digest_holds_async = AsyncMock()  # type: ignore[method-assign]
-    mgr._sweep_conversations = MagicMock()  # type: ignore[method-assign]
+    mgr._sweep_conversations_async = AsyncMock()  # type: ignore[method-assign]
     mgr._taskq_pump = MagicMock()  # type: ignore[method-assign]
     mgr._maybe_flag_stall = AsyncMock()  # type: ignore[method-assign]
     monkeypatch.setattr(subagent_mod, "_REAPER_INTERVAL", 0)

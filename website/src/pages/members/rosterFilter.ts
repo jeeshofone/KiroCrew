@@ -102,6 +102,7 @@ export interface RosterQuery {
 
 interface RosterRowLike {
   name: string; display_name?: string; starred?: boolean; source?: unknown; last_active_ts?: number
+  last_chat_ts?: number
   dashboard_created?: unknown; has_dm_message?: unknown; last_message?: unknown
 }
 
@@ -119,32 +120,27 @@ function matchesSearch(m: RosterRowLike, needle: string): boolean {
   return m.name.toLowerCase().includes(needle) || rowLabel(m).toLowerCase().includes(needle)
 }
 
-/** Whether the roster lists a row WITHOUT being asked for it. Listed when
- *  EITHER its Crewmates-page DM thread already holds a message (any origin:
- *  a user who chatted with it is using it), OR it was created on the
- *  dashboard (`source` kirocrew AND a member id -- covers a greeting that
- *  failed or never landed). The default crew is listed whatever its record
- *  says, as it always has been. Everything else -- an app's row, a
- *  sync-generated row, a legacy row, none of them chatted with -- is hidden
- *  until the search reaches it.
+/** Whether the roster lists a row WITHOUT being asked for it: only a crew the
+ *  user has actually chatted with (`last_chat_ts`, recorded server-side when
+ *  the person sends it a message in its DM or in a normal chat), or one the
+ *  user starred. A crew that only ran in the background -- a cron, a wake, a
+ *  sub-agent, a dispatched worker -- or that an app drove is hidden until the
+ *  search reaches it, the default crew included.
  *
- *  A thread's first message is also read from the row's live preview
- *  (`last_message`, pushed through the member projection), so a row the user
- *  just chatted with stays listed without waiting for a roster refetch. A row
- *  from an older gateway that carries NEITHER field is listed: hiding on an
- *  absent field would blank the roster on a mixed-version deploy.
- *
- *  `defaultAgent === null` means the default-crew lookup failed: every row is
- *  listed, since the rule cannot tell which row it must never hide. */
+ *  A row from an older gateway carries no `last_chat_ts`, and keeps that
+ *  gateway's rule (DM thread holds a message, created on the dashboard, the
+ *  default crew): hiding on an absent field would blank the roster on a
+ *  mixed-version deploy. `defaultAgent === null` (the lookup failed) lists
+ *  every such row, since that rule cannot tell which row it must never hide. */
 export function listedByDefault(m: RosterRowLike, defaultAgent: string | null): boolean {
+  if (m.starred === true) return true
+  if (typeof m.last_chat_ts === 'number') return m.last_chat_ts > 0
   if (defaultAgent === null) return true
   if (defaultAgent !== '' && m.name === defaultAgent) return true
   if (m.dashboard_created === undefined && m.has_dm_message === undefined) return true
   return (
     m.has_dm_message === true ||
     m.dashboard_created === true ||
-    // A star is the user marking the row as theirs: listed like a chatted one.
-    m.starred === true ||
     (typeof m.last_message === 'string' && m.last_message.trim() !== '')
   )
 }
@@ -181,13 +177,20 @@ export function rosterPopulation<M extends RosterRowLike>(
   )
 }
 
-/** Most-recently-active first (like any IM member list); never-talked members
- *  fall to the bottom alphabetically. `name` is a plain locale-aware sort over
- *  the DISPLAYED label, since that is the text the user scans. */
+/** A row's place in the Recent order: the user's own last message
+ *  (`last_chat_ts`), never a background turn. An older gateway's row, which
+ *  has no such field, falls back to its `last_active_ts`. */
+export function chatRecency(m: RosterRowLike): number {
+  return (typeof m.last_chat_ts === 'number' ? m.last_chat_ts : m.last_active_ts) ?? 0
+}
+
+/** Most-recently-CHATTED first (like any IM member list); never-chatted
+ *  members fall to the bottom alphabetically. `name` is a plain locale-aware
+ *  sort over the DISPLAYED label, since that is the text the user scans. */
 export function sortRoster<M extends RosterRowLike>(members: readonly M[], sort: MemberSort): M[] {
   const out = [...members]
   if (sort === 'name') return out.sort((a, b) => compareText(rowLabel(a), rowLabel(b)))
-  return out.sort((a, b) => (b.last_active_ts ?? 0) - (a.last_active_ts ?? 0) || compareText(rowLabel(a), rowLabel(b)))
+  return out.sort((a, b) => chatRecency(b) - chatRecency(a) || compareText(rowLabel(a), rowLabel(b)))
 }
 
 /** True when `query` narrows the roster by something other than the typed

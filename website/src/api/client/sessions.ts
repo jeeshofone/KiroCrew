@@ -9,7 +9,7 @@ import type { CrewBoardAction, CrewBoardActionResult, WorkBoardResponse } from '
 
 export const SEARCH_MIN_CHARS = 2  // backend session search threshold (must match kiro_crew.history.SEARCH_MIN_CHARS)
 
-export function createSessionsEndpoints({ get, post, del, j }: ClientTransport) {
+export function createSessionsEndpoints({ get, post, del, j, jfetch: fetch }: ClientTransport) {
   const runtimes = {
     restartSessions: () =>
       post('/api/sessions/restart').then(j) as Promise<{

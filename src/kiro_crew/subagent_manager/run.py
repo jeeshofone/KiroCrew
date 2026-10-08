@@ -931,6 +931,7 @@ class RunEventCoordinator(ManagerComponent):
             else:
                 logger.warning("Subagent %s timed out", info.id)
         except asyncio.CancelledError:
+            handed_to_recovery = False
             if not info.reaped and not info.done:
                 if (
                     not info.user_stopped
@@ -975,6 +976,7 @@ class RunEventCoordinator(ManagerComponent):
                     except Exception:
                         logger.debug("SEL audit for cancel recovery failed", exc_info=True)
                     self._manager._schedule_cancel_recovery(info)
+                    handed_to_recovery = True
                 else:
                     info.done = True
                     if (
@@ -1002,6 +1004,18 @@ class RunEventCoordinator(ManagerComponent):
                 logger.info("Subagent %s completed before a cancel ended the run", info.id)
             else:
                 logger.info("Subagent %s cancelled", info.id)
+            if handed_to_recovery:
+                # The run continues on the ``<id>:recovery`` task, not this one,
+                # so this task must end CANCELLED rather than return: a waiter
+                # holding it (``await task``, ``asyncio.wait_for``,
+                # ``asyncio.timeout``) would otherwise read a clean completion
+                # while the run has neither finished nor claimed its session,
+                # and a ``wait_for`` that timed out would return instead of
+                # raising ``TimeoutError``. ``_resume``'s handshake
+                # waits with ``asyncio.wait``, which does not care how the task
+                # ended; the finally below runs either way and, while
+                # ``_recovering`` is set, reports nothing.
+                raise
         except Exception as exc:
             if getattr(exc, "context_overflow", False):
                 # The native session that raised this cannot shrink the envelope
@@ -1271,8 +1285,9 @@ class RunEventCoordinator(ManagerComponent):
         # spawned in the finally above; block until it completes so sequencing is
         # unchanged for callers.
         #
-        # NOT during shutdown. `_run`'s CancelledError arm deliberately does not
-        # re-raise, so by the time we reach this await the cancellation has been
+        # NOT during shutdown. `_run`'s terminal CancelledError arm deliberately
+        # does not re-raise (only the hand-off to cancel recovery does, and it
+        # spawns no report), so by the time we reach this await the cancellation has been
         # consumed and `shield` would simply wait out the full _ON_DONE_TIMEOUT
         # injection cap — holding `cancel_all()`'s gather for up to 20 minutes.
         # The report is registered in `self._report_tasks`, so `cancel_all()`'s

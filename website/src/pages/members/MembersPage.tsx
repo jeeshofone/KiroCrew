@@ -28,10 +28,11 @@
  * thread, so the UI does not announce it — there is no unpinned state to
  * contrast against.
  *
- * Which crewmate is open rides the URL (`?member=<name>`), and the last one
- * opened is remembered per browser: a visit that names no one lands on the
- * remembered crewmate if it is still on the roster, else on the most recently
- * USED chat (greatest `last_active_ts`). That is the conversation the user
+ * Which crewmate is open rides the URL (`?member=<name>`). A visit that names
+ * no one lands on the crewmate the user last CHATTED with (`last_chat_ts`, a
+ * server record, so it survives a gateway restart), else on the one last
+ * opened in this browser if it is still on the roster, else on the most
+ * recently USED chat (greatest `last_active_ts`). That is the conversation the user
  * most plausibly came back for, and it is a property of the user's own
  * history, not of the list order: #11763 rejected priming the user on
  * whichever row the SORT floated to the top, and that still holds — the
@@ -116,6 +117,8 @@ import CrewProfilePanel, { type ProfileTab } from './CrewProfilePanel'
 import { createPortal } from 'react-dom'
 import { useCrewmateThreadsFlag } from '../../hooks/useCrewmateThreadsFlag'
 import { CrewDashboardFrame } from './CrewWebview'
+import CrewDashboardTab from './CrewDashboardTab'
+import { mergePaneDraft } from '../../utils/chatPaneDrafts'
 import ErrorBoundary from '../../components/ErrorBoundary'
 import ErrorNotice from '../../components/ErrorNotice'
 import { useConfirm } from '../../components/ConfirmDialog'
@@ -202,6 +205,8 @@ export function resolveDefaultMember(
   remembered: string | null,
   ordered: readonly MemberRosterRow[],
 ): MemberRosterRow | undefined {
+  const chatted = lastChattedMember(ordered)
+  if (chatted) return chatted
   if (remembered && remembered !== 'default') {
     const hit = ordered.find((m) => m.name === remembered)
     if (hit) return hit
@@ -210,6 +215,21 @@ export function resolveDefaultMember(
   for (const m of ordered) {
     if (m.name === 'default') continue
     if (!best || (m.last_active_ts ?? 0) > (best.last_active_ts ?? 0)) best = m
+  }
+  return best
+}
+
+/** The crewmate the user last sent a message to (`last_chat_ts`, recorded by
+ *  the server, so it survives a gateway restart and a new browser alike), in
+ *  its DM or in a normal chat. It outranks this browser's remembered pick: the
+ *  page reopens the conversation the user last HAD, not the row they last
+ *  clicked. The built-in `default` assistant is not a crewmate. Strict `>` so
+ *  a tie keeps the first in `rows`. */
+export function lastChattedMember(rows: readonly MemberRosterRow[]): MemberRosterRow | undefined {
+  let best: MemberRosterRow | undefined
+  for (const m of rows) {
+    if (m.name === 'default' || !((m.last_chat_ts ?? 0) > 0)) continue
+    if (!best || (m.last_chat_ts ?? 0) > (best.last_chat_ts ?? 0)) best = m
   }
   return best
 }
@@ -1680,8 +1700,8 @@ export default function MembersPage() {
     () => ({ search: filter, starredOnly, source: sourceFilter, status: statusFilter, sort, defaultAgent, chosen: activeName }),
     [filter, starredOnly, sourceFilter, statusFilter, sort, defaultAgent, activeName],
   )
-  // The rows the roster is about right now: created crewmates and the default
-  // crew, or -- with a search typed -- whatever the search reaches, hidden rows
+  // The rows the roster is about right now: crewmates the user chatted with
+  // (or starred), or -- with a search typed -- whatever the search reaches, hidden rows
   // included. The header count, the "N of M" and the filter menu's tallies read
   // THIS list, never `members`, so no count includes a row the user cannot see.
   const shownMembers = useMemo(() => rosterPopulation(members, rosterFilterQuery), [members, rosterFilterQuery])
@@ -2075,9 +2095,9 @@ export default function MembersPage() {
   const schedulesMountedRef = useRef(false)
   const activeTabId = shownTabId ?? tabsCtl.activeId
   // The in-chat Command Center dock is the Dynamic Dashboard, a Feature Preview
-  // (Settings > Developer); off, the dock has no opener. The Dashboard TAB is the
-  // crewmate's own published page (CrewDashboardFrame), not that surface, so it
-  // stays a standing entry either way.
+  // (Settings > Developer); off, the dock has no opener. The Dashboard TAB stays a
+  // standing entry either way -- the flag decides what FILLS it, the crewmate's
+  // dynamic dashboard or the published view it showed before.
   const dashboardPreview = usePreviewFlag(PREVIEW_DASHBOARD)
   const dashboardVisible = panelVisible && activeTabId === CREW_DASHBOARD_TAB_ID
   const [dashboardVisitedFor, setDashboardVisitedFor] = useState<string | null>(null)
@@ -2588,8 +2608,8 @@ export default function MembersPage() {
   // the shown population: hidden rows are not "filtered out", they are unlisted.
   const filteredOut =
     loaded && !loadError && shownMembers.length > 0 && sortedMembers.length === 0 && !filter.trim()
-  // Every crewmate exists but the listing rule hides them all (none chatted,
-  // created here, starred or the default crew): say so and name the search as
+  // Every crewmate exists but the listing rule hides them all (none chatted
+  // with, none starred): say so and name the search as
   // the way in, rather than an empty list under "0 crewmates".
   const allHidden =
     loaded && !loadError && !filter.trim() && shownMembers.length === 0 && !hasNoCrewmates(members)
@@ -2873,8 +2893,13 @@ export default function MembersPage() {
     const remembered = safeGetItem(LAST_MEMBER_KEY)
     const rememberedRow =
       remembered && remembered !== 'default' ? members.find((m) => m.name === remembered) : undefined
+    // The last crewmate the user CHATTED with outranks the memory (it is the
+    // server's record, so a restart or a new browser keeps it).
     const target =
-      rememberedRow ?? resolveDefaultMember(null, listedMembers) ?? resolveDefaultMember(null, orderedMembers)
+      lastChattedMember(orderedMembers) ??
+      rememberedRow ??
+      resolveDefaultMember(null, listedMembers) ??
+      resolveDefaultMember(null, orderedMembers)
     if (!target) {
       // Named a gone crewmate on an empty roster: say where they went above
       // the roster (shown: '' marks the roster variant of the notice, as
@@ -3791,8 +3816,8 @@ export default function MembersPage() {
                   >{pillActivity.label}</div>
                 </div>
                 {/* The one visible sign that this chip OPENS something. Without
-                    it the pill and the switcher chip beside it are two glass
-                    chips with faces in them, and only one of them is a door to
+                    it the pill and the switcher beside it are two controls
+                    with faces in them, and only one of them is a door to
                     the Profile. Decorative: the tooltip and `aria-expanded`
                     already say it for assistive tech. */}
                 <ChevronRight size={14} className="lucide-inline shrink-0 text-muted" aria-hidden="true" data-testid="member-identity-pill-chevron" />
@@ -4095,11 +4120,19 @@ export default function MembersPage() {
           // One Dashboard: the existing crew publication is one task view.
           // Preserve its renderer and exact member identity, while the host
           // owns live task summaries, questions and approval controls.
-          // The Dashboard tab IS the crewmate's published view (crewmate-panel IA):
-          // the HTML report the crewmate writes itself, rendered straight into the
-          // panel. No card, Contained bar or Expand around it (CrewDashboardFrame,
-          // not the CrewWebview drawer) and no Command Center above it: each read
-          // as one more container stacked over the one page that matters.
+          // The Dashboard tab is the crewmate's own dynamic dashboard -- the page the
+          // read resolves for it, its adopted copy or the default template, with every
+          // number folded from its crew log -- BEHIND THE FEATURE PREVIEW. With the
+          // preview off the tab keeps rendering the published view it rendered before,
+          // which is what "off by default" has to mean: the standing Dashboard entry
+          // shows the same thing to anybody who has not turned the preview on.
+          //
+          // The entry itself is unconditional either way. The TAB is a standing one;
+          // only what fills it moves with the flag.
+          //
+          // No card, Contained bar or Expand around either (not the CrewWebview
+          // drawer) and no Command Center above it: each read as one more container
+          // stacked over the one page that matters.
           const dashboardBody = (
             <div className="h-full min-h-0 flex flex-col" data-testid="member-dashboard" aria-label={t('pages.membersPage.dashboard_tab')}>
               {/* Said here only when the MAIN COLUMN is not already saying it:
@@ -4110,7 +4143,20 @@ export default function MembersPage() {
                 ? <p role="status" className="px-4 pt-3 text-sm text-muted">{t('pages.membersPage.opening_thread')}</p>
                 : null}
               {activeSlug && activeMemberName && (
-                <CrewDashboardFrame slug={activeSlug} member={activeMemberName} displayName={crewDisplayName(activeView ?? active)} />
+                dashboardPreview ? (
+                  // Keyed per crewmate so the tab remounts on a switch instead of
+                  // opening the next crewmate on the page held for this one.
+                  <CrewDashboardTab
+                    key={JSON.stringify([activeSlug, activeMemberName])}
+                    slug={activeSlug}
+                    member={activeMemberName}
+                    displayName={crewDisplayName(activeView ?? active)}
+                    // A needs-you option lands in this crewmate's chat box; the person sends it.
+                    onAct={activeSlot ? (text: string) => mergePaneDraft(activeSlot, text, []) : undefined}
+                  />
+                ) : (
+                  <CrewDashboardFrame slug={activeSlug} member={activeMemberName} displayName={crewDisplayName(activeView ?? active)} />
+                )
               )}
             </div>
           )

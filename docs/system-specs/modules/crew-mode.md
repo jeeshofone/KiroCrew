@@ -819,43 +819,54 @@ component bodies.
 Landing rule (Crewmates page): with no crewmates the page
 shows a single empty-state hero (ghost avatar, "No crewmates yet", one line,
 "New crewmate") in place of a roster call to action and a "pick a member" pane;
-with crewmates and no `?member=`, the remembered crewmate opens, else the most
-recently used one (greatest `last_active_ts`, ties keep roster order). Below md
+with crewmates and no `?member=`, the crewmate the user last chatted with opens
+(greatest `last_chat_ts`, see below; it is server-side, so a gateway restart or a
+new browser keeps it), else the remembered crewmate, else the most recently used
+one (greatest `last_active_ts`, ties keep roster order). Below md
 nothing auto-opens — the roster is the page. A `?member=` naming a crewmate that
 is gone falls back the same way, under the existing swap notice. The page's copy
 says crewmate / Crewmates and "Built from"; the crew record, its API and its
 identifiers are unchanged.
 
-The roster lists a row unasked when EITHER its Crewmates-page DM thread already
-holds a message (any origin) OR it was created on the dashboard (`source` is
-`kirocrew` AND the record carries a `member_id`, which covers a greeting that
-never landed) OR the user starred it; the default crew (whichever crew the top-level `default_agent` names) is
-always listed. Every other row (an app's own source stamp, with or without a
-member id, a sync-generated row, a legacy `kirocrew` row without a member id,
-none of them chatted with) is hidden and appears when the search text matches
-it. The star, origin and status filters narrow the rows the roster shows, so
-choosing an origin does not reach a hidden row; the search is the one door
-within the roster list. A team's view (`?team=`) and the team dialog are built
-from the whole roster, so they still list every crewmate the user put on that
-team -- placing a crewmate on a team is itself a choice to use it -- and a team
-whose crewmates are all hidden keeps its (empty) roster header. The crewmate
-open in the thread stays listed while open, and a remembered crewmate is
-restored even when the rule hides it; with nothing but the default crew
-listed while hidden crewmates exist, the landing opens the most recently used
-hidden one (listed while open); where nothing auto-opens (below md) and every
-row is hidden, the roster says so and names the search. If
-the default-crew lookup fails, every row is listed and an error notice says why. `GET /api/members` carries the two facts as booleans, `dashboard_created`
-and `has_dm_message` (`ConversationLog.has_messages` on the bound thread, which
-stops at the first non-metadata row, or rows held by the live slot; an
-unreadable transcript counts as a message); the member id itself is not on the
-wire. The client also treats a non-empty live `last_message` as a message, so a
-row the user just chatted with stays listed before the next roster read. A row
-from an older gateway carrying neither field is listed. The header count and
-the filter tallies count the listed rows plus any hidden row the search
-reaches. The landing fallback opens a remembered crewmate first (even a
-hidden one, which is then listed while open), then the most recently used listed
-crewmate, then the most recently used hidden one when only the default crew is
-listed.
+The roster lists a row unasked only when the user has chatted with it or
+starred it. "Chatted with" is `last_chat_ts > 0` on `GET /api/members`: the
+epoch of the user's own last message to that crew, in its Crewmates DM or in a
+normal chat, recorded by `kiro_crew.crew_recency` (`crew_recency.json` under
+the data home) when `POST /api/chat` is called by the dashboard user -- no app
+token, no cron attestation. Creating a crewmate counts too:
+`POST /api/agents` (owner-only, so never an app token) records the new crew
+unless the caller is an attested cron, so a crewmate the user just made is
+listed at once and sorts first. A chat that picked no crew is recorded under
+`""` and counts for the default crew. Crons, wakes, patrols,
+sub-agents, conductor-dispatched workers and apps never write it, so a crew that
+only ran in the background or that an app drove is hidden -- the default crew
+and a dashboard-created crew included. The record is written when the send
+reaches the handler, before the turn starts, so a send the turn later fails
+still counts as the user chatting with that crew. The client stamps the same
+value on the row bound to the sending slot (`noteUserChat`), so a crewmate the
+user just messaged stays listed after they switch away. On the first roster read
+of a data home, a one-time seed (`seeded` in the file) fills the record from each
+bound DM thread's newest user-role speech row that does not open with `[` (every
+row the gateway injects under the user role does); a seed that cannot read a
+thread (no log, a busy transcript) is not marked done and runs again on a later
+read. Every writer refuses to
+replace a file it cannot read. Every other row is hidden and appears when the
+search text matches it. The star, origin and status filters narrow the rows the
+roster shows, so choosing an origin does not reach a hidden row; the search is
+the one door within the roster list. A team's view (`?team=`) and the team
+dialog are built from the whole roster, so they still list every crewmate the
+user put on that team -- placing a crewmate on a team is itself a choice to use
+it -- and a team whose crewmates are all hidden keeps its (empty) roster header.
+The crewmate open in the thread stays listed while open, and a remembered
+crewmate is restored even when the rule hides it; where nothing auto-opens
+(below md) and every row is hidden, the roster says so and names the search.
+Recent order is by `last_chat_ts`. A row from an older gateway that carries no
+`last_chat_ts` keeps that gateway's rule: listed when its DM thread holds a
+message (`has_dm_message`), it was created on the dashboard
+(`dashboard_created`), it carries a non-empty live `last_message`, or it is the
+default crew; a row carrying neither boolean is listed, and a failed
+default-crew lookup lists every such row. The header count and the filter
+tallies count the listed rows plus any hidden row the search reaches.
 
 Deleting a crewmate is available on this page: the crewmate's edit controls
 open the shared `CrewEditorDialog` in place, and its Danger pane deletes the

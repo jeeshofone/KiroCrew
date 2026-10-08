@@ -10,6 +10,9 @@ import { CrewmatesSection } from './CrewmatesSection'
 import { i18nT } from '../../i18n/t'
 const DEV_MODE_KEY = 'mc-dev-mode'
 const DEV_MODE_EVENT = 'mc-dev-mode-changed'
+/** The remote guide's SSH-tunnel section: it works on every desktop OS and
+ *  covers both a hand-run forward and the app-held one (#3810). */
+const LOCAL_GATEWAY_TUNNEL_GUIDE = 'https://github.com/kirodotdev/KiroCrew/blob/main/docs/guides/remote-and-mobile.md#ssh-tunnel-laptop'
 
 /** Settings > Developer tab.
  *
@@ -79,10 +82,23 @@ export function DeveloperPanel() {
         <SettingsCard>
           <SettingsToggle
             label={i18nT('pages.settings.developerPanel.run_a_local_gateway')}
-            description={i18nT('pages.settings.developerPanel.start_a_gateway_on_this_machine_turn_it_off_to_u')}
+            description={i18nT('pages.settings.developerPanel.turn_it_off_only_when_a_gateway_already_answers')}
             checked={localGatewayEnabled}
             onChange={setLocalGatewayEnabled}
           />
+          {/* "Off" has a prerequisite: this app's port must reach a crew saved
+              for it (Set Remote Host…), through the app-held tunnel or one the
+              user runs. A hand-run tunnel with no saved crew is refused as a
+              foreign holder (#3810). The guide's SSH-tunnel section covers it. */}
+          <a
+            href={LOCAL_GATEWAY_TUNNEL_GUIDE}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1.5 text-[13px] font-medium text-accent hover:underline py-1"
+          >
+            {i18nT('pages.settings.developerPanel.how_to_set_up_an_ssh_tunnel')}
+            <ExternalLink size={13} className="lucide-inline" />
+          </a>
         </SettingsCard>
       </SettingsSection>
     )}

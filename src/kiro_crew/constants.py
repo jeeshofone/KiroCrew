@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 import re
 from collections.abc import Iterator
 
@@ -103,13 +104,114 @@ def node_version_meets_floor(
     return tuple(version) >= tuple(floor)
 
 
+# Minimum glibc the OFFICIAL Node.js >= 18 Linux binaries (nodejs.org and the
+# prebuilt tarballs nvm/mise fetch) are linked against. Amazon Linux 2 ships
+# glibc 2.26, so those binaries are present on PATH but fail to LOAD with
+# "GLIBC_2.28 not found" -- which means the usual "install from nodejs.org / nvm
+# install" advice sends an AL2 user in a circle. ``ensure-node.sh`` already
+# resolves this by unpacking the nodejs "unofficial-builds" glibc-217 variant
+# (compiled against glibc 2.17); the message below points there instead on a
+# host whose glibc is below this floor.
+_OFFICIAL_NODE_GLIBC_FLOOR: tuple[int, int] = (2, 28)
+
+
+def _host_glibc_version() -> tuple[int, int] | None:
+    """This host's glibc (major, minor), or ``None`` when it cannot be read.
+
+    ``None`` on any non-glibc or unreadable host (macOS, Windows, musl, or an
+    unparseable version string) so the caller stays with the default remedy
+    rather than guessing. Uses ``platform.libc_ver`` -- the same reader
+    ``wheel_engine._no_wheel_message`` relies on -- and never raises.
+    """
+    if platform.system() != "Linux":
+        return None
+    try:
+        name, ver = platform.libc_ver()
+    except Exception:
+        return None
+    if name != "glibc" or not ver:
+        return None
+    m = re.match(r"^(\d+)\.(\d+)", ver)
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)))
+
+
+def _glibc217_ensure_node_path() -> str | None:
+    """Path to the bundled ``ensure-node.sh`` when it ships here, else ``None``.
+
+    Returns ``None`` on a pip/wheel install, which ships no shell script
+    (``env._ensure_node_script`` returns ``None`` there). Independent of CPU --
+    the caller gates the x86_64 requirement separately -- so a path here means
+    "the auto-provisioner is available", not "it will succeed". Never raises.
+    """
+    try:
+        from kiro_crew.env import _ensure_node_script
+
+        script = _ensure_node_script()
+    except Exception:
+        return None
+    return str(script) if script is not None else None
+
+
 def node_too_old_message(
     version: tuple[int, int, int], floor: tuple[int, int, int] = MIN_NODE_VERSION
 ) -> str:
-    """User-facing line naming the found version, the exact floor, and the fix."""
-    return (
+    """User-facing line naming the found version, the exact floor, and the fix.
+
+    On a host whose glibc is older than the official Node binaries' floor
+    (Amazon Linux 2 ships glibc 2.26), the usual nodejs.org / nvm advice fails
+    to LOAD -- the binaries exist but raise "GLIBC_2.28 not found". The remedy
+    then depends on the host, and the action is stated FIRST:
+
+    * x86_64 with the bundled script -> ``bash <path>`` auto-installs the
+      glibc-2.17 Node build.
+    * x86_64 without the script (pip/wheel install) -> that same glibc-2.17
+      build DOES run here, so install it from unofficial-builds.nodejs.org (or
+      move to a newer base image).
+    * aarch64/Graviton -> no glibc-2.17 build is published for ARM, so move to a
+      newer base image (Amazon Linux 2023, Ubuntu 22.04+) or build from source.
+    """
+    base = (
         f"Node.js v{format_node_version(version)} is too old: Kiro Crew needs "
-        f"v{format_node_version(floor)} or newer. Update Node.js: install 24 LTS "
+        f"v{format_node_version(floor)} or newer."
+    )
+    glibc = _host_glibc_version()
+    if glibc is not None and glibc < _OFFICIAL_NODE_GLIBC_FLOOR:
+        # Official Node binaries will not load here. The remedy is per-host, and
+        # the ACTION comes first; the glibc explanation trails it.
+        why = (
+            f"This host's glibc ({glibc[0]}.{glibc[1]}) is older than the official "
+            f"Node.js builds require (glibc {_OFFICIAL_NODE_GLIBC_FLOOR[0]}."
+            f"{_OFFICIAL_NODE_GLIBC_FLOOR[1]}+), so a nodejs.org / nvm install "
+            'would fail to run with "GLIBC_... not found".'
+        )
+        if platform.machine() == "x86_64":
+            script = _glibc217_ensure_node_path()
+            if script is not None:
+                action = (
+                    f"Run `bash {script}` to install the glibc-2.17 Node build "
+                    "that runs here, or move to a newer base image "
+                    "(Amazon Linux 2023, Ubuntu 22.04+)."
+                )
+            else:
+                # pip/wheel install: no bundled script, but the x64 glibc-2.17
+                # build still runs -- point at it directly, not a migration.
+                action = (
+                    "Install the glibc-2.17 Node build from "
+                    "https://unofficial-builds.nodejs.org, or move to a newer "
+                    "base image (Amazon Linux 2023, Ubuntu 22.04+)."
+                )
+        else:
+            # aarch64/Graviton: upstream publishes no arm64 glibc-2.17 build.
+            action = (
+                "No glibc-2.17 Node build is published for this CPU; move to a "
+                "newer base image (Amazon Linux 2023, Ubuntu 22.04+) or build "
+                "Node from source."
+            )
+        return f"{base} {action} ({why})"
+    return (
+        f"{base} Update Node.js: install 24 LTS "
         "from https://nodejs.org, or run `nvm install 24` / `mise use -g node@24`."
     )
 

@@ -1882,21 +1882,24 @@ class TestReleaseConversation:
 
 
 class TestSweepConversations:
-    def test_fresh_conversation_kept(self) -> None:
+    @pytest.mark.asyncio
+    async def test_fresh_conversation_kept(self) -> None:
         mgr = _manager()
         mgr._conversations["subagent:c1"] = 1000.0
-        mgr._sweep_conversations(now=1001.0)
+        await mgr._sweep_conversations_async(now=1001.0)
         assert "subagent:c1" in mgr._conversations
 
-    def test_busy_conversation_refreshed_not_released(self) -> None:
+    @pytest.mark.asyncio
+    async def test_busy_conversation_refreshed_not_released(self) -> None:
         mgr = _manager()
         mgr._conversations["subagent:c1"] = 0.0
         mgr._agents["c1"] = _info("c1")
         now = float(sa._CONVERSATION_TTL_SECS * 3)
-        mgr._sweep_conversations(now=now)
+        await mgr._sweep_conversations_async(now=now)
         assert mgr._conversations["subagent:c1"] == now
 
-    def test_expired_conversation_released(self) -> None:
+    @pytest.mark.asyncio
+    async def test_expired_conversation_released(self) -> None:
         mgr = _manager()
         mgr._conversations["subagent:c1"] = 0.0
         mgr._sessions.forget_conversation.return_value = "sid-1"
@@ -1904,7 +1907,7 @@ class TestSweepConversations:
             patch.object(sa, "update_state"),
             patch.object(sa, "_cleanup_session_files_sync"),
         ):
-            mgr._sweep_conversations(now=float(sa._CONVERSATION_TTL_SECS * 3))
+            await mgr._sweep_conversations_async(now=float(sa._CONVERSATION_TTL_SECS * 3))
         assert "subagent:c1" not in mgr._conversations
 
 

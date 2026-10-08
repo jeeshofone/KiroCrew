@@ -515,10 +515,14 @@ class FieldSpec:
     allowed: frozenset[str] | None = None  # enum allow-list
     pattern: re.Pattern[str] | None = None  # regex pattern
     default: Any = None
-    item_type: type | None = None  # type: ignore[valid-type]  # for list fields: expected type of each element
+    item_type: type | tuple[type, ...] | None = None  # type: ignore[valid-type]  # for list fields: expected type(s) of each element
     item_max_len: int = 0  # for list fields: max length of each string element
     item_pattern: re.Pattern[str] | None = None  # for list fields: regex for each string element
     max_items: int = 0  # for list fields: max number of items (0 = no limit)
+    # For list fields whose items may be objects: the ToolSchema each dict item
+    # is validated against (unknown keys refused, like a top-level call). Only
+    # consulted when ``item_type`` admits ``dict``.
+    item_schema: Any = None
     # Opt-in, and DELIBERATELY narrow: when a string field is over ``max_len``,
     # truncate it to the cap instead of rejecting the whole call. For a field
     # whose only job is to EXPLAIN a request — ``autonudge_stop`` /
@@ -633,10 +637,20 @@ def validate_field(value: Any, spec: FieldSpec) -> Any:
         if spec.item_type:
             for i, item in enumerate(value):
                 if not isinstance(item, spec.item_type):
+                    item_types: tuple[type, ...] = (
+                        spec.item_type if isinstance(spec.item_type, tuple) else (spec.item_type,)
+                    )
+                    expected = " or ".join(t.__name__ for t in item_types)
                     raise ValidationError(
                         spec.name,
-                        f"item[{i}]: expected {spec.item_type.__name__}, got {type(item).__name__}",
+                        f"item[{i}]: expected {expected}, got {type(item).__name__}",
                     )
+                if isinstance(item, dict) and spec.item_schema is not None:
+                    try:
+                        value[i] = validate_tool_args(item, spec.item_schema)
+                    except ValidationError as exc:
+                        raise ValidationError(f"{spec.name}[{i}].{exc.field}", exc.message) from exc
+                    continue
                 if isinstance(item, str):
                     item = sanitize_string(item)
                     value[i] = item
@@ -1287,11 +1301,32 @@ def validate_jsonrpc_request(req: dict[str, Any]) -> tuple[str, Any, dict[str, A
 
 # ── Tool Schemas (MCP Core) ──
 
+#: One ``spawn_run`` ``tasks[]`` entry in object form. A string
+#: entry is the plain prompt; an object entry carries the prompt plus the
+#: per-task overrides that win over the call's batch-wide value. Kept to the
+#: fields a caller varies across one wave in practice (model, effort); a
+#: per-task template is ``agents``. The rest stay batch-wide and can join this
+#: object later without changing the shape again.
+SPAWN_RUN_TASK_ITEM_SCHEMA = ToolSchema(
+    tool_name="spawn_run.tasks[]",
+    fields=[
+        FieldSpec("task", str, required=True, max_len=MAX_MEDIUM_STRING),
+        FieldSpec("model", str, max_len=MAX_SHORT_STRING, pattern=_MODEL_NAME_RE),
+        FieldSpec("reasoning_effort", str, allowed=EFFORT_VALUES),
+    ],
+)
+
 SPAWN_RUN_SCHEMA = ToolSchema(
     tool_name="spawn_run",
     fields=[
         FieldSpec("task", str, max_len=MAX_MEDIUM_STRING),
-        FieldSpec("tasks", list, item_type=str, item_max_len=MAX_MEDIUM_STRING),
+        FieldSpec(
+            "tasks",
+            list,
+            item_type=(str, dict),
+            item_max_len=MAX_MEDIUM_STRING,
+            item_schema=SPAWN_RUN_TASK_ITEM_SCHEMA,
+        ),
         FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=REGISTERED_AGENT_NAME_RE),
         FieldSpec(
             "agents",
@@ -4427,9 +4462,88 @@ PANEL_PUBLISH_SCHEMA = ToolSchema(
 # would pass it through unvalidated.
 PANEL_TEMPLATES_SCHEMA = ToolSchema(tool_name="panel_templates")
 
+#: Empty and registered, for ``PANEL_TEMPLATES_SCHEMA``'s reason: the tool takes no
+#: arguments, and an empty registered schema REJECTS an unexpected one where no
+#: schema at all would pass it through unvalidated.
+DASHBOARD_FIELDS_SCHEMA = ToolSchema(tool_name="dashboard_fields")
+
+DASHBOARD_WRITE_SCHEMA = ToolSchema(
+    tool_name="dashboard_write",
+    fields=[
+        FieldSpec("field", str, required=True, max_len=64),
+        # EVERY JSON SCALAR AND CONTAINER, spelled out, because the field's type is
+        # the MANIFEST's to declare and not this schema's. A schema that pinned one
+        # type would either contradict the manifest or restate it, and a value may
+        # be a number, a phrase, a boolean, a list or an object depending on which
+        # field it is.
+        #
+        # ``bool`` is listed FIRST and separately from the rest for a reason that
+        # bit once already: a bare ``object`` here rejects ``True``, so a crewmate
+        # writing into a ``boolean`` field was refused by the schema -- with a
+        # message about an expected object, which is neither the real problem nor
+        # something the agent could act on. ``dashboard_agentic.check_write`` is
+        # the one place that knows what each field wants, and it refuses with a
+        # code the mistake book can group and teach; this schema's only job is to
+        # reject an unexpected ARGUMENT.
+        FieldSpec("value", (bool, int, float, str, list, dict), required=True),
+    ],
+)
+
+DASHBOARD_TEMPLATES_SCHEMA = ToolSchema(
+    tool_name="dashboard_templates",
+    fields=[
+        # Optional, and the absence is a real case rather than a default: no query
+        # means "list them all", which is what an agent asks for when the person has
+        # not said what they want to see yet.
+        FieldSpec("query", str, max_len=200),
+    ],
+)
+
+DASHBOARD_PREVIEW_SCHEMA = ToolSchema(
+    tool_name="dashboard_preview",
+    fields=[
+        # ``template_id`` is the only argument this tool acts on, and it is NOT marked
+        # required: a missing one is refused by the tool with the sentence that names
+        # what to call instead, where a schema refusal would name only the field.
+        FieldSpec("template_id", str, max_len=64),
+        # ``manifest`` and ``html`` are still ACCEPTED here, and refused one layer up.
+        # A page the caller wrote cannot be previewed or adopted -- see
+        # ``instance.AUTHORED_PAGE_REFUSAL`` -- and dropping these two specs would make
+        # that refusal read "unknown field", which tells a caller to try a different
+        # spelling rather than that the whole capability is a later change. The caps
+        # bound what reaches the refusal; ``html`` matches the store's own
+        # ``MAX_INSTANCE_HTML_BYTES`` ceiling spelled in characters.
+        FieldSpec("manifest", dict),
+        FieldSpec("html", str, max_len=64 * 1024),
+    ],
+)
+
+#: Empty and registered, for ``PANEL_TEMPLATES_SCHEMA``'s reason -- and here the
+#: emptiness is also the safety property the tool advertises: apply installs the page
+#: that was STAGED, so an accepted argument would be a way to make the thing applied
+#: differ from the thing the person looked at.
+DASHBOARD_APPLY_SCHEMA = ToolSchema(tool_name="dashboard_apply")
+
+DASHBOARD_ROLLBACK_SCHEMA = ToolSchema(
+    tool_name="dashboard_rollback",
+    fields=[
+        # No upper bound: the ceiling is whatever version this instance has reached,
+        # which this schema cannot know. The store refuses a version above the current
+        # one with a sentence naming the current one, which is the number the caller
+        # needs; a fixed maximum here would refuse with a limit that means nothing.
+        FieldSpec("to_version", int, required=True, min_val=1),
+    ],
+)
+
 MCP_PANEL_SCHEMAS: dict[str, ToolSchema] = {
     "panel_publish": PANEL_PUBLISH_SCHEMA,
     "panel_templates": PANEL_TEMPLATES_SCHEMA,
+    "dashboard_fields": DASHBOARD_FIELDS_SCHEMA,
+    "dashboard_write": DASHBOARD_WRITE_SCHEMA,
+    "dashboard_templates": DASHBOARD_TEMPLATES_SCHEMA,
+    "dashboard_preview": DASHBOARD_PREVIEW_SCHEMA,
+    "dashboard_apply": DASHBOARD_APPLY_SCHEMA,
+    "dashboard_rollback": DASHBOARD_ROLLBACK_SCHEMA,
 }
 
 MCP_COMPUTER_SCHEMAS: dict[str, ToolSchema] = {

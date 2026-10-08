@@ -506,19 +506,21 @@ class TestApiSpawnRelease:
 
     def test_409_while_busy(self) -> None:
         mgr = _mgr()
-        mgr.release_conversation.return_value = (False, "conversation_busy: in flight")
+        mgr.release_conversation_async = AsyncMock(
+            return_value=(False, "conversation_busy: in flight")
+        )
         resp = _run(mod.api_spawn_release, self._req(mgr))
         assert resp.status == 409
         assert _payload(resp)["code"] == "conversation_busy"
 
     def test_404_when_gone(self) -> None:
         mgr = _mgr()
-        mgr.release_conversation.return_value = (False, "conversation_gone")
+        mgr.release_conversation_async = AsyncMock(return_value=(False, "conversation_gone"))
         assert _run(mod.api_spawn_release, self._req(mgr)).status == 404
 
     def test_success(self) -> None:
         mgr = _mgr()
-        mgr.release_conversation.return_value = (True, "")
+        mgr.release_conversation_async = AsyncMock(return_value=(True, ""))
         resp = _run(mod.api_spawn_release, self._req(mgr))
         assert _payload(resp) == {"conversation": "conv1", "status": "released"}
 

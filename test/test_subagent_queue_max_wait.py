@@ -808,7 +808,7 @@ class TestAnExpiryOutlivesItsProcess:
             monkeypatch.setattr(mgr, "_refresh_learned_settled", MagicMock())
             monkeypatch.setattr(mgr, "_sweep_stuck_waves_async", AsyncMock())
             monkeypatch.setattr(mgr, "_sweep_digest_holds_async", AsyncMock())
-            monkeypatch.setattr(mgr, "_sweep_conversations", MagicMock())
+            monkeypatch.setattr(mgr, "_sweep_conversations_async", AsyncMock())
             monkeypatch.setattr(mgr, "_taskq_pump", MagicMock())
             reaper = asyncio.ensure_future(mgr._reaper_loop())
             try:
@@ -1187,7 +1187,7 @@ class TestARefusedTeardownSweepIsRetried:
             monkeypatch.setattr(mgr, "_refresh_learned_settled", MagicMock())
             monkeypatch.setattr(mgr, "_sweep_stuck_waves_async", AsyncMock())
             monkeypatch.setattr(mgr, "_sweep_digest_holds_async", AsyncMock())
-            monkeypatch.setattr(mgr, "_sweep_conversations", MagicMock())
+            monkeypatch.setattr(mgr, "_sweep_conversations_async", AsyncMock())
             monkeypatch.setattr(mgr, "_taskq_pump", MagicMock())
             reaper = asyncio.ensure_future(mgr._reaper_loop())
             try:

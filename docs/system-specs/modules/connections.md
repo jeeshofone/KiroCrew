@@ -30,7 +30,11 @@ grant still lives with kiro-cli and nothing here reads it. Kiro Crew keeps the
 secret in the encrypted vault (`CONNECTIONS_<SLUG>_CLIENT_SECRET`) as the source
 of truth and writes it into the emitted agent spec as `oauth.clientSecret` only
 because that file is the one thing kiro-cli reads — **the same footing the
-existing `headers` secrets have: vault is truth, the spec is a projection.** See
+existing `headers` secrets have: vault is truth, the spec is a projection.** The
+projection is owner-only on POSIX: every agent-spec write lands at `0o600` (an
+existing file keeps its owner bits and loses group/other), so the plaintext is
+never readable by another local user. Moving the secret off disk entirely needs a
+kiro-cli runtime secret channel and is tracked in #10702. See
 "Pre-registered OAuth clients" below.
 
 ## Status and cancel

@@ -27,7 +27,7 @@ import { beginArtifactWrite, endArtifactWrite } from '../lib/artifactWrites'
 import { withDeadline } from '../lib/withDeadline'
 import { installApiTransport } from './apiTransport'
 import { isDeadlineError, queryClient, invalidateAcrossQueryClients } from './queryClient'
-import { recordError, attachReport, parseErrorCode, requestPath } from '../utils/errorReport'
+import { recordError, recordTransportRejection, attachReport, parseErrorCode, requestPath } from '../utils/errorReport'
 import { i18nT } from '../i18n/t'
 import type { ClientTransport } from './client/transport'
 import { createSystemEndpoints } from './client/system'
@@ -165,6 +165,8 @@ export type {
   CrewTeam,
   CrewPanelData,
   CrewPanelMeta,
+  DashboardFieldSpec,
+  DashboardManifest,
 } from './client/agents'
 export { SLASH_COMMANDS_TIMEOUT_MS } from './client/chatSlotSettings'
 export type {
@@ -953,14 +955,34 @@ function withJournaledDeadline<T>(
 ): Promise<T> {
   return withDeadline(ms, outer, attempt).catch((error: unknown) => {
     if (isDeadlineError(error)) {
-      const report = recordError({
-        source: 'api',
-        message: error instanceof Error ? error.message : String(error),
-        code: 'timeout',
-        endpoint,
-      })
-      // `isDeadlineError` has already established this is a non-null object.
-      attachReport(error as object, report)
+      // `jfetch` already journals and pins a report when the inner fetch rejects
+      // with a TimeoutError, so an attempt that uses `jfetch` arrives here with
+      // a report already attached. Re-journaling would emit a duplicate entry
+      // (burning a ring slot) and overwrite the pinned endpoint with a second
+      // report that describes the same failure — both are waste. Only journal
+      // when the error carries no report yet (an attempt that bypasses `jfetch`
+      // or a deadline on a non-fetch operation).
+      const alreadyPinned = typeof error === 'object' && error !== null
+        && 'errorReport' in (error as Record<string, unknown>)
+      if (!alreadyPinned) {
+        // Route through `recordTransportRejection`, NOT `recordError`: a timeout
+        // whose `jfetch` entry the burst cap already suppressed arrives here with
+        // no pin (the suppressed call attached nothing), and `recordError` would
+        // skip the cap and re-add the very entry the cap dropped. The cap keys on
+        // `method + endpoint`; the method the inner `jfetch` saw is lost by here,
+        // so this re-record keys on the endpoint under the default GET bucket —
+        // which is the same bucket `jfetch` used for the suppressed GET it is
+        // standing in for, so the suppression carries through. A still-live key
+        // hands back its stored report; only a genuinely unrecorded deadline
+        // (an attempt that never went through `jfetch`) adds a fresh entry.
+        const report = recordTransportRejection({
+          message: error instanceof Error ? error.message : String(error),
+          code: 'timeout',
+          endpoint,
+        })
+        // `isDeadlineError` has already established this is a non-null object.
+        if (report) attachReport(error as object, report)
+      }
     }
     throw error
   })
@@ -970,6 +992,62 @@ function withJournaledDeadline<T>(
 // Without it, browser requests would skip the `if sk:` check — a fail-open
 // path that an MCP subprocess could exploit by omitting its own header.
 const _sk = { 'X-Session-Key': 'dashboard:ui' }
+
+/**
+ * A deliberate cancellation rather than a failure: an unmount, a navigation, or
+ * a react-query key that was superseded aborts the in-flight request on purpose.
+ * `fetch` rejects such a request with an `AbortError` DOMException. Recording it
+ * would evict a real report from the 20-deep ring for a request nobody was still
+ * waiting on — so these are the one transport rejection the journal skips.
+ *
+ * A `withDeadline` expiry is NOT an abort in this sense: it aborts with a
+ * `TimeoutError`-named reason (see lib/withDeadline), which `isDeadlineError`
+ * recognises and which is a genuine failure worth keeping.
+ */
+function isDeliberateAbort(error: unknown): boolean {
+  if (isDeadlineError(error)) return false
+  return typeof error === 'object' && error !== null
+    && (error as { name?: unknown }).name === 'AbortError'
+}
+
+/**
+ * The transport's rejection chokepoint. Wraps every `fetch` the API layer issues
+ * so a request that fails BEFORE producing an HTTP `Response` — a network drop
+ * (`TypeError: Failed to fetch` / `Load failed`), or a `withDeadline` timeout —
+ * is written to the same error journal that `apiFailure` writes answered
+ * failures to. Without this, `recordError` only ever runs once the server has
+ * answered, so the one failure class with no server-side log (the request never
+ * arrived) was also the one the client did not record — the exact gap #9579 and
+ * #12433 report.
+ *
+ * The message is journaled VERBATIM: `findReport` resolves the "ask the agent"
+ * hand-off by exact message match, so rewording here would orphan the entry this
+ * exists to create. Deliberate aborts are skipped (see `isDeliberateAbort`), and
+ * `recordTransportRejection` burst-caps per endpoint so offline polling cannot
+ * flush the ring. The original error is rethrown UNCHANGED: callers and tests
+ * key off its own message, and the report rides on it via `attachReport` so a
+ * notice resolves THIS request's endpoint rather than another rejection's.
+ */
+function jfetch(input: string, init?: RequestInit): Promise<Response> {
+  // Forward with the SAME argument shape the caller used: a raw read written on
+  // `fetch('/api/…')` with no init must stay a one-argument call, because adding
+  // a second `undefined` is a wire change the transport-contract tests pin (and
+  // keeping the shapes identical means this wrapper is observable only on the
+  // rejection path it exists for).
+  const request = init === undefined ? fetch(input) : fetch(input, init)
+  return request.catch((error: unknown) => {
+    if (!isDeliberateAbort(error)) {
+      const report = recordTransportRejection({
+        message: error instanceof Error ? error.message : String(error),
+        endpoint: requestPath(input),
+        method: (init?.method ?? 'GET').toUpperCase(),
+        code: isDeadlineError(error) ? 'timeout' : 'network',
+      })
+      if (report && typeof error === 'object' && error !== null) attachReport(error as object, report)
+    }
+    throw error
+  })
+}
 
 /**
  * Count a mutating request against the artifact it targets, so the leave-time
@@ -999,7 +1077,7 @@ function trackArtifactWrite(url: string, res: Promise<Response>): Promise<Respon
 }
 
 const get = (url: string, sessionKey?: string, signal?: AbortSignal) =>
-  fetch(url, { headers: { ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk) }, ...(signal ? { signal } : {}) })
+  jfetch(url, { headers: { ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk) }, ...(signal ? { signal } : {}) })
 const post = (
   url: string,
   body?: object,
@@ -1007,7 +1085,7 @@ const post = (
   extra?: HeadersInit,
   redirect?: RequestRedirect,
 ) =>
-  trackArtifactWrite(url, fetch(url, {
+  trackArtifactWrite(url, jfetch(url, {
     method: 'POST',
     // sessionKey overrides the shared `dashboard:ui` placeholder with the REAL
     // slot. The placeholder satisfies the server's `if sk:` gate but names no
@@ -1025,11 +1103,11 @@ const post = (
     body: body ? JSON.stringify(body) : undefined,
   }))
 const put = (url: string, body: object, sessionKey?: string, extra?: HeadersInit) =>
-  trackArtifactWrite(url, fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json', ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk), ...extra }, body: JSON.stringify(body) }))
+  trackArtifactWrite(url, jfetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json', ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk), ...extra }, body: JSON.stringify(body) }))
 const del = (url: string, body?: object, sessionKey?: string, extra?: HeadersInit) =>
-  trackArtifactWrite(url, fetch(url, { method: 'DELETE', headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk), ...extra }, body: body ? JSON.stringify(body) : undefined }))
+  trackArtifactWrite(url, jfetch(url, { method: 'DELETE', headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk), ...extra }, body: body ? JSON.stringify(body) : undefined }))
 const patch = (url: string, body: object, sessionKey?: string, signal?: AbortSignal) =>
-  trackArtifactWrite(url, fetch(url, {
+  trackArtifactWrite(url, jfetch(url, {
     method: 'PATCH',
     // Same override as post(): replace the shared `dashboard:ui` placeholder with
     // the REAL slot when the write belongs to a chat session, so the server's
@@ -1120,6 +1198,7 @@ const transport: ClientTransport = {
   j,
   jNullable,
   jInstancesDisabled,
+  jfetch,
   sessionKeyHeader: _sk,
   checkSessionExpired,
   removeAuthBanner,

@@ -261,6 +261,17 @@ def test_the_snapshot_command_line_is_unchanged() -> None:
         ),
         (("--components",), "components", None, None, None, None, None, "_StoreAction"),
         (("--purpose",), "purpose", None, None, "backup", None, None, "_StoreAction"),
+        (
+            ("--strict",),
+            "strict",
+            0,
+            True,
+            False,
+            None,
+            "Exit 3 instead of 0 when the bundle was written but omits entries it was "
+            "asked to carry (see MANIFEST.json 'skipped'). The bundle is kept.",
+            "_StoreTrueAction",
+        ),
         (("--to",), "to", None, None, None, None, argparse.SUPPRESS, "_StoreAction"),
     ]
 

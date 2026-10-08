@@ -67,7 +67,7 @@ export const FILE_SEARCH_TIMEOUT_MS = 15_000
  *  them. */
 export const BROWSE_FILES_TIMEOUT_MS = 10_000
 
-export function createFilesEndpoints({ post, put, del, j, checkSessionExpired, withJournaledDeadline }: ClientTransport) {
+export function createFilesEndpoints({ post, put, del, j, jfetch: fetch, checkSessionExpired, withJournaledDeadline }: ClientTransport) {
   const projects = {
     // Follow-up card: create a sibling git worktree of `repo` on a new `branch`.
     // Resolves with the created path, or rejects with the server's message

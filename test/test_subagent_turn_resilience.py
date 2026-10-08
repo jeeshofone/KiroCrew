@@ -1341,6 +1341,37 @@ async def test_unexpected_cancel_auto_continues_once():
 
 
 @pytest.mark.asyncio
+async def test_unexpected_cancel_hand_off_is_visible_to_a_wait_for_waiter():
+    """A waiter whose ``wait_for`` deadline cancels the run must see
+    ``TimeoutError``, and the original task must end cancelled, because the run
+    has moved to the ``:recovery`` task and has not finished. A task that
+    swallowed the cancel made ``wait_for`` return normally instead."""
+    started = asyncio.Event()
+    mgr = _manager(_mock_sessions(_hanging_stream_factory(started)))
+
+    with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+        info = mgr.spawn("interruptible job")
+        assert info is not None
+        await asyncio.wait_for(started.wait(), timeout=_START_TIMEOUT)
+        task1 = mgr._tasks[info.id]
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(task1, timeout=0.05)
+
+        assert task1.cancelled()
+        assert info.done is False
+        assert info._cancel_retry_used is True
+
+        # The continuation still happens on a fresh task.
+        started.clear()
+        await asyncio.wait_for(started.wait(), timeout=_RESPAWN_TIMEOUT)
+        task2 = mgr._tasks.get(info.id)
+        assert task2 is not None and task2 is not task1
+        await mgr.cancel_all()
+
+    assert info.done is True
+
+
+@pytest.mark.asyncio
 async def test_unexpected_cancel_after_tool_activity_finalizes_without_respawn():
     """Once ANY tool has executed, an unexpected cancel must NOT auto-respawn:
     the respawn would run on a fresh session with no tool ledger, so the model

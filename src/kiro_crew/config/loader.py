@@ -3400,6 +3400,7 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
         title_refresh_every_turns=section.read(
             "title_refresh_every_turns", _title_refresh_every_turns
         ),
+        title_ticket_prefix=section.read("title_ticket_prefix", _safe_bool),
         mcp_probe_timeout_secs=section.read(
             "mcp_probe_timeout_secs", _safe_int, MCP_PROBE_TIMEOUT_MIN, MCP_PROBE_TIMEOUT_MAX
         ),

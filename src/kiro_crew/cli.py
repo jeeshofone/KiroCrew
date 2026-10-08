@@ -1922,6 +1922,14 @@ Examples:
     )
     snap_parser.add_argument("--keep", type=int, default=7, help="Keep N most recent snapshots")
     snap_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "Exit 3 instead of 0 when the bundle was written but omits entries it was "
+            "asked to carry (see MANIFEST.json 'skipped'). The bundle is kept."
+        ),
+    )
+    snap_parser.add_argument(
         "--list", action="store_true", dest="list_snapshots", help="List existing snapshots"
     )
     snap_parser.add_argument(

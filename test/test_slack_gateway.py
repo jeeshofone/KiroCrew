@@ -23,6 +23,7 @@ from wheel_update_test_helpers import ARTIFACT_BASE, FEED_BASE, wire_wheel_apply
 
 from kiro_crew.autonudge import NudgeLoop
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.dashboard.handlers import updates as dashboard_updates
 from kiro_crew.slack import gateway as gw
 from kiro_crew.slack.gateway import (
     _CRON_MSG_LIMIT,
@@ -114,6 +115,23 @@ class _ImportlibWithoutReload:
 
     def __getattr__(self, name):
         return getattr(importlib, name)
+
+
+@pytest.fixture(autouse=True)
+def _restore_update_check_cache():
+    """Hand the next test the update-check cache this one inherited.
+
+    ``dashboard.handlers.updates._update_info`` is one process-wide dict, and the
+    gateway imported it by identity, so it is restored in place, never rebound. Tests
+    here clear it and seed their own verdicts, and the provider path writes
+    ``managed_by="command"`` into it; left behind, that key makes a later legacy check
+    on the same worker read "a policy update command owns this install" and only
+    notify, so an apply the test expects never runs.
+    """
+    inherited = dict(dashboard_updates._update_info)
+    yield
+    dashboard_updates._update_info.clear()
+    dashboard_updates._update_info.update(inherited)
 
 
 def _install_effect(effect: str = "install", route: str | None = "git"):
@@ -1161,22 +1179,20 @@ class TestCheckForUpdates:
         import kiro_crew.dashboard.handlers as _h
         from kiro_crew.platform.governance import UpdatePins
 
-        orig = _h._update_info.copy()
         # Create a config with auto_update=False
         fake_cfg = MagicMock()
         fake_cfg.auto_update = False
-        try:
-            _h._update_info.update({"update_available": True, "version": "9.9.9"})
-            with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
-                with patch("kiro_crew.config.KiroCrewConfig.load", return_value=fake_cfg):
-                    with patch(
-                        "kiro_crew.platform.governance.active_update_pins",
-                        return_value=UpdatePins(),
-                    ):
-                        await orch._check_for_updates()
-        finally:
-            _h._update_info.clear()
-            _h._update_info.update(orig)
+        # The check's verdict and nothing else: an earlier test's keys (a provider's
+        # managed_by) must not decide the branch. The module fixture restores it.
+        _h._update_info.clear()
+        _h._update_info.update({"update_available": True, "version": "9.9.9"})
+        with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
+            with patch("kiro_crew.config.KiroCrewConfig.load", return_value=fake_cfg):
+                with patch(
+                    "kiro_crew.platform.governance.active_update_pins",
+                    return_value=UpdatePins(),
+                ):
+                    await orch._check_for_updates()
         orch._auto_apply_update.assert_not_awaited()
         ds.push_refresh.assert_called_with("update_available")
 
@@ -1199,22 +1215,18 @@ class TestCheckForUpdates:
 
         fake_cfg = MagicMock()
         fake_cfg.auto_update = True
-        orig = _h._update_info.copy()
-        try:
-            _h._update_info.update(
-                {"update_available": True, "can_apply": True, "version_newer": False}
-            )
-            with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
-                with patch("kiro_crew.config.KiroCrewConfig.load", return_value=fake_cfg):
-                    with patch(
-                        "kiro_crew.platform.update_governance.update_required",
-                        return_value=False,
-                    ):
-                        with _install_effect():
-                            await orch._check_for_updates()
-        finally:
-            _h._update_info.clear()
-            _h._update_info.update(orig)
+        _h._update_info.clear()
+        _h._update_info.update(
+            {"update_available": True, "can_apply": True, "version_newer": False}
+        )
+        with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
+            with patch("kiro_crew.config.KiroCrewConfig.load", return_value=fake_cfg):
+                with patch(
+                    "kiro_crew.platform.update_governance.update_required",
+                    return_value=False,
+                ):
+                    with _install_effect():
+                        await orch._check_for_updates()
         orch._auto_apply_update.assert_not_awaited()
         ds.push_refresh.assert_called_with("update_available")
 
@@ -1228,22 +1240,16 @@ class TestCheckForUpdates:
 
         fake_cfg = MagicMock()
         fake_cfg.auto_update = True
-        orig = _h._update_info.copy()
-        try:
-            _h._update_info.update(
-                {"update_available": True, "can_apply": True, "version_newer": True}
-            )
-            with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
-                with patch("kiro_crew.config.KiroCrewConfig.load", return_value=fake_cfg):
-                    with patch(
-                        "kiro_crew.platform.update_governance.update_required",
-                        return_value=False,
-                    ):
-                        with _install_effect():
-                            await orch._check_for_updates()
-        finally:
-            _h._update_info.clear()
-            _h._update_info.update(orig)
+        _h._update_info.clear()
+        _h._update_info.update({"update_available": True, "can_apply": True, "version_newer": True})
+        with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
+            with patch("kiro_crew.config.KiroCrewConfig.load", return_value=fake_cfg):
+                with patch(
+                    "kiro_crew.platform.update_governance.update_required",
+                    return_value=False,
+                ):
+                    with _install_effect():
+                        await orch._check_for_updates()
         orch._auto_apply_update.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -1265,39 +1271,30 @@ class TestCheckForUpdates:
         import kiro_crew.dashboard.handlers as _h
         from kiro_crew.platform.update_capability import CHECK_SUCCEEDED
 
-        orig = _h._update_info.copy()
-        try:
-            # A git checkout (`can_apply`) below the floor whose check SUCCEEDED
-            # but found no newer `__version__` (version_newer False). The wheel
-            # layout's equivalent no-newer-build path is
-            # test_mandatory_wheel_no_newer_build_notifies.
-            _h._update_info.update(
-                {
-                    "update_available": False,
-                    "can_apply": True,
-                    "version_newer": False,
-                    "check_status": CHECK_SUCCEEDED,
-                }
-            )
-            with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
-                with patch(
-                    "kiro_crew.platform.update_governance.update_required", return_value=True
-                ):
-                    with _install_effect("mandatory"):
-                        await orch._check_for_updates()
-            # Captured before the finally restores the pre-test cache.
-            update_available = _h._update_info["update_available"]
-            check_status = _h._update_info["check_status"]
-        finally:
-            _h._update_info.clear()
-            _h._update_info.update(orig)
+        # A git checkout (`can_apply`) below the floor whose check SUCCEEDED
+        # but found no newer `__version__` (version_newer False). The wheel
+        # layout's equivalent no-newer-build path is
+        # test_mandatory_wheel_no_newer_build_notifies.
+        _h._update_info.clear()
+        _h._update_info.update(
+            {
+                "update_available": False,
+                "can_apply": True,
+                "version_newer": False,
+                "check_status": CHECK_SUCCEEDED,
+            }
+        )
+        with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
+            with patch("kiro_crew.platform.update_governance.update_required", return_value=True):
+                with _install_effect("mandatory"):
+                    await orch._check_for_updates()
         orch._auto_apply_update.assert_not_awaited()
         ds.push_refresh.assert_called_with("update_available")
         # The notify path refreshes the badge but does NOT clobber the shared
         # check cache: the verdict the check wrote (no update available, check
         # succeeded) survives, mirroring the wheel branch.
-        assert update_available is False
-        assert check_status == CHECK_SUCCEEDED
+        assert _h._update_info["update_available"] is False
+        assert _h._update_info["check_status"] == CHECK_SUCCEEDED
 
     @pytest.mark.asyncio
     async def test_min_version_mandate_applies_when_a_newer_build_is_available(self):
@@ -1313,20 +1310,12 @@ class TestCheckForUpdates:
         orch._auto_apply_update = AsyncMock()
         import kiro_crew.dashboard.handlers as _h
 
-        orig = _h._update_info.copy()
-        try:
-            _h._update_info.update(
-                {"update_available": True, "can_apply": True, "version_newer": True}
-            )
-            with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
-                with patch(
-                    "kiro_crew.platform.update_governance.update_required", return_value=True
-                ):
-                    with _install_effect("mandatory"):
-                        await orch._check_for_updates()
-        finally:
-            _h._update_info.clear()
-            _h._update_info.update(orig)
+        _h._update_info.clear()
+        _h._update_info.update({"update_available": True, "can_apply": True, "version_newer": True})
+        with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
+            with patch("kiro_crew.platform.update_governance.update_required", return_value=True):
+                with _install_effect("mandatory"):
+                    await orch._check_for_updates()
         orch._auto_apply_update.assert_awaited_once()
         # The floor-mandated apply is marked so a no-op outcome stays visible.
         assert orch._auto_apply_update.await_args.kwargs.get("mandatory") is True

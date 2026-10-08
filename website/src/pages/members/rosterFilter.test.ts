@@ -7,7 +7,7 @@ import { describe, it, expect } from 'vitest'
 
 import {
   countByFilter, listedByDefault, matchesStatus, narrowRoster, parseSort, parseStatusFilters, queryNarrows,
-  rosterPopulation, rosterShows, sortRoster,
+  chatRecency, rosterPopulation, rosterShows, sortRoster,
   type MemberSignals, type RosterQuery,
 } from './rosterFilter'
 
@@ -225,5 +225,31 @@ describe('storage parsers reject junk', () => {
     expect(parseSort(null)).toBe('recent')
     expect(parseSort('name')).toBe('name')
     expect(parseSort('date-desc')).toBe('recent')
+  })
+})
+
+describe('last_chat_ts: only crews the user chatted with', () => {
+  // What a current gateway ships: every row carries the user's own last send.
+  const CHAT = [
+    { name: 'bg-only', source: 'kirocrew', dashboard_created: true, has_dm_message: true, last_message: 'patrol note', last_active_ts: 900, last_chat_ts: 0 },
+    { name: 'default', source: 'builtin', has_dm_message: false, last_active_ts: 50, last_chat_ts: 0 },
+    { name: 'app-bot', source: 'radar-app', has_dm_message: false, last_active_ts: 800, last_chat_ts: 0 },
+    { name: 'old-chat', source: 'package', has_dm_message: false, last_active_ts: 5, last_chat_ts: 100 },
+    { name: 'new-chat', source: 'kirocrew', has_dm_message: true, last_active_ts: 1, last_chat_ts: 300 },
+  ]
+  it('lists a row only when the user sent it a message, whatever else it carries', () => {
+    const listed = CHAT.filter((m) => listedByDefault(m, 'default')).map((m) => m.name)
+    expect(listed).toEqual(['old-chat', 'new-chat'])
+  })
+  it('ignores a failed default-crew lookup: the rule no longer needs it', () => {
+    expect(CHAT.filter((m) => listedByDefault(m, null)).map((m) => m.name)).toEqual(['old-chat', 'new-chat'])
+  })
+  it('still lists a starred row', () => {
+    expect(listedByDefault({ ...CHAT[0], starred: true }, 'default')).toBe(true)
+  })
+  it('orders Recent by the user\'s last send, not by background activity', () => {
+    expect(sortRoster(CHAT, 'recent').map((m) => m.name)).toEqual(['new-chat', 'old-chat', 'app-bot', 'bg-only', 'default'])
+    expect(chatRecency({ name: 'x', last_active_ts: 7 })).toBe(7)
+    expect(chatRecency({ name: 'x', last_active_ts: 7, last_chat_ts: 0 })).toBe(0)
   })
 })

@@ -504,6 +504,7 @@ rather than reporting a silent success. These are human debug/diagnostic twins o
 | `kirocrew snapshot` | Create a portable backup of Kiro Crew state |
 | `kirocrew snapshot /path/to/dir` | Snapshot to specific output directory |
 | `kirocrew snapshot --keep 7` | Keep N most recent snapshots (default: 7) |
+| `kirocrew snapshot --strict` | Exit 3 instead of 0 when the bundle omits entries it was asked to carry |
 | `kirocrew snapshot --list` | List existing snapshots |
 | `kirocrew restore` | Restore from most recent snapshot |
 | `kirocrew restore /path/to/snap.tar.gz` | Restore from specific snapshot |

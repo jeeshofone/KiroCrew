@@ -9,7 +9,7 @@ import { parseErrorCode } from '../../utils/errorReport'
 import { ApiError } from '../apiError'
 import type { ClientTransport } from './transport'
 
-export function createVoiceEndpoints({ post, put, j }: ClientTransport) {
+export function createVoiceEndpoints({ post, put, j, jfetch: fetch }: ClientTransport) {
   const speechToText = {
     // STT
     sttConfig: () => fetch('/api/config/stt').then(j),

@@ -23,7 +23,7 @@ export interface AppPublishProvider {
   endpoint: string
 }
 
-export function createArtifactsEndpoints({ get, post, del, patch, j, checkSessionExpired, removeAuthBanner }: ClientTransport) {
+export function createArtifactsEndpoints({ get, post, del, patch, j, jfetch: fetch, checkSessionExpired, removeAuthBanner }: ClientTransport) {
   const library = {
     // Artifacts
     /** List artifacts. `session` scopes to the artifacts one chat session

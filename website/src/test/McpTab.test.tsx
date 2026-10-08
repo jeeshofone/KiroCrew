@@ -443,12 +443,12 @@ describe('McpTab needs_auth status', () => {
     fireEvent.click(trigger)
     expect(await screen.findByText(/gateway started this server/i)).toBeInTheDocument()
 
-    for (const status of ['error', 'outdated', 'disabled'] as const) {
+    // `outdated` left this list in #15516: it now explains why the reading is
+    // stale and how to re-probe (see 'outdated status hint' below).
+    for (const status of ['error', 'disabled'] as const) {
       mockApi.mcpServers.mockResolvedValue([remote(status)])
       const { unmount } = renderTab()
-      const other = await screen.findByText(
-        status === 'error' ? 'Error' : status === 'outdated' ? 'Outdated' : 'Disabled',
-      )
+      const other = await screen.findByText(status === 'error' ? 'Error' : 'Disabled')
       expect(other).not.toHaveAttribute('title')
       expect(within(other.parentElement!).queryByRole('button', { name: 'More information' })).toBeNull()
       unmount()
@@ -463,6 +463,57 @@ describe('McpTab needs_auth status', () => {
     expect(screen.getByText('Error').className).toContain('text-danger')
     expect(screen.getByText('HTTP 500')).toBeInTheDocument()
     expect(screen.queryByText('Not verified')).not.toBeInTheDocument()
+  })
+})
+
+describe('outdated status hint (#15516)', () => {
+  // A row reads "Outdated" for two reasons that need different actions: the
+  // last result aged past the probe TTL (refresh re-probes it), or the server
+  // crossed the consecutive-failure threshold and every probe pass now skips it
+  // (refresh does nothing until Reset count; the Failing badge says so). The reporter of #15516 saw only
+  // "Outdated" and had to find agent.mcp_quarantine_after_failures by hand.
+  async function outdatedTip(row: McpServer): Promise<string> {
+    mockApi.mcpServers.mockResolvedValue([row])
+    renderTab()
+    const badge = await screen.findByText('Outdated')
+    expect(badge).not.toHaveAttribute('title')
+    fireEvent.click(within(badge.parentElement!).getByRole('button', { name: 'More information' }))
+    return (await screen.findByRole('tooltip')).textContent ?? ''
+  }
+
+  it('an aged reading points at the refresh button', async () => {
+    const text = await outdatedTip({ ...server('alpha'), status: 'outdated' })
+    expect(text).toMatch(/30 minutes/)
+    expect(text).toMatch(/refresh button/)
+    expect(text).not.toMatch(/Reset count/)
+  })
+
+  it('a quarantined row leaves the explanation to its Failing badge', async () => {
+    // The exact row shape probe_all returns for an excluded server: status
+    // outdated, no error, plus the quarantine annotation. The aged-reading hint
+    // would send the reader to a refresh that cannot work, and a second copy of
+    // the Failing tip would compete with it, so the Outdated badge has no tip.
+    mockApi.mcpServers.mockResolvedValue([
+      { ...server('airbnb'), status: 'outdated', error: '', probeFailures: 3, probeFailing: true },
+    ])
+    renderTab()
+    const badge = await screen.findByText('Outdated')
+    expect(within(badge.parentElement!).queryByRole('button', { name: 'More information' })).toBeNull()
+    expect(screen.getByText('Failing')).toBeInTheDocument()
+  })
+
+  it('the Failing note no longer claims nothing changed', async () => {
+    mockApi.mcpServers.mockResolvedValue([
+      { ...server('airbnb'), status: 'outdated', error: '', probeFailures: 3, probeFailing: true },
+    ])
+    renderTab()
+    const badge = await screen.findByText('Failing')
+    fireEvent.click(within(badge.parentElement!).getByRole('button', { name: 'More information' }))
+    const text = (await screen.findByRole('tooltip')).textContent ?? ''
+    expect(text).toContain('3 consecutive probes failed')
+    expect(text).toMatch(/stopped probing/)
+    expect(text).toMatch(/Reset count/)
+    expect(text).not.toMatch(/not a change/)
   })
 })
 

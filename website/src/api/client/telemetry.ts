@@ -29,7 +29,7 @@ export type WakaTimeStats = {
   }
 }
 
-export function createTelemetryEndpoints({ get, post, j }: ClientTransport) {
+export function createTelemetryEndpoints({ get, post, j, jfetch: fetch }: ClientTransport) {
   const usageReadouts = {
     /** The five session folds of a crew log, keyed by name, in ONE request.
      *
