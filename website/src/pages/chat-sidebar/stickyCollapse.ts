@@ -31,8 +31,19 @@
  * closed, and the header has fallen back to the block's top. The block's own
  * top does not move as its body closes, so the click's header position less
  * the block's top in the collapsed commit is the same distance either way.
+ *
+ * HOW FAST the body closes follows from the hold. Once the lane has moved, an
+ * animated close slides the folder's rows up past the still header and leaves
+ * the lane under it empty until the next folder arrives. So a collapse that
+ * starts from a pinned header takes the reduced-motion path for that one
+ * commit: the body closes with no transition (`instantClose` on `FolderBody`),
+ * and the session rows' layout projection is off, because Framer would
+ * otherwise animate the next folder's rows up from where they sat below the
+ * open body, hundreds of px away. The next folder and its rows are under the
+ * header in the same frame. A header at its natural place keeps the animated
+ * close: nothing scrolls, and the folder visibly folds shut below it.
  */
-import { useCallback, useLayoutEffect, useRef, type RefObject } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react'
 import type { ChatFolder } from '../../types'
 
 /** How long a click's arm waits for its collapse to render. The optimistic
@@ -46,6 +57,11 @@ const PINNED_EPSILON_PX = 0.5
 export function paintedHeaderTop(block: HTMLElement | null): number | null {
   const header = block?.querySelector<HTMLElement>(':scope > [data-folder-row]')
   return header ? header.getBoundingClientRect().top : null
+}
+
+/** How far a block's header is painted below the block's own top, in px. */
+function pinnedOffset(block: HTMLElement, headerTop: number): number {
+  return headerTop - block.getBoundingClientRect().top
 }
 
 /**
@@ -65,7 +81,7 @@ export function holdPinnedHeaderThroughCollapse(
   headerTop: number | null = paintedHeaderTop(block),
 ): number {
   if (!lane || !block || headerTop === null) return 0
-  const pinnedBy = headerTop - block.getBoundingClientRect().top
+  const pinnedBy = pinnedOffset(block, headerTop)
   if (pinnedBy <= PINNED_EPSILON_PX) return 0
   const before = lane.scrollTop
   lane.scrollTop = before - pinnedBy
@@ -78,24 +94,64 @@ export function holdPinnedHeaderThroughCollapse(
  * that shows that folder collapsed (see the module note on timing). Expanding,
  * the folder leaving the tree, or the arm outliving `HOLD_ARM_TTL_MS` disarms
  * it.
+ *
+ * `instantCloseId` names the folder whose collapse started from a pinned
+ * header (for its `FolderBody`'s `instantClose` and the rows' layout
+ * projection). It is decided at the click, from the same reading the hold
+ * uses, and committed before the collapse so the collapsed commit already
+ * carries it. Two frames after that commit it is cleared, so later reorders
+ * animate again: the first frame is the one the collapse paints in, and only
+ * the second callback is sure to run after it. Clearing it then cannot animate
+ * anything, because the closed track is already at `0fr`. It is also cleared
+ * by the next arm, by `disarm`, by a dropped arm, and by that folder being
+ * seen open again however it was expanded.
  */
 export function useHoldPinnedHeaderOnCollapse(laneRef: RefObject<HTMLElement | null>, folders: ChatFolder[]) {
   const pending = useRef<{ id: string; block: HTMLElement; headerTop: number | null; at: number } | null>(null)
-  const armHold = useCallback((id: string, block: HTMLElement | null) => {
-    pending.current = block ? { id, block, headerTop: paintedHeaderTop(block), at: performance.now() } : null
+  const [instantCloseId, setInstantCloseId] = useState<string | null>(null)
+  const releaseFrame = useRef<number | null>(null)
+  const cancelRelease = useCallback(() => {
+    if (releaseFrame.current !== null) cancelAnimationFrame(releaseFrame.current)
+    releaseFrame.current = null
   }, [])
-  const disarm = useCallback(() => { pending.current = null }, [])
+  useEffect(() => cancelRelease, [cancelRelease])
+  const armHold = useCallback((id: string, block: HTMLElement | null) => {
+    const headerTop = block ? paintedHeaderTop(block) : null
+    pending.current = block ? { id, block, headerTop, at: performance.now() } : null
+    const pinned = block !== null && headerTop !== null && pinnedOffset(block, headerTop) > PINNED_EPSILON_PX
+    cancelRelease()
+    setInstantCloseId(pinned ? id : null)
+  }, [cancelRelease])
+  const disarm = useCallback(() => {
+    pending.current = null
+    cancelRelease()
+    setInstantCloseId(null)
+  }, [cancelRelease])
   useLayoutEffect(() => {
     const p = pending.current
-    if (!p) return
+    if (!p) {
+      // Seen open again with no collapse pending (expanded by any control):
+      // its next collapse decides afresh.
+      if (instantCloseId !== null && !folders.find(f => f.id === instantCloseId)?.collapsed) setInstantCloseId(null)
+      return
+    }
     // An arm whose collapse never rendered (the update was dropped) must not
     // fire on a later, unrelated collapse of the same folder.
-    if (performance.now() - p.at > HOLD_ARM_TTL_MS) { pending.current = null; return }
+    if (performance.now() - p.at > HOLD_ARM_TTL_MS) { pending.current = null; setInstantCloseId(null); return }
     const folder = folders.find(f => f.id === p.id)
-    if (!folder) { pending.current = null; return }
+    if (!folder) { pending.current = null; setInstantCloseId(null); return }
     if (!folder.collapsed) return
     pending.current = null
     holdPinnedHeaderThroughCollapse(laneRef.current, p.block.isConnected ? p.block : null, p.headerTop)
-  }, [folders, laneRef])
-  return { armHold, disarm }
+    if (instantCloseId === p.id) {
+      cancelRelease()
+      releaseFrame.current = requestAnimationFrame(() => {
+        releaseFrame.current = requestAnimationFrame(() => {
+          releaseFrame.current = null
+          setInstantCloseId(null)
+        })
+      })
+    }
+  }, [folders, laneRef, instantCloseId, cancelRelease])
+  return { armHold, disarm, instantCloseId }
 }

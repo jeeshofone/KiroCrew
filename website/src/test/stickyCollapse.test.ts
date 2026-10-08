@@ -6,7 +6,7 @@
  * ChatSidebar.stickyFolderCollapse.test.tsx.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { renderHook } from '@testing-library/react'
+import { act, renderHook } from '@testing-library/react'
 import { holdPinnedHeaderThroughCollapse, useHoldPinnedHeaderOnCollapse, HOLD_ARM_TTL_MS } from '../pages/chat-sidebar/stickyCollapse'
 import type { ChatFolder } from '../types'
 
@@ -77,7 +77,7 @@ describe('useHoldPinnedHeaderOnCollapse', () => {
 
   it('holds on the first commit that shows the armed folder collapsed, and only once', () => {
     const { lane, block, hook } = setup()
-    hook.result.current.armHold('f', block)
+    act(() => hook.result.current.armHold('f', block))
     hook.rerender({ folders: folder(false) })
     expect(lane.scrollTop).toBe(500)
     hook.rerender({ folders: folder(true) })
@@ -91,7 +91,7 @@ describe('useHoldPinnedHeaderOnCollapse', () => {
   it('drops an arm whose collapse never rendered within the window', () => {
     const now = vi.spyOn(performance, 'now').mockReturnValue(1000)
     const { lane, block, hook } = setup()
-    hook.result.current.armHold('f', block)
+    act(() => hook.result.current.armHold('f', block))
     now.mockReturnValue(1000 + HOLD_ARM_TTL_MS + 1)
     hook.rerender({ folders: folder(true) })
     expect(lane.scrollTop).toBe(500)
@@ -102,7 +102,7 @@ describe('useHoldPinnedHeaderOnCollapse', () => {
     // Reduced motion: by the collapsed commit the header has fallen to the
     // block's top, so only the arm-time reading still has the 300px offset.
     const { lane, block, hook } = setup()
-    hook.result.current.armHold('f', block)
+    act(() => hook.result.current.armHold('f', block))
     const header = block.querySelector<HTMLElement>('[data-folder-row]')!
     header.getBoundingClientRect = block.getBoundingClientRect
     hook.rerender({ folders: folder(true) })
@@ -112,9 +112,9 @@ describe('useHoldPinnedHeaderOnCollapse', () => {
 
   it('an expand before the collapse renders disarms it, so a later collapse does not scroll', () => {
     const { lane, block, hook } = setup()
-    hook.result.current.armHold('f', block)
+    act(() => hook.result.current.armHold('f', block))
     hook.rerender({ folders: folder(false) })
-    hook.result.current.disarm()
+    act(() => hook.result.current.disarm())
     hook.rerender({ folders: folder(true) })
     expect(lane.scrollTop).toBe(500)
     lane.remove()
@@ -122,10 +122,55 @@ describe('useHoldPinnedHeaderOnCollapse', () => {
 
   it('disarm cancels a pending hold', () => {
     const { lane, block, hook } = setup()
-    hook.result.current.armHold('f', block)
-    hook.result.current.disarm()
+    act(() => hook.result.current.armHold('f', block))
+    act(() => hook.result.current.disarm())
     hook.rerender({ folders: folder(true) })
     expect(lane.scrollTop).toBe(500)
+    lane.remove()
+  })
+
+  it('names the folder for an instant close only when its header was pinned at the arm', () => {
+    const { lane, block, hook } = setup()
+    act(() => hook.result.current.armHold('f', block))
+    expect(hook.result.current.instantCloseId).toBe('f')
+    hook.rerender({ folders: folder(true) })
+    expect(hook.result.current.instantCloseId).toBe('f')
+    // Seen open again, by any control: the next collapse decides afresh.
+    hook.rerender({ folders: folder(false) })
+    expect(hook.result.current.instantCloseId).toBeNull()
+    // A header at its natural place animates.
+    block.getBoundingClientRect = block.querySelector<HTMLElement>('[data-folder-row]')!.getBoundingClientRect
+    act(() => hook.result.current.armHold('f', block))
+    expect(hook.result.current.instantCloseId).toBeNull()
+    lane.remove()
+  })
+
+  it('disarm and a dropped arm both clear the instant close', () => {
+    const now = vi.spyOn(performance, 'now').mockReturnValue(1000)
+    const { lane, block, hook } = setup()
+    act(() => hook.result.current.armHold('f', block))
+    act(() => hook.result.current.disarm())
+    expect(hook.result.current.instantCloseId).toBeNull()
+    act(() => hook.result.current.armHold('f', block))
+    now.mockReturnValue(1000 + HOLD_ARM_TTL_MS + 1)
+    hook.rerender({ folders: folder(true) })
+    expect(hook.result.current.instantCloseId).toBeNull()
+    lane.remove()
+  })
+
+  it('releases the instant close two frames after the collapse commit, so later reorders animate', () => {
+    const frames: FrameRequestCallback[] = []
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation(cb => { frames.push(cb); return frames.length })
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {})
+    const { lane, block, hook } = setup()
+    act(() => hook.result.current.armHold('f', block))
+    hook.rerender({ folders: folder(true) })
+    expect(hook.result.current.instantCloseId).toBe('f')
+    // The first frame is the one the collapse paints in: still instant.
+    act(() => frames.shift()!(0))
+    expect(hook.result.current.instantCloseId).toBe('f')
+    act(() => frames.shift()!(16))
+    expect(hook.result.current.instantCloseId).toBeNull()
     lane.remove()
   })
 })

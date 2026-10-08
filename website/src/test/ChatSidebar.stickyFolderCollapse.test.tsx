@@ -35,6 +35,8 @@ vi.mock('framer-motion', async () => {
         if (FRAMER_PROPS.has(k)) continue
         clean[k] = props[k]
       }
+      // Recorded, so a test can see whether a row is in layout projection.
+      if ('layout' in props) clean['data-layout'] = String(props.layout)
       return React.createElement(tag, { ...clean, ref }, props.children as React.ReactNode)
     })
   // One component per tag, so `motion.div` is the same type on every render: a
@@ -159,18 +161,37 @@ function stubPinnedGeometry(
     block.querySelector(`[data-testid="folder-rail-${FOLDER}"]`)?.parentElement?.closest('[aria-hidden]')?.getAttribute('aria-hidden') ?? null
   /** The folder body's aria-hidden at each scrollTop write: "true" = rows already hidden. */
   const bodyHiddenAtWrite: (string | null)[] = []
+  /** The body's transition at each write, i.e. in the collapsed commit itself. */
+  const transitionAtWrite: string[] = []
+  /** Each session row's `layout` prop at each write ("false" = not projected). */
+  const rowLayoutAtWrite: string[][] = []
   Object.defineProperty(lane, 'scrollTop', {
     configurable: true,
     get: () => top,
     set: (v: number) => {
       bodyHiddenAtWrite.push(bodyHidden())
+      transitionAtWrite.push(folderBodyBox().style.transition)
+      rowLayoutAtWrite.push(rowLayouts())
       top = Math.max(0, v)
     },
   })
   const r = (y: number, h: number) => ({ top: y, bottom: y + h, left: 0, right: 300, width: 300, height: h, x: 0, y, toJSON: () => ({}) }) as DOMRect
   block.getBoundingClientRect = () => r(blockTop, 1200)
   header.getBoundingClientRect = () => r(reducedMotion && bodyHidden() === 'true' ? blockTop : HEADER_PAINTED_TOP, 32)
-  return { lane, header, bodyHiddenAtWrite }
+  return { lane, header, bodyHiddenAtWrite, transitionAtWrite, rowLayoutAtWrite }
+}
+
+/** Every session row's recorded `layout` prop, in DOM order. */
+function rowLayouts(): string[] {
+  return [...document.querySelectorAll('[data-layout]')].map(el => el.getAttribute('data-layout') ?? '')
+}
+
+/** The folder body's grid box, which carries the close transition. */
+function folderBodyBox(): HTMLElement {
+  const rail = document.querySelector<HTMLElement>(`[data-testid="folder-rail-${FOLDER}"]`)
+  const box = rail?.parentElement?.closest<HTMLElement>('[aria-hidden]')
+  if (!box) throw new Error('folder body not rendered')
+  return box
 }
 
 describe('collapsing a folder whose sticky header is pinned keeps the header in place', () => {
@@ -205,6 +226,54 @@ describe('collapsing a folder whose sticky header is pinned keeps the header in 
     const { lane } = stubPinnedGeometry(500)
     fireEvent.click(document.querySelector<HTMLElement>(`[data-testid="folder-rail-${FOLDER}"]`)!)
     await waitFor(() => expect(lane.scrollTop).toBe(500 - SCROLLED_INTO_FOLDER))
+  })
+
+  it('closes the body with no transition when the collapse starts from the pinned header', async () => {
+    // An animated close under a held header slides the rows up past it and
+    // leaves the lane empty until the next folder arrives (the blank lane).
+    const { getByRole } = await renderSidebar(false)
+    const { lane, transitionAtWrite } = stubPinnedGeometry(500)
+    fireEvent.click(getByRole('button', { name: /collapse folder long folder/i }))
+    await waitFor(() => expect(lane.scrollTop).toBe(500 - SCROLLED_INTO_FOLDER))
+    expect(transitionAtWrite).toEqual(['none'])
+    const box = folderBodyBox()
+    expect(box.getAttribute('aria-hidden')).toBe('true')
+    expect(box.style.gridTemplateRows).toBe('0fr')
+    // The rows are never faded out, which is what blanked the closing track.
+    expect((box.firstElementChild as HTMLElement).style.opacity).toBe('')
+  })
+
+  it('takes the rows out of layout projection for that commit, then puts them back', async () => {
+    // Projected, the next folder's rows would slide up from where they sat
+    // below the open body, leaving the lane under its header empty meanwhile.
+    const { getByRole } = await renderSidebar(false)
+    expect(rowLayouts().length).toBeGreaterThan(0)
+    expect(new Set(rowLayouts())).toEqual(new Set(['position']))
+    const { lane, rowLayoutAtWrite } = stubPinnedGeometry(500)
+    fireEvent.click(getByRole('button', { name: /collapse folder long folder/i }))
+    await waitFor(() => expect(lane.scrollTop).toBe(500 - SCROLLED_INTO_FOLDER))
+    expect(rowLayoutAtWrite.length).toBe(1)
+    expect(new Set(rowLayoutAtWrite[0])).toEqual(new Set(['false']))
+    await waitFor(() => expect(new Set(rowLayouts())).toEqual(new Set(['position'])))
+  })
+
+  it('closes with no transition under prefers-reduced-motion too', async () => {
+    const { getByRole } = await renderSidebar(false)
+    const { lane, transitionAtWrite } = stubPinnedGeometry(500, undefined, { reducedMotion: true })
+    fireEvent.click(getByRole('button', { name: /collapse folder long folder/i }))
+    await waitFor(() => expect(lane.scrollTop).toBe(500 - SCROLLED_INTO_FOLDER))
+    expect(transitionAtWrite).toEqual(['none'])
+  })
+
+  it('keeps the animated close, and animates the expand, when the header is at its natural place', async () => {
+    const { getByRole } = await renderSidebar(false)
+    stubPinnedGeometry(40, HEADER_PAINTED_TOP)
+    fireEvent.click(getByRole('button', { name: /collapse folder long folder/i }))
+    await waitFor(() => expect(folderBodyBox().getAttribute('aria-hidden')).toBe('true'))
+    expect(folderBodyBox().style.transition).toMatch(/grid-template-rows 150ms/)
+    fireEvent.click(getByRole('button', { name: /expand folder long folder/i }))
+    await waitFor(() => expect(folderBodyBox().getAttribute('aria-hidden')).toBe('false'))
+    expect(folderBodyBox().style.transition).toMatch(/grid-template-rows 150ms/)
   })
 
   it('leaves the lane alone when the header sits at its natural place', async () => {
