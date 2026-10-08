@@ -42,7 +42,7 @@
  * Usage: npm run build && node scripts/capture-notification-approval-refusal.mjs [outDir]
  */
 import { chromium } from 'playwright'
-import { mkdirSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { serveDist } from './lib/serve-dist.mjs'
 import { logPageProblems, stubDashboardApi, json } from './lib/stub-dashboard-api.mjs'
 
@@ -57,11 +57,19 @@ const REFUSED = 'This approval has expired or was already decided'
 const REASON = 'gateway busy, try again'
 const HEDGED = 'may not have been recorded — the request failed. Try again.'
 
+// Every approval row names the request it was raised for: the id plus the
+// coordinator's server-issued instance (and its slot, '' here).
 const note = (ts, id, title) => ({
   kind: 'approval', source: 'system', channel: 'system.approval', priority: 'critical',
   title, body: 'Nightly backup wants to run `rsync -a ~/data /mnt/backup`.',
-  ts, acked: false, approval_id: id,
+  ts, acked: false, approval_id: id, approval_instance: `inst-${id}`,
 })
+// The authority's answer for requests still pending: the reconcile retires
+// any listed row whose request is not in it.
+const pendingOf = (rows, slot = '') => rows.filter(n => n.kind === 'approval').map(n => ({
+  id: n.approval_id, instance: n.approval_instance, slot, source: 'agent', tool: 'shell',
+  tool_input: 'rsync -a ~/data /mnt/backup', ts: Date.parse(n.ts) / 1000,
+}))
 const NOTES = [
   note('2026-09-28T02:00:00.000000+00:00', 'apr-backup', 'Tool approval: shell (Nightly backup)'),
   note('2026-09-28T01:00:00.000000+00:00', 'apr-report', 'Tool approval: shell (Weekly report)'),
@@ -102,6 +110,7 @@ async function open(theme, { status, error, popover = false, deleteStatus = 200 
         await json(route, { notifications: notes, unread: notes.filter(n => !n.acked).length })
         return true
       }
+      if (path === '/api/approvals') { await json(route, pendingOf(notes)); return true }
       if (path.startsWith('/api/approvals/')) {
         // No status: the request never gets a response (a dropped connection).
         if (!status) { await route.abort('connectionreset'); return true }
@@ -279,6 +288,8 @@ await feedFrame('10-popover-503-plain', 'dark', { status: 503, error: REASON, po
     extra: async (path, route) => {
       if (path === '/api/notifications' && route.request().method() === 'DELETE') { counts.deletes += 1; await json(route, { ok: true }); return true }
       if (path === '/api/notifications') { await json(route, { notifications: listed, unread: 1 }); return true }
+      // Still pending when the tab opens: the reconcile keeps the row live.
+      if (path === '/api/approvals') { await json(route, pendingOf(listed, SLOT)); return true }
       if (path.startsWith('/api/chat/slots/')) { await json(route, { running: true, has_more: false, total: 0, queue: [], messages: [] }); return true }
       return false
     },
@@ -286,14 +297,14 @@ await feedFrame('10-popover-503-plain', 'dark', { status: 503, error: REASON, po
   let ws = null
   await page.routeWebSocket(/\/api\/ws/, s => { ws = s })
   await page.goto(base + '/', { waitUntil: 'domcontentloaded' })
-  // Let the first-connect reconcile (an empty /api/approvals) settle first.
+  // Let the first-connect reconcile settle first.
   await page.waitForTimeout(2500)
   const push = async (type, data) => { ws?.send(JSON.stringify({ type, data })); await page.waitForTimeout(900) }
   await push('approval', {
-    id: PRESSED.approval_id, slot: SLOT, source: 'agent', tool: 'shell',
+    id: PRESSED.approval_id, instance: PRESSED.approval_instance, slot: SLOT, source: 'agent', tool: 'shell',
     tool_input: 'rsync -a ~/data /mnt/backup', ts: Number(tsSeconds),
   })
-  await push('approval_resolved', { id: PRESSED.approval_id, slot: SLOT, approved: false, decision: 'expired' })
+  await push('approval_resolved', { id: PRESSED.approval_id, origin: 'coordinator', instance: PRESSED.approval_instance, slot: SLOT, approved: false, decision: 'expired' })
   await page.getByRole('button', { name: 'Notifications', exact: true }).first().click()
   await page.waitForTimeout(600)
   const s = {
@@ -309,6 +320,7 @@ await feedFrame('10-popover-503-plain', 'dark', { status: 503, error: REASON, po
 // arrives while the reader watches: the row leaves. Recorded as webm.
 {
   const SLOT = 'chat-nightly-backup'
+  const VIDEO_DIR = mkdtempSync(`${OUT}/.video-`)
   const tsSeconds = String(Date.parse(PRESSED.ts) / 1000)
   const slots = [{
     key: SLOT, title: 'Nightly backup', running: true, last_message: 'Waiting on your approval.',
@@ -317,7 +329,9 @@ await feedFrame('10-popover-503-plain', 'dark', { status: 503, error: REASON, po
   }]
   const context = await browser.newContext({
     viewport: { width: 1280, height: 800 }, colorScheme: 'dark',
-    recordVideo: { dir: `${OUT}/.video`, size: { width: 1280, height: 800 } },
+    // A run-private directory: the recording is moved out of it, and only it
+    // is removed afterwards, never a directory the caller already had.
+    recordVideo: { dir: VIDEO_DIR, size: { width: 1280, height: 800 } },
   })
   const page = await context.newPage()
   logPageProblems(page)
@@ -328,6 +342,8 @@ await feedFrame('10-popover-503-plain', 'dark', { status: 503, error: REASON, po
     extra: async (path, route) => {
       if (path === '/api/notifications' && route.request().method() === 'DELETE') { await json(route, { ok: true }); return true }
       if (path === '/api/notifications') { await json(route, { notifications: listed, unread: 1 }); return true }
+      // Still pending when the tab opens: the reconcile keeps the row live.
+      if (path === '/api/approvals') { await json(route, pendingOf(listed, SLOT)); return true }
       if (path.startsWith('/api/chat/slots/')) { await json(route, { running: true, has_more: false, total: 0, queue: [], messages: [] }); return true }
       return false
     },
@@ -338,14 +354,14 @@ await feedFrame('10-popover-503-plain', 'dark', { status: 503, error: REASON, po
   await page.waitForTimeout(2500)
   const push = async (type, data) => { ws?.send(JSON.stringify({ type, data })); await page.waitForTimeout(900) }
   await push('approval', {
-    id: PRESSED.approval_id, slot: SLOT, source: 'agent', tool: 'shell',
+    id: PRESSED.approval_id, instance: PRESSED.approval_instance, slot: SLOT, source: 'agent', tool: 'shell',
     tool_input: 'rsync -a ~/data /mnt/backup', ts: Number(tsSeconds),
   })
   await page.getByRole('button', { name: 'Notifications', exact: true }).first().click()
   const row = page.locator('[data-notif-row]').first()
   await row.getByRole('button', { name: /^Approve$/ }).waitFor()
   await page.waitForTimeout(1800)
-  await push('approval_resolved', { id: PRESSED.approval_id, slot: SLOT, approved: false, decision: 'expired' })
+  await push('approval_resolved', { id: PRESSED.approval_id, origin: 'coordinator', instance: PRESSED.approval_instance, slot: SLOT, approved: false, decision: 'expired' })
   await page.getByTestId('notification-feed-empty').waitFor()
   await page.waitForTimeout(2200)
   const rows = await page.locator('[data-notif-row]').count()
@@ -355,7 +371,7 @@ await feedFrame('10-popover-503-plain', 'dark', { status: 503, error: REASON, po
   console.log(`15-popover-live-expiry.webm: ${ok ? 'OK' : 'MISMATCH'} ${JSON.stringify({ rows })}`)
   if (!ok) failed = true
   else await video.saveAs(`${OUT}/15-popover-live-expiry.webm`)
-  rmSync(`${OUT}/.video`, { recursive: true, force: true })
+  rmSync(VIDEO_DIR, { recursive: true, force: true })
 }
 
 await browser.close()
