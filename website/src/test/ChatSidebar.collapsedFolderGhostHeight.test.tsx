@@ -206,15 +206,17 @@ describe('FolderBody defers layout suppression until the collapse has animated',
     expect(inner().getAttribute('style')).toContain('content-visibility: visible')
   })
 
-  it('folds the rows away under the clip instead of fading them, so the closing track is never blank', () => {
-    // An `opacity: 0` snap here hid the rows in the first frame while the track
-    // was still shrinking, which painted the space as an empty lane. jsdom runs
-    // no transitions, so this pins only the style; the PR's filmstrips are the
-    // evidence for the painting itself.
+  it('stops the rows painting the moment it closes, with opacity on the box itself', () => {
+    // `visibility` is inherited, and a row control that transitions `all`
+    // carries the inherited value through its own 150ms transition, so with
+    // `visibility: hidden` alone the rows would paint for the whole close.
+    // `opacity` is not inherited, so one value on this box hides them at once.
+    // jsdom runs no transitions, so this pins only the style; the PR's
+    // filmstrips are the evidence for the painting itself.
     const { rerender } = render(<FolderBody open><div>rows</div></FolderBody>)
-    expect(inner().style.opacity).toBe('')
+    expect(inner().style.opacity).toBe('1')
     rerender(<FolderBody open={false}><div>rows</div></FolderBody>)
-    expect(inner().style.opacity).toBe('')
+    expect(inner().style.opacity).toBe('0')
     expect(inner().style.visibility).toBe('hidden')
   })
 

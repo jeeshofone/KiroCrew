@@ -173,4 +173,45 @@ describe('useHoldPinnedHeaderOnCollapse', () => {
     expect(hook.result.current.instantCloseId).toBeNull()
     lane.remove()
   })
+
+  it('releases a pinned arm whose collapse never renders at the TTL, with no folders change', () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const { lane, block, hook } = setup()
+      act(() => hook.result.current.armHold('f', block))
+      expect(hook.result.current.instantCloseId).toBe('f')
+      act(() => { vi.advanceTimersByTime(HOLD_ARM_TTL_MS - 1) })
+      expect(hook.result.current.instantCloseId).toBe('f')
+      act(() => { vi.advanceTimersByTime(1) })
+      expect(hook.result.current.instantCloseId).toBeNull()
+      // The arm is gone too: a later collapse of the same folder does not scroll.
+      hook.rerender({ folders: folder(true) })
+      expect(lane.scrollTop).toBe(500)
+      lane.remove()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a pinned collapse that renders is not cut short by the TTL timer', () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const frames: FrameRequestCallback[] = []
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation(cb => { frames.push(cb); return frames.length })
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {})
+    try {
+      const { lane, block, hook } = setup()
+      act(() => hook.result.current.armHold('f', block))
+      hook.rerender({ folders: folder(true) })
+      expect(lane.scrollTop).toBe(200)
+      // Re-armed on a later collapse: the first arm's timer must not clear it.
+      act(() => { vi.advanceTimersByTime(HOLD_ARM_TTL_MS / 2) })
+      hook.rerender({ folders: folder(false) })
+      act(() => hook.result.current.armHold('f', block))
+      act(() => { vi.advanceTimersByTime(HOLD_ARM_TTL_MS / 2 + 1) })
+      expect(hook.result.current.instantCloseId).toBe('f')
+      lane.remove()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })

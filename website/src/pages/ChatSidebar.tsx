@@ -2925,13 +2925,11 @@ function ChatSidebar({
   useHoverPinLiveness({ hoverPinRef, releaseHoverPin, filteredSlots: laneSlots, boardLaneActive, flatLaneActive, conductorLaneActive, orderedColumns })
 
   useStaleNarrowBridge({ listNarrowed, filteredSlots: laneSlots, staleCollapseMs, sortKey, isStaleExempt, setStaleExpanded, slotFolders })
-  const { armHold, disarm: disarmHold, instantCloseId } = useHoldPinnedHeaderOnCollapse(laneScrollRef, folders)
   // Reduced motion disables every row. Otherwise renderSessionRow enrolls only
   // the first SIDEBAR_DISPLACEMENT_WINDOW paint positions in layout projection,
-  // bounding Framer's measurement set without a total-list-size cliff. A
-  // collapse from a pinned header takes the reduced-motion path for its one
-  // commit (`instantCloseId`, see stickyCollapse.ts).
-  const rowAnimEnabled = !reduceMotion && instantCloseId === null
+  // bounding Framer's measurement set without a total-list-size cliff.
+  // `rowAnimEnabled` itself is derived below the pinned-header hold, which
+  // also turns it off (see `instantCloseId`).
 
   const {
     isFolderFilteredOut, revealedContainers, toggleReveal, hiddenByContainer, allHiddenFolders,
@@ -2987,7 +2985,11 @@ function ChatSidebar({
   // The list view's toggle. Its folder headers are sticky, so a collapse also
   // moves the lane to keep a pinned header where it is painted, in the commit
   // that hides the body (see stickyCollapse.ts); `from` is the pressed control,
-  // inside the folder block. The hook is called above, beside `rowAnimEnabled`.
+  // inside the folder block.
+  const { armHold, disarm: disarmHold, instantCloseId } = useHoldPinnedHeaderOnCollapse(laneScrollRef, folders)
+  // A collapse from a pinned header takes the reduced-motion path for its one
+  // commit (`instantCloseId`, see stickyCollapse.ts).
+  const rowAnimEnabled = !reduceMotion && instantCloseId === null
   const toggleListFolderCollapse = (folder: ChatFolder, from: HTMLElement) => {
     if (folder.collapsed) disarmHold()
     else armHold(folder.id, from.closest<HTMLElement>('[data-folder-drop]'))

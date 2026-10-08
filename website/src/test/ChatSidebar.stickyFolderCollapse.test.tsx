@@ -239,8 +239,6 @@ describe('collapsing a folder whose sticky header is pinned keeps the header in 
     const box = folderBodyBox()
     expect(box.getAttribute('aria-hidden')).toBe('true')
     expect(box.style.gridTemplateRows).toBe('0fr')
-    // The rows are never faded out, which is what blanked the closing track.
-    expect((box.firstElementChild as HTMLElement).style.opacity).toBe('')
   })
 
   it('takes the rows out of layout projection for that commit, then puts them back', async () => {
@@ -268,9 +266,21 @@ describe('collapsing a folder whose sticky header is pinned keeps the header in 
   it('keeps the animated close, and animates the expand, when the header is at its natural place', async () => {
     const { getByRole } = await renderSidebar(false)
     stubPinnedGeometry(40, HEADER_PAINTED_TOP)
+    // Read the transition in the commit that hides the body, before any frame
+    // runs: a later read could see a released instant close and pass anyway.
+    const box = folderBodyBox()
+    const transitionWhenHidden: string[] = []
+    const seen = new MutationObserver(() => {
+      if (box.getAttribute('aria-hidden') === 'true' && transitionWhenHidden.length === 0) {
+        transitionWhenHidden.push(box.style.transition)
+      }
+    })
+    seen.observe(box, { attributes: true, attributeFilter: ['aria-hidden'] })
     fireEvent.click(getByRole('button', { name: /collapse folder long folder/i }))
     await waitFor(() => expect(folderBodyBox().getAttribute('aria-hidden')).toBe('true'))
-    expect(folderBodyBox().style.transition).toMatch(/grid-template-rows 150ms/)
+    seen.disconnect()
+    expect(transitionWhenHidden).toHaveLength(1)
+    expect(transitionWhenHidden[0]).toMatch(/grid-template-rows 150ms/)
     fireEvent.click(getByRole('button', { name: /expand folder long folder/i }))
     await waitFor(() => expect(folderBodyBox().getAttribute('aria-hidden')).toBe('false'))
     expect(folderBodyBox().style.transition).toMatch(/grid-template-rows 150ms/)

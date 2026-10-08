@@ -103,24 +103,40 @@ export function holdPinnedHeaderThroughCollapse(
  * animate again: the first frame is the one the collapse paints in, and only
  * the second callback is sure to run after it. Clearing it then cannot animate
  * anything, because the closed track is already at `0fr`. It is also cleared
- * by the next arm, by `disarm`, by a dropped arm, and by that folder being
- * seen open again however it was expanded.
+ * by the next arm, by `disarm`, by a dropped arm (on a timer at
+ * `HOLD_ARM_TTL_MS`, so it never waits on a later `folders` change), and by
+ * that folder being seen open again however it was expanded.
  */
 export function useHoldPinnedHeaderOnCollapse(laneRef: RefObject<HTMLElement | null>, folders: ChatFolder[]) {
   const pending = useRef<{ id: string; block: HTMLElement; headerTop: number | null; at: number } | null>(null)
   const [instantCloseId, setInstantCloseId] = useState<string | null>(null)
   const releaseFrame = useRef<number | null>(null)
+  const expiry = useRef<ReturnType<typeof setTimeout> | null>(null)
   const cancelRelease = useCallback(() => {
     if (releaseFrame.current !== null) cancelAnimationFrame(releaseFrame.current)
     releaseFrame.current = null
+    if (expiry.current !== null) clearTimeout(expiry.current)
+    expiry.current = null
   }, [])
   useEffect(() => cancelRelease, [cancelRelease])
   const armHold = useCallback((id: string, block: HTMLElement | null) => {
     const headerTop = block ? paintedHeaderTop(block) : null
-    pending.current = block ? { id, block, headerTop, at: performance.now() } : null
+    const arm = block ? { id, block, headerTop, at: performance.now() } : null
+    pending.current = arm
     const pinned = block !== null && headerTop !== null && pinnedOffset(block, headerTop) > PINNED_EPSILON_PX
     cancelRelease()
     setInstantCloseId(pinned ? id : null)
+    // A pinned arm whose collapse never renders would otherwise keep row
+    // projection off until some later `folders` change. Expire it on its own
+    // clock, exactly as the layout effect's TTL check would.
+    if (pinned && arm) {
+      expiry.current = setTimeout(() => {
+        expiry.current = null
+        if (pending.current !== arm) return
+        pending.current = null
+        setInstantCloseId(null)
+      }, HOLD_ARM_TTL_MS)
+    }
   }, [cancelRelease])
   const disarm = useCallback(() => {
     pending.current = null
