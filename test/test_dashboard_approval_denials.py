@@ -680,6 +680,7 @@ class TestExpiredApprovalRetiresTheCard:
             "slot": slot.key,
             "decision": "expired",
             "instance": self._raised_instance(state, "req-exp"),
+            "origin": "coordinator",
         }
         mock_sel.log_tool_invocation.assert_called_once_with(
             session_key=slot.key,
@@ -712,6 +713,7 @@ class TestExpiredApprovalRetiresTheCard:
             "slot": slot_key,
             "decision": "expired",
             "instance": self._raised_instance(state, "req-removed-slot"),
+            "origin": "coordinator",
         }
 
     @pytest.mark.asyncio
@@ -734,6 +736,7 @@ class TestExpiredApprovalRetiresTheCard:
             "approved": False,
             "decision": "expired",
             "instance": self._raised_instance(state, "req-bg"),
+            "origin": "coordinator",
         }
         assert "req-bg" not in state._pending_approvals
         assert "req-bg" not in state._approval_futures
@@ -776,6 +779,7 @@ class TestExpiredApprovalRetiresTheCard:
             "id": "req-ok",
             "approved": True,
             "instance": self._raised_instance(state, "req-ok"),
+            "origin": "coordinator",
         }
         cls = json.loads(slot.messages[-1]["cls"])
         assert "resolved" not in cls
@@ -800,6 +804,7 @@ class TestExpiredApprovalRetiresTheCard:
             "id": "req-no",
             "approved": False,
             "instance": self._raised_instance(state, "req-no"),
+            "origin": "coordinator",
         }
         assert "req-no" not in state._pending_approvals
         assert "req-no" not in state._approval_futures
