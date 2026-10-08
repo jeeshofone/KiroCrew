@@ -109,7 +109,7 @@ from kiro_crew.jsonl_util import (
     bounded_raw_records,
     strict_raw_records,
 )
-from kiro_crew.owner_only_files import owner_only_opener
+from kiro_crew.owner_only_files import OWNER_ONLY_FILE_MODE, mkdirs_owner_only, owner_only_opener
 from kiro_crew.platform_compat import file_lock, restrict_dir_to_owner
 from kiro_crew.session_ledger import _store_name, is_link, resolved_within, unlink_lock_in_hold
 
@@ -2603,7 +2603,7 @@ def _open_lock(path: Path) -> Iterator[None]:
     closed, which is why nothing here has a lock-less fallback.
     """
     _mkdir_private(path.parent)
-    path.touch(exist_ok=True)
+    path.touch(mode=OWNER_ONLY_FILE_MODE, exist_ok=True)
     with open(path, "r+") as handle:
         with file_lock(handle.fileno(), exclusive=True):
             yield
@@ -4052,9 +4052,11 @@ def _mkdir_private(directory: Path) -> None:
 
     Best-effort for the same reason the root's is: a filesystem that refuses the mode
     change must not make a crew log unwritable, and the sandbox mask and the file-tool
-    fence still stand.
+    fence still stand. Every level this creates is born ``0700`` (a ``parents=True``
+    mkdir would leave the intermediate ``crew-log/<kind>`` at the umask default); the
+    ``chmod`` below is for the leaf that already existed.
     """
-    directory.mkdir(parents=True, exist_ok=True)
+    mkdirs_owner_only(directory)
     if os.name == "posix":
         try:
             if directory.stat().st_mode & 0o777 == 0o700:
