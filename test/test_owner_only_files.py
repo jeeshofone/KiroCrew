@@ -784,6 +784,87 @@ def test_gateway_log_is_created_and_rolled_over_owner_only(home: Path) -> None:
     assert _readable_by_others(home) == []
 
 
+# The writers below run on background tasks a gateway start kicks off, so whether
+# the boot test sees them depends on whether they finish before it walks the home.
+# Each is pinned here directly, where nothing depends on that timing.
+
+
+def test_the_autonudge_store_and_its_sidecar_lock_are_owner_only(home: Path) -> None:
+    from kiro_crew.autonudge_service.store import _locked_file
+
+    store = home / "nested" / "autonudge.json"
+    with _locked_file(store, "r") as fh:
+        assert json.load(fh)["loops"] == []
+    with _locked_file(store.with_name("autonudge.quarantine.json.lock"), "a+"):
+        pass
+
+    assert _mode(store) == 0o600
+    assert _readable_by_others(home) == []
+
+
+def test_the_autonudge_store_outside_the_home_keeps_the_umask_default(tmp_path: Path) -> None:
+    from kiro_crew.autonudge_service.store import _locked_file
+
+    store = tmp_path / "elsewhere" / "autonudge.json"
+    with _locked_file(store, "r"):
+        pass
+    assert _mode(store) == 0o644
+    assert _mode(store.parent) == 0o755
+
+
+def test_the_inbound_spool_directory_and_its_lock_are_owner_only(home: Path) -> None:
+    from kiro_crew.messaging import inbound_spool
+
+    target = home / "inbound-spool" / "refused.jsonl"
+    assert inbound_spool.peek_next(path=target) == (None, [])
+    assert inbound_spool.record_refusal_sync(
+        inbound_spool.SpooledInbound(channel_type="slack", conversation_id="D1", text="hello"),
+        path=home / "inbound-spool-2" / "refused.jsonl",
+    )
+
+    assert _mode(home / "inbound-spool") == 0o700
+    assert _readable_by_others(home) == []
+
+
+def test_a_member_crew_log_its_lock_lease_and_fold_marker_are_owner_only(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import kiro_crew.members as members
+    from kiro_crew.crew_log.schema import KIND_MEMBER
+    from kiro_crew.crew_log.store import crew_log_dir
+    from kiro_crew.eventlog.service import MemberEventLogService
+
+    monkeypatch.setattr(members, "data_home", lambda: home)
+    roster = home / "members"
+    roster.mkdir(mode=0o700)
+
+    MemberEventLogService(roster).ensure("default-37a8eec1", "default")
+
+    member_dir = crew_log_dir(KIND_MEMBER, "default-37a8eec1")
+    for leaf in (".lock", ".lease", ".legacy-activity-folded"):
+        assert (member_dir / leaf).is_file(), leaf
+    assert _mode(member_dir.parent) == 0o700
+    assert _readable_by_others(home) == []
+
+
+def test_the_fold_marker_and_an_absent_unit_s_lease_carrier_are_owner_only(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The two member writers that can run before the unit's own directory exists."""
+    import kiro_crew.members as members
+    from kiro_crew.eventlog import service
+
+    monkeypatch.setattr(members, "data_home", lambda: home)
+    (home / "members").mkdir(mode=0o700)
+
+    service.MemberEventLogService(home / "members")._clean_legacy_under_unit_lease("absent-1")
+    assert (home / "crew-log" / "members").is_dir()
+    assert _readable_by_others(home) == []
+
+    assert service._retire_legacy_activity("folded-1")
+    assert _readable_by_others(home) == []
+
+
 # ── the startup sweep ────────────────────────────────────────────────────────
 
 

@@ -39,6 +39,7 @@ from kiro_crew.eventlog import members_projections, types
 from kiro_crew.eventlog.log import APPEND_CONTENTION_SECONDS, MemberLog
 from kiro_crew.eventlog.members_projections import all_units
 from kiro_crew.eventlog.types import Event
+from kiro_crew.owner_only_files import OWNER_ONLY_FILE_MODE, mkdirs_owner_only
 from kiro_crew.projection import EMPTY_WATERMARK, DirectoryCheckpointStore, ProjectionRegistry
 
 logger = logging.getLogger(__name__)
@@ -563,8 +564,8 @@ def _retire_legacy_activity(slug: str) -> bool:
     if fenced is None:
         return False
     try:
-        fenced.parent.mkdir(parents=True, exist_ok=True)
-        fenced.touch(exist_ok=True)
+        mkdirs_owner_only(fenced.parent)
+        fenced.touch(mode=OWNER_ONLY_FILE_MODE, exist_ok=True)
         # touch() puts the directory entry in the page cache only. Without this the
         # entry can be absent after a crash while the rename below has already
         # landed, which is the one combination the ordering above rules out.
@@ -1113,11 +1114,12 @@ class MemberEventLogService:
 
         try:
             directory = crew_log_dir(KIND_MEMBER, slug)
-            # Owner-only, and mkdir masks rather than widens, so this cannot grant
-            # more than 0o700 whatever the umask is. These directories hold
-            # conversation bodies once a writer uses one, and a peer's create would
-            # inherit this mode rather than set its own.
-            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # Owner-only at every level it creates, the parent ``crew-log/members``
+            # included (``mkdir(parents=True, mode=...)`` applies the mode to the
+            # leaf only). These directories hold conversation bodies once a writer
+            # uses one, and a peer's create would inherit this mode rather than set
+            # its own.
+            mkdirs_owner_only(directory)
         except OSError:
             logger.warning(
                 "crew log: cannot hold the unit lease for %r; keeping its legacy activity",
