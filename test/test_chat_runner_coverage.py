@@ -6141,15 +6141,16 @@ class TestRunChatWakaTimeCodingAccounting:
         note_activity.assert_not_called()
 
 
-class TestBlockedLinkCardCounts:
-    """What the dashboard needs from a flush to show a blocked link's card.
+class TestBlockedLinkCardRecords:
+    """What the dashboard's blocked-link card lists after a flush.
 
-    The card shows its one address as the clicked link only when the host has
-    exactly one record and exactly one placeholder in the saved reply
+    The card lists the host's records in the saved reply, each under its own
+    address, and never claims which one a chip stands for
     (``BlockedLinkCard`` in ``website/src/components/RedactionCards.tsx``).
-    Every other count lists the host's addresses and says it can't tell. These
-    stream the deltas through both per-delta removers in the order the
-    streaming loop applies them, then flush.
+    Counts cannot prove that a placeholder and a record are the same URL, so
+    these pin what each record says about itself. They stream the deltas
+    through both per-delta removers in the order the streaming loop applies
+    them, then flush.
     """
 
     H = "h.example-sink.net"
@@ -6169,18 +6170,13 @@ class TestBlockedLinkCardCounts:
         redacted, links, _ = chat_runner._redact_segment(slot, text)
         return redacted, links
 
-    @classmethod
-    def _card_is_one_address(cls, content: str, links: list[dict], host: str) -> bool:
-        placeholder = f"[REDACTED: suspicious URL to {host}]"
-        return content.count(placeholder) == 1 and sum(r["domain"] == host for r in links) == 1
-
-    def test_one_address_on_its_host_is_its_own_card(self):
+    def test_one_address_on_its_host_is_its_one_record(self):
         url = f"https://{self.H}/only?q=" + "a" * 250
         content, links = self._flush(["See ", url[:40], url[40:], " now."])
-        assert self._card_is_one_address(content, links, self.H)
+        assert content.count(f"[REDACTED: suspicious URL to {self.H}]") == 1
         assert [r["url"] for r in links] == [url]
 
-    def test_glued_pair_a_credential_tag_and_a_key_split_link_show_cant_tell(self):
+    def test_glued_pair_a_credential_tag_and_a_key_split_link_list_every_record(self):
         # Two same-host long-query addresses glued across a delta, a
         # credential tag, then a same-host address whose key a delta redacted.
         g1 = f"https://{self.H}/g1?q=" + "a" * 250
@@ -6194,9 +6190,9 @@ class TestBlockedLinkCardCounts:
             self.KEY + "&t=x",
             " end.",
         ]
-        content, links = self._flush(deltas)
-        assert not self._card_is_one_address(content, links, self.H)
+        _, links = self._flush(deltas)
         assert sum(r["domain"] == self.H for r in links) > 1
+        assert all(r["path"] for r in links if r["domain"] == self.H)
 
     @staticmethod
     def _key_split_presigned_flush() -> dict:
@@ -6204,7 +6200,7 @@ class TestBlockedLinkCardCounts:
         addresses whose key a delta redacted. The dashboard test
         ``MarkdownRenderer.blockedLinkCredInUrl.test.tsx`` renders this output."""
         host = "my-bucket.s3.us-east-1.amazonaws.com"
-        key = TestBlockedLinkCardCounts.KEY
+        key = TestBlockedLinkCardRecords.KEY
         deltas: list[str] = []
         for i, name in enumerate(("report.csv", "invoice.pdf")):
             url = (
@@ -6216,14 +6212,52 @@ class TestBlockedLinkCardCounts:
             deltas += [f"Link {i + 1}: ", url[:cut], url[cut:], " . "]
         for name in ("other-a", "other-b"):
             deltas += [" plain ", f"https://{host}/{name}?X-Amz-Credential=", key + "%2Fx", " . "]
-        content, links = TestBlockedLinkCardCounts._flush(deltas)
+        content, links = TestBlockedLinkCardRecords._flush(deltas)
         return {"content": content, "blocked_links": links}
 
-    def test_key_split_links_beside_presigned_starts_show_cant_tell(self):
+    def test_key_split_links_beside_presigned_starts_match_the_dashboard_fixture(self):
         out = self._key_split_presigned_flush()
-        host = "my-bucket.s3.us-east-1.amazonaws.com"
-        assert not self._card_is_one_address(out["content"], out["blocked_links"], host)
         fixture = Path(__file__).resolve().parents[1] / "website/src/test/fixtures/credInUrl.json"
+        assert json.loads(fixture.read_text(encoding="utf-8")) == out
+
+    @staticmethod
+    def _one_presigned_one_key_split_flush() -> dict:
+        """ONE presigned S3 address split at ``&X-Amz-Date`` (a placeholder
+        with no record of its own) beside ONE same-host address whose key a
+        delta redacted (a record the text shows no placeholder for). The
+        dashboard test ``MarkdownRenderer.blockedLinkOneOne.test.tsx`` renders
+        this output."""
+        host = "my-bucket.s3.us-east-1.amazonaws.com"
+        key = TestBlockedLinkCardRecords.KEY
+        url = (
+            f"https://{host}/report.csv?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={key}"
+            "%2F20261008%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20261008T000000Z"
+            "&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=" + "a" * 64
+        )
+        cut = url.index("&X-Amz-Date")
+        deltas = [
+            "Link: ",
+            url[:cut],
+            url[cut:],
+            " . plain ",
+            f"https://{host}/other-a?X-Amz-Credential=",
+            key + "%2Fx",
+            " . ",
+        ]
+        content, links = TestBlockedLinkCardRecords._flush(deltas)
+        return {"content": content, "blocked_links": links}
+
+    def test_one_placeholder_and_one_record_of_different_addresses_name_their_own(self):
+        """One placeholder and one record need not be the same URL: the record
+        names /other-a, not the report.csv the chip stands for. The card lists
+        it under that address and never as the clicked link."""
+        out = self._one_presigned_one_key_split_flush()
+        host = "my-bucket.s3.us-east-1.amazonaws.com"
+        assert out["content"].count(f"[REDACTED: suspicious URL to {host}]") == 1
+        assert [r["path"] for r in out["blocked_links"]] == ["/other-a"]
+        fixture = (
+            Path(__file__).resolve().parents[1] / "website/src/test/fixtures/blockedLinkOneOne.json"
+        )
         assert json.loads(fixture.read_text(encoding="utf-8")) == out
 
     def test_clearing_the_streamed_text_clears_its_raw_copy(self):
