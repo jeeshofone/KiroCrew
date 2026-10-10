@@ -31,7 +31,12 @@ from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.constants import DEFAULT_SUBAGENT_MAX_TURNS
 from kiro_crew.context_management import COMPLETION_KEEP_DEFAULT_CHARS
 from kiro_crew.execution_context import read_session_execution
-from kiro_crew.mcp_shared import ToolCancelled, is_tool_cancelled, on_response_outcome
+from kiro_crew.mcp_shared import (
+    ToolCancelled,
+    is_tool_cancelled,
+    on_response_outcome,
+    register_response_outcome_tool,
+)
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.subagent import (
@@ -1459,6 +1464,10 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
     sa_errors: list[str] = []
     # Members the gate accepted as ``queued`` (deferred, not started).
     sa_deferred: set[str] = set()
+    # Names this call to the gateway: every member it reserves carries it, so
+    # ending the call's collection ends each of them, including one whose
+    # ``/api/spawn`` reply never arrived and whose id this call never learned.
+    call_id = uuid.uuid4().hex
     for entry in agents_input:
         prompt = entry.get("prompt", "").strip()
         if not prompt:
@@ -1472,6 +1481,7 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
             # completion is this call's result, never a prompt into the
             # parent's turn, which is blocked right here.
             "inline_collect": True,
+            "inline_call": call_id,
             "max_wait": max_wait,
             **sa_groups,
         }
@@ -1492,6 +1502,9 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
                 sa_errors.append(f"{_redact_sa(prompt)[:60]}: spawn returned no agent id")
 
     if not sa_ids and sa_errors:
+        # A spawn whose reply was lost may still have reserved a member: end
+        # the call's collection so its completion is delivered at once.
+        _close_collection(parent_session, [], [], call=call_id)
         return "Error spawning sub-agents:\n" + "\n".join(f"  - {e}" for e in sa_errors)
     if not sa_ids:
         return "Error: no valid agent entries found in 'agents' array"
@@ -1502,72 +1515,63 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
     # very sub-agents we are waiting on.
     try:
         return _await_and_collect(
-            sa_ids, sa_errors, sa_deferred, parent_session, max_wait, _redact_sa
+            sa_ids, sa_errors, sa_deferred, parent_session, max_wait, _redact_sa, call_id
         )
     except BaseException:
         # Cancelled or failed before returning anything: end the collection
         # with nothing collected, so every completion it held is delivered to
         # the parent as an ordinary one.
-        _close_collection(parent_session, [], sa_ids)
+        _close_collection(parent_session, [], sa_ids, call=call_id)
         raise
 
 
-#: The whole of a commit or drop report, every attempt, pause, refused
-#: re-dial and reply read included (``_send`` is given it as a deadline).
-#: Under ``mcp_shared.OUTCOME_HOOK_SIGNAL_WAIT_SECS``, so a SIGTERM's join
-#: covers its worst case.
-COLLECTION_REPORT_DEADLINE_SECS = 3.5
-#: The clock that deadline is read on. Its own name, so a test that scripts
-#: ``mcp_core.time`` for the poll loop is not also scripting this deadline.
-_report_clock = time.monotonic
+#: The pauses between ``_close_collection``'s attempts: three attempts of at
+#: most 5 s each, so a report fits the 20 s a normal exit waits for it
+#: (``mcp_shared.OUTCOME_HOOK_EXIT_WAIT_SECS``).
+COLLECTION_RETRY_PAUSES: tuple[float, ...] = (1.0, 2.0)
+#: The pause itself, this module's own name so a test can make it a no-op
+#: without touching the process-wide ``time.sleep``.
+_collection_retry_pause: Callable[[float], None] = time.sleep
 
 
 def _close_collection(
-    parent_session: str, collected: list[str], released: list[str], phase: str = "claim"
+    parent_session: str,
+    collected: list[str],
+    released: list[str],
+    phase: str = "claim",
+    *,
+    call: str = "",
 ) -> None:
     """Send one step of this call's inline collection to the gateway.
 
     ``claim`` ends the collection of *released* and claims *collected*, the ids
     the result names. ``commit`` / ``drop`` report that the dispatcher wrote or
-    dropped the response carrying them. Retried, because a lost claim leaves
-    every member held until the collection expires (``max_wait`` plus a grace
-    period), and a lost commit or drop leaves a claim to expire; both are then
-    delivered as ordinary completions. Never raises.
+    dropped the response carrying them. *call* names the call, so every step
+    also ends each member the call reserved, including one whose id it never
+    learned. Retried, because a lost claim leaves every member held until the
+    collection expires (``max_wait`` plus a grace period), and a lost commit or
+    drop leaves a claim to expire; both are then delivered as ordinary
+    completions. Never raises.
     """
     if not parent_session:
         return
     body: dict[str, Any] = {"ids": collected, "parent_session": parent_session, "phase": phase}
     if released:
         body["released"] = released
-    # A commit or drop runs on an outcome hook, which a SIGTERM waits for only
-    # ``OUTCOME_HOOK_SIGNAL_WAIT_SECS``: every attempt and pause fits inside
-    # that, so the report is never cut off mid-retry by the wait it relies on.
-    # A claim runs inside the call itself: three 5 s attempts and their pauses.
-    budget = 5.0 * 3 + 3.0 if phase == "claim" else COLLECTION_REPORT_DEADLINE_SECS
-    deadline = _report_clock() + budget
-    for attempt in range(3):
-        left = deadline - _report_clock()
-        if left <= 0:
-            return
+    if call:
+        body["call"] = call
+    pauses = COLLECTION_RETRY_PAUSES
+    for attempt in range(len(pauses) + 1):
         try:
             # A refused or failed request comes back as an ``error`` body, not
             # an exception, and is retried the same way.
-            # ``deadline`` carries what is left into ``_send``, on its own
-            # clock, so its refused retry and a slow reply stay inside it too.
-            resp = mcp_core._post(
-                "/api/spawn/mark-collected",
-                body,
-                timeout=min(5.0, left),
-                deadline=mcp_core.time.monotonic() + left,
-            )
+            resp = mcp_core._post("/api/spawn/mark-collected", body, timeout=5.0)
             if isinstance(resp, dict) and not resp.get("error"):
                 return
         except Exception:
             pass
-        if attempt < 2:
-            pause = min(1.0 + attempt, deadline - _report_clock())
-            if pause > 0:
-                mcp_core.time.sleep(pause)
+        if attempt < len(pauses) and pauses[attempt] > 0:
+            _collection_retry_pause(pauses[attempt])
 
 
 def _inline_result(aid: str, raw: str, redact_text: Callable[[str], str]) -> str:
@@ -1596,6 +1600,7 @@ def _await_and_collect(
     parent_session: str,
     max_wait: float,
     _redact_sa: Callable[[str], str],
+    call_id: str = "",
 ) -> str:
     """Poll ``spawn_sub_agents``' members until settled, then build its result."""
     poll_interval = 2.0
@@ -1791,8 +1796,8 @@ def _await_and_collect(
         raise ToolCancelled("spawn_sub_agents cancelled before returning its results")
     reply = "\n\n".join(sa_results)
     collected = _carried_in_reply(sa_results, {aid: _block_of[aid] for aid in _settled_ids})
-    _close_collection(parent_session, collected, sa_ids)
-    _commit_when_answered(parent_session, collected, sa_ids)
+    _close_collection(parent_session, collected, sa_ids, call=call_id)
+    _commit_when_answered(parent_session, collected, sa_ids, call_id)
     return reply
 
 
@@ -1826,7 +1831,9 @@ def _carried_in_reply(blocks: list[str], position: Mapping[str, int]) -> list[st
     return carried
 
 
-def _commit_when_answered(parent_session: str, collected: list[str], released: list[str]) -> None:
+def _commit_when_answered(
+    parent_session: str, collected: list[str], released: list[str], call: str = ""
+) -> None:
     """Settle the claims on *collected* only once the response carrying them is written.
 
     A cancel can still drop the response after this call returns, so the
@@ -1841,7 +1848,9 @@ def _commit_when_answered(parent_session: str, collected: list[str], released: l
         return
 
     def _report(delivered: bool) -> None:
-        _close_collection(parent_session, collected, released, "commit" if delivered else "drop")
+        _close_collection(
+            parent_session, collected, released, "commit" if delivered else "drop", call=call
+        )
 
     delivered = on_response_outcome(_report)
     if delivered is not None:
@@ -1947,3 +1956,7 @@ HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "spawn_sub_agents": spawn_sub_agents,
     "resource_status": resource_status,
 }
+
+# The one tool that commits on its response's outcome (``_commit_when_answered``),
+# so the dispatcher arms its calls and no other tool's.
+register_response_outcome_tool("spawn_sub_agents")

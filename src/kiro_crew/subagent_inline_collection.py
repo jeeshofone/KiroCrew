@@ -20,9 +20,15 @@ same rule. Each member is a record whose state moves one way::
 
 * **collecting**: ``reserve`` records the member when ``/api/spawn`` mints its run
   id, before the run can start, so a member that finishes at once, or one that
-  waits behind the concurrency cap, is covered.
-* **held**: the member completed while collecting. Its completion is kept here,
-  undelivered, and never injected.
+  waits behind the concurrency cap, is covered. From here on the run is kept
+  out of completed-run eviction (``pins``), so a member that finishes and is
+  followed by many newer completions before its terminal report reaches
+  ``hold`` is still there to be read.
+* **held**: the member completed while collecting. Only its id is kept here.
+  The completion stays on the live run (``SubagentManager.get``), undelivered
+  (``_delivery_queued``, so no ``delivered`` tombstone starts its result.txt
+  retention clock), still pinned. It is never injected, and a release reads it
+  back from the run.
 * **claimed**: the call's close (``finish``) named the member in its result, but
   that result has not yet reached the parent: the dispatcher writes the tool's
   response only after the call returns, and a cancel can still drop it. Nothing
@@ -52,7 +58,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import dataclasses
 import logging
 import os
 import time
@@ -73,6 +78,20 @@ MAX_COLLECTION_TTL_SECS = 7200.0 + COLLECTION_GRACE_SECS
 #: population: the dashboard slot's collected set uses it too, and a member that
 #: would exceed it is refused at spawn rather than silently left unheld.
 MAX_IDS_PER_PARENT = 1000
+#: Longest parent session key a record keeps. The caller names the parent, so
+#: the record cap alone bounds how MANY records there are, not how big each is.
+#: Sized from the real key formats: the longest is a dashboard thread,
+#: ``thread:<slot>:<mid>`` (7 + a 249-character slot key + 1 + an 18-character
+#: mid = 275), then ``dashboard:<slot>`` (259); cron, hook, subagent and channel
+#: keys are a prefix and one or two provider ids. A longer key is REFUSED before
+#: anything is retained, never truncated: a cut key could merge two parents.
+MAX_PARENT_KEY_CHARS = 512
+#: Longest agent id a record keeps. Run ids are 16 hex characters
+#: (``SubagentManager._mint_agent_id``); the margin admits older id shapes.
+MAX_AGENT_ID_CHARS = 128
+#: Longest call id a record keeps. The tool names its call with a 32-character
+#: hex uuid; the bound is the agent id's, for the same margin.
+MAX_CALL_ID_CHARS = MAX_AGENT_ID_CHARS
 #: How long a returned id waits for its completion before it is forgotten. A
 #: completion normally follows within seconds of the run being read as done.
 COLLECTED_TTL_SECS = 3600.0
@@ -81,6 +100,10 @@ COLLECTED_TTL_SECS = 3600.0
 #: after the response is written; a lost report costs a duplicate, never a
 #: lost result.
 CLAIM_TTL_SECS = 300.0
+#: The longest a parent's expiry timer waits: the shortest deadline any record
+#: is given (a claim's, and the reservation grace), so a pending timer always
+#: fires by a newly given deadline.
+_EXPIRY_SWEEP_SECS = min(CLAIM_TTL_SECS, COLLECTION_GRACE_SECS)
 #: Added to the injection timeout to bound how long a released result waits
 #: for the run's own terminal report to return before it is delivered anyway.
 #: The report's longest legitimate wait is a held cron parent's idle reset,
@@ -88,38 +111,6 @@ CLAIM_TTL_SECS = 300.0
 TERMINAL_REPORT_GRACE_SECS = 60.0
 #: How often a released result re-checks that its parent's turn ended.
 _ORPHAN_IDLE_POLL_SECS = 0.5
-#: The most text a held completion keeps in any string field but ``result``,
-#: ``error`` and ``result_path``, the ellipsis included. Task and tool-title
-#: text have no cap of their own, and a held record outlives the run record's
-#: own eviction, so the registry bounds what it retains itself.
-HELD_TEXT_MAX_CHARS = 512
-#: The most ``error`` text a held completion keeps, the ellipsis included. The
-#: route prints it whole (``Error: ...``), so it gets room for a real
-#: traceback tail rather than the generic cap.
-HELD_ERROR_MAX_CHARS = 8192
-#: The most a failed member's ``error`` keeps once the budget has no room: the
-#: note ``_cut_error_to_bytes`` writes, for an error up to HELD_ERROR_MAX_CHARS.
-_HELD_ERROR_NOTE_MAX_BYTES = len(f"[error text not retained ({HELD_ERROR_MAX_CHARS} chars)]")
-#: Text fields kept whole: the route points at ``result_path`` as written.
-_HELD_UNCAPPED_TEXT = frozenset({"result", "result_path"})
-#: Every held completion's ``result``, ``error`` and ``result_path``, across
-#: every parent, counted in UTF-8 bytes. The one excess: a failed member keeps
-#: at least a ``_HELD_ERROR_NOTE_MAX_BYTES`` note in ``error`` so it never reads
-#: as completed. A result is kept whole while it fits. One that does not is still held (the
-#: parent's turn is blocked inside the call, so routing it anywhere else would
-#: inject into that turn): it keeps what fits, cut the way ``completion_keep``
-#: cuts, and its release reads the full result back from the live run, or says
-#: in the result itself how much was not retained.
-HELD_BYTES_BUDGET = 8 * 1024 * 1024
-#: The only non-scalar run fields a held copy keeps, each read by the completion
-#: route and bounded: one batch's deliveries. Every other field that holds an
-#: object (the follow-up queue ``spawn_steer`` appends to without a cap, the
-#: in-flight tool tracker, futures) is reset on the copy to its dataclass
-#: default, so the live run's own value is untouched.
-_HELD_KEPT_OBJECTS = frozenset({"_digest_settle_deliveries"})
-#: Text buffers the run fills while live and the route does not read.
-_HELD_DROPPED_TEXT = ("streaming_text",)
-_SCALARS = (str, int, float, bool, type(None))
 
 COLLECTING = "collecting"
 HELD = "held"
@@ -140,17 +131,18 @@ class _Record:
     parent: str
     state: str
     deadline: float
-    completion: Any = None
+    #: The member's completion arrived while it was collected or claimed. Only
+    #: this flag is kept: result, error and status are read from the run.
+    held: bool = False
     retired: bool = False
     #: The fence has dropped this result (once, whichever path saw it first).
     fenced: bool = False
     #: The delivery of an unreturned result, cancelled when its parent retires.
     task: asyncio.Task[str] | None = None
-    #: What this record's result text charges to ``HELD_BYTES_BUDGET``.
-    held_bytes: int = 0
-    #: The result's length in chars when the budget made ``hold`` keep only
-    #: part of it, else 0. A release then restores it (``_restored_result``).
-    result_cut_from: int = 0
+    #: The call that reserved it, so ending that call ends this reservation
+    #: even when the call never learned the id (its ``/api/spawn`` reply was
+    #: lost). ``""`` is the parent's one anonymous call (no call id given).
+    call: str = ""
 
 
 class InlineCollections:
@@ -162,28 +154,50 @@ class InlineCollections:
         self._records: dict[str, dict[str, _Record]] = {}
         # Strong references to the deliveries in flight.
         self._tasks: set[asyncio.Task[str]] = set()
-        # Bytes of held result text, against ``HELD_BYTES_BUDGET``.
-        self._held_bytes = 0
         # The manager whose route, sessions, terminal reports and store a
         # delivery uses. Bound by ``SubagentManager`` at construction.
         self._manager: Any = None
+        # The parents with an expiry timer pending: ONE per parent
+        # (``_schedule_expiry``). A parent whose records are all gone keeps its
+        # timer until it fires and finds nothing, so a reserve-and-discard
+        # cycle reuses it, and timers never outnumber the parents active in the
+        # last ``_EXPIRY_SWEEP_SECS``.
+        self._timers: set[str] = set()
 
     def bind(self, manager: Any) -> None:
         self._manager = manager
 
+    @staticmethod
+    def refuse_oversized(field: str, length: int) -> None:
+        """Name, once in the log, an identity refused past its bound."""
+        logger.warning(
+            "inline collection refused a %s of %d characters (bound %d); nothing recorded",
+            field,
+            length,
+            _BOUND_OF[field],
+        )
+
     # ── spawn side ──
 
-    def reserve(self, parent: str, aid: str, max_wait: float) -> bool:
-        """Record that a live call collects *aid* for *parent*; False when full."""
+    def reserve(self, parent: str, aid: str, max_wait: float, *, call: str = "") -> bool:
+        """Record that live call *call* collects *aid* for *parent*; False when full."""
         if not parent or not aid:
             return False
+        field = oversized_identity(parent, (aid,), call)
+        if field:
+            self.refuse_oversized(field, _length_of(field, parent, (aid,), call))
+            return False
+        ttl = min(max(float(max_wait), 0.0) + COLLECTION_GRACE_SECS, MAX_COLLECTION_TTL_SECS)
+        deadline = self._clock() + ttl
+        # Before expiring: this reserve is the call still alive, so nothing it
+        # collects may expire under it.
+        self._extend_call(parent, call, deadline)
         self._expire(parent)
         records = self._records.setdefault(parent, {})
-        ttl = min(max(float(max_wait), 0.0) + COLLECTION_GRACE_SECS, MAX_COLLECTION_TTL_SECS)
         existing = records.get(aid)
         if existing is not None:
             if existing.state == COLLECTING and not existing.retired:
-                existing.deadline = self._clock() + ttl
+                existing.deadline = max(existing.deadline, deadline)
                 return True
             return False
         # Every retained record holds its place, whatever its state: a member
@@ -191,22 +205,53 @@ class InlineCollections:
         if len(records) >= MAX_IDS_PER_PARENT:
             self._prune(parent)
             return False
-        records[aid] = _Record(aid, parent, COLLECTING, self._clock() + ttl)
+        records[aid] = _Record(aid, parent, COLLECTING, deadline, call=call)
         self._schedule_expiry(parent, ttl)
         return True
 
-    def finish(self, parent: str, released: Iterable[str], returned: Iterable[str]) -> None:
+    def _extend_call(self, parent: str, call: str, deadline: float) -> None:
+        """Move every member *call* still collects for *parent* to *deadline*, if later.
+
+        The call starts its ``max_wait`` poll only once its last spawn
+        returned, so a collection is due from the call's latest reservation,
+        never from each member's own: a member reserved early stays held while
+        its call is still spawning or polling.
+        """
+        for rec in self._records.get(parent, {}).values():
+            if rec.call == call and rec.state in (COLLECTING, HELD) and rec.deadline < deadline:
+                rec.deadline = deadline
+
+    def _of_call(self, parent: str, call: str | None) -> set[str]:
+        """The ids *call* reserved for *parent* that are still collecting or held."""
+        if call is None:
+            return set()
+        return {
+            aid
+            for aid, rec in self._records.get(parent, {}).items()
+            if rec.call == call and rec.state in (COLLECTING, HELD)
+        }
+
+    def finish(
+        self,
+        parent: str,
+        released: Iterable[str],
+        returned: Iterable[str],
+        *,
+        call: str | None = "",
+    ) -> None:
         """End collection of *released*; *returned* is named in the call's result.
 
         Synchronous. A member the result names is CLAIMED, in place, so it keeps
         the capacity its reservation took: nothing is settled until ``commit``
         hears the response reached the parent. A held member the result does not
         name is delivered as an ordinary completion in the background, since
-        that waits for the parent's turn, which is blocked on the caller.
+        that waits for the parent's turn, which is blocked on the caller. Every
+        member *call* reserved is released too, including one the call never
+        learned; ``None`` names no call.
         """
         returned_set = set(returned)
         records = self._records.get(parent, {})
-        for aid in set(released) | returned_set:
+        for aid in set(released) | returned_set | self._of_call(parent, call):
             rec = records.get(aid)
             if rec is None or rec.state not in (COLLECTING, HELD):
                 continue
@@ -223,6 +268,7 @@ class InlineCollections:
         delivered: bool,
         *,
         released: Iterable[str] = (),
+        call: str | None = "",
     ) -> list[asyncio.Task[str]]:
         """Settle or release *ids*: the call's response was written or dropped.
 
@@ -235,12 +281,12 @@ class InlineCollections:
         registry (dropped), so it takes the ordinary route. A dropped result
         whose completion is in hand is delivered as an ordinary completion.
         *released* ends the collection of the call's other members, as the
-        claim would have.
+        claim would have, and so does *call* for every member it reserved.
         """
         records = self._records.get(parent, {})
         named = set(ids)
         settles: list[asyncio.Task[str]] = []
-        for aid in set(released) - named:
+        for aid in (set(released) | self._of_call(parent, call)) - named:
             rec = records.get(aid)
             if rec is not None and rec.state in (COLLECTING, HELD):
                 self._end_collection(rec)
@@ -249,19 +295,25 @@ class InlineCollections:
             if rec is None or rec.state not in (COLLECTING, HELD, CLAIMED):
                 continue
             if rec.retired:
-                # The parent ended before the response was confirmed: no live
-                # turn read it, so nothing is settled; restart recovery keeps it.
+                # The parent ended before the response was confirmed, so
+                # nothing is settled and restart recovery keeps it. If the
+                # response was in fact written before the teardown, that
+                # recovery delivers it again: a duplicate, never a loss.
                 # One whose completion has not arrived stays until its deadline,
                 # so ``hold`` still fences that completion.
-                if rec.completion is not None:
+                if rec.held:
                     self._parent_retired(rec)
                     self._remove(rec)
             elif not delivered and rec.state != CLAIMED:
                 self._end_collection(rec)  # its claim never landed: as a close
-            elif rec.completion is None:
+            elif not rec.held:
                 if delivered:
                     rec.state = RETURNED
                     rec.deadline = self._clock() + COLLECTED_TTL_SECS
+                    # Its own timer: a completion that never reaches
+                    # ``consume_collected`` (a fenced one, say) must not leave
+                    # the marker for a parent key nothing touches again.
+                    self._schedule_expiry(parent, COLLECTED_TTL_SECS)
                 else:
                     self._remove(rec)
             else:
@@ -284,112 +336,20 @@ class InlineCollections:
         if rec is not None and rec.state in (COLLECTING, HELD):
             self._remove(rec)
 
-    def record_collected(self, parent: str, ids: Iterable[str]) -> int:
-        """Claim ids a call returned that no reservation covers; the count dropped.
-
-        A member spawned without a reservation (an older tool) is claimed the
-        same way, within the same capacity. One the capacity cannot keep is
-        counted and named once in the log, and its completion is delivered as
-        an ordinary one.
-        """
-        now = self._clock()
-        for other in list(self._records):
-            self._drop_expired_returns(other, now)
-        records = self._records.setdefault(parent, {})
-        dropped = 0
-        for aid in ids:
-            if aid in records:
-                continue  # owned already
-            if len(records) >= MAX_IDS_PER_PARENT:
-                dropped += 1
-                continue
-            rec = _Record(aid, parent, COLLECTING, now)
-            records[aid] = rec
-            self._claim(rec)
-        if dropped:
-            logger.warning(
-                "inline-collected ids for %s at their cap of %d; %d not recorded, "
-                "so their completions are delivered as ordinary ones",
-                parent,
-                MAX_IDS_PER_PARENT,
-                dropped,
-            )
-        self._prune(parent)
-        return dropped
-
     # ── gateway side ──
 
-    def hold(self, parent: str, aid: str, completion: Any) -> bool:
-        """Keep *completion* undelivered if a live call collects *aid*."""
+    def hold(self, parent: str, aid: str) -> bool:
+        """Keep *aid*'s completion undelivered if a live call collects it.
+
+        Only marks the record: the caller marks the run ``_delivery_queued``,
+        and the pin ``reserve`` took keeps the run out of completed-run
+        eviction until collection ownership ends.
+        """
         self._expire(parent)
         rec = self._records.get(parent, {}).get(aid)
-        if rec is None or rec.state not in (COLLECTING, CLAIMED) or rec.completion is not None:
+        if rec is None or rec.state not in (COLLECTING, CLAIMED) or rec.held:
             return False
-        snap = _held_snapshot(completion)
-        if snap is None:
-            # Its fields cannot be enumerated, so a bounded copy cannot be
-            # built: delivered as an ordinary completion instead of retained.
-            logger.warning(
-                "Subagent %s: completion is a %s, not a run record; not holding it",
-                aid,
-                type(completion).__name__,
-            )
-            return False
-        # Everything the snapshot keeps whole or near-whole is charged, so the
-        # budget bounds all held text. ``error`` is charged first and never
-        # cut: the outcome is derived from it being non-empty, and only content
-        # may degrade, never the outcome. Then the pointer, which is what makes
-        # a cut result recoverable. Then ``result``, which absorbs the pressure.
-        room = max(0, HELD_BYTES_BUDGET - self._held_bytes)
-        charge = 0
-        for name in ("error", "result_path"):
-            value = getattr(snap, name, "")
-            if not isinstance(value, str) or not value:
-                continue
-            if name == "error":
-                kept_field = _cut_error_to_bytes(value, room)
-            else:
-                # A partial path points nowhere, so it is kept whole or not at all.
-                kept_field = value if len(value.encode("utf-8")) <= room else ""
-            if kept_field != value:
-                logger.warning(
-                    "Subagent %s: held results take %d of %d bytes, so its %s is held as %d of %d bytes",
-                    aid,
-                    self._held_bytes,
-                    HELD_BYTES_BUDGET,
-                    name,
-                    len(kept_field.encode("utf-8")),
-                    len(value.encode("utf-8")),
-                )
-                setattr(snap, name, kept_field)
-            used = len(kept_field.encode("utf-8"))
-            charge += used
-            room = max(0, room - used)
-        result = getattr(completion, "result", "")
-        result = result if isinstance(result, str) else ""
-        result_bytes = len(result.encode("utf-8"))
-        if result_bytes > room:
-            # Still held: the parent's turn is blocked inside the call, so the
-            # ordinary route would inject into it. Only the content degrades.
-            kept = _cut_to_bytes(result, room, self._completion_keep_mode())
-            logger.warning(
-                "Subagent %s: held results already take %d of %d bytes, so its "
-                "%d-byte result is held as %d bytes; a release restores it from "
-                "the live run or says how much was not retained",
-                aid,
-                self._held_bytes + charge,
-                HELD_BYTES_BUDGET,
-                result_bytes,
-                len(kept.encode("utf-8")),
-            )
-            rec.result_cut_from = len(result)
-            result = kept
-            result_bytes = len(kept.encode("utf-8"))
-        charge += result_bytes
-        snap.result = result
-        rec.completion = snap
-        rec.held_bytes = charge
-        self._held_bytes += charge
+        rec.held = True
         if rec.retired:
             # Its parent ended while it ran: owned, and dropped by the fence.
             self._parent_retired(rec)
@@ -399,11 +359,27 @@ class InlineCollections:
             rec.state = HELD
         return True
 
+    def pins(self, info: Any) -> bool:
+        """True while a collection owns *info*'s run, so retention keeps it.
+
+        ``evict_completed_agents`` asks it. The pin is taken at ``reserve``,
+        before the run can finish, and kept through hold, claim and delivery:
+        the registry keeps no copy, so the live run is what a release reads.
+        Ownership ends, and the pin with it, when the record leaves the
+        registry (commit, drop, discard, expiry, delivery done or cancelled at
+        shutdown), when a written commit leaves only the ``returned`` marker,
+        or when the parent is retired. Bounded by ``MAX_IDS_PER_PARENT`` and
+        each collection's expiry.
+        """
+        records = self._records.get(getattr(info, "parent_session_key", ""), {})
+        rec = records.get(getattr(info, "id", ""))
+        return rec is not None and _owns_run(rec)
+
     def has_collected(self, parent: str) -> bool:
         """True while any claimed or returned id for *parent* still awaits its completion."""
         now = self._clock()
         return any(
-            r.state in (CLAIMED, RETURNED) and r.completion is None and r.deadline > now
+            r.state in (CLAIMED, RETURNED) and not r.held and r.deadline > now
             for r in self._records.get(parent, {}).values()
         )
 
@@ -435,7 +411,7 @@ class InlineCollections:
             return
         for rec in list(records.values()):
             rec.retired = True
-            held = rec.state in (HELD, CLAIMED) and rec.completion is not None
+            held = rec.state in (HELD, CLAIMED) and rec.held
             if held or rec.task is not None:
                 # Dropped here, not by the cancelled task: a task cancelled
                 # before its first step never runs its body.
@@ -499,18 +475,24 @@ class InlineCollections:
         return outcome
 
     async def _deliver_once(self, rec: _Record, *, returned: bool) -> str:
-        info = rec.completion
         mgr = self._manager
         if returned:
             # The written response carried it to the parent before any later
             # teardown, so it is delivered whatever happens to the parent now.
+            info = self._live(rec)
+            if info is None:
+                logger.warning(
+                    "Subagent %s: its run record is gone, so its delivered mark is "
+                    "left to restart recovery",
+                    rec.aid,
+                )
+                return UNDELIVERED
             await self._settle([info])
             return DELIVERED
-        await self._await_terminal_report(info)
+        await self._await_terminal_report(rec.aid)
         await self._await_parent_idle(rec.parent)
-        ticket = _ticket(info)
-        if rec.result_cut_from:
-            ticket.result = await self._restored_result(rec, ticket)
+        info = self._live(rec)
+        ticket = _ticket(info) if info is not None else await self._gone_ticket(rec)
         if self._parent_retired(rec):
             return UNDELIVERED
         on_done = mgr._on_done if mgr is not None else None
@@ -546,34 +528,52 @@ class InlineCollections:
         mode = getattr(self._manager, "_completion_keep", "head")
         return mode if mode in ("head", "tail", "both") else "head"
 
-    async def _restored_result(self, rec: _Record, ticket: Any) -> str:
-        """The released result of a record the budget held only in part.
+    def _live(self, rec: _Record) -> Any | None:
+        """The held member's run record, read from the manager, or None when gone.
 
-        The live run's own result when the manager still has it (the full
-        completion copy). Otherwise what was kept, followed by a note that
-        says how much was not, and where the full text is when its transcript
-        is on disk, in ``result`` itself, so every branch of the route shows it.
+        Result, error and status all come from it, so a failed member is never
+        announced as a success, and nothing the registry kept can be stale.
         """
         get = getattr(self._manager, "get", None)
-        live = None
-        if callable(get):
-            try:
-                live = get(rec.aid)
-            except Exception:
-                logger.debug("Could not read the live run %s", rec.aid, exc_info=True)
-        live_result = getattr(live, "result", None)
-        if isinstance(live_result, str) and live_result:
-            return live_result
-        kept = ticket.result if isinstance(ticket.result, str) else ""
-        path = getattr(ticket, "result_path", "")
-        if await asyncio.to_thread(_transcript_on_disk, path):
-            note = (
-                f"[result was not retained in full ({rec.result_cut_from} chars); "
-                f"full result: {path}]"
+        if not callable(get):
+            return None
+        try:
+            live = get(rec.aid)
+        except Exception:
+            logger.debug("Could not read the live run %s", rec.aid, exc_info=True)
+            return None
+        if getattr(live, "id", None) != rec.aid or not hasattr(live, "_delivery_queued"):
+            return None
+        return live
+
+    async def _gone_ticket(self, rec: _Record) -> Any:
+        """An explicit error for a held member whose run record is gone at release.
+
+        Never an empty success: the outcome is an error naming what happened,
+        and the result file when it is still readable.
+        """
+        from kiro_crew.subagent import SubagentInfo
+        from kiro_crew.subagent_persistence import agent_dir_for_display
+
+        path = ""
+        try:
+            path = str(agent_dir_for_display(rec.aid) / "result.txt")
+        except Exception:
+            logger.debug("Could not name the result file of %s", rec.aid, exc_info=True)
+        on_disk = await asyncio.to_thread(_transcript_on_disk, path)
+        note = "[run record gone before its held result was released"
+        note += f"; full result: {path}]" if on_disk else "; result not retained]"
+        logger.warning("Subagent %s: %s", rec.aid, note)
+        return _ticket(
+            SubagentInfo(
+                id=rec.aid,
+                task="",
+                done=True,
+                parent_session_key=rec.parent,
+                error=note,
+                result_path=path if on_disk else "",
             )
-        else:
-            note = f"[result was not retained ({rec.result_cut_from} chars)]"
-        return f"{kept}\n\n{note}" if kept else note
+        )
 
     def _parent_retired(self, rec: _Record) -> bool:
         """True, with the result's delivery dropped, when its parent was retired.
@@ -588,7 +588,7 @@ class InlineCollections:
         if rec.fenced:
             return True
         rec.fenced = True
-        info = rec.completion
+        info = self._live(rec)
         if info is not None and getattr(info, "_report_owed", False) is True:
             try:
                 self._manager._admission.taskq_clear_owed_reports([rec.aid])
@@ -606,7 +606,7 @@ class InlineCollections:
         except Exception:
             logger.debug("Could not settle held inline deliveries", exc_info=True)
 
-    async def _await_terminal_report(self, info: Any) -> None:
+    async def _await_terminal_report(self, aid: str) -> None:
         # The hold was taken inside the run's terminal report, which may still be
         # finishing (a held cron parent's idle reset awaits). Take over only once
         # it has returned, so the two never decide the same delivery.
@@ -615,8 +615,7 @@ class InlineCollections:
             return
         from kiro_crew.subagent import INJECTION_TIMEOUT
 
-        # The record keeps a snapshot, so the report is found by the run's id.
-        aid = getattr(info, "id", None)
+        # The registry keeps only the id, so the report is found by it.
         pending = [
             task for task, owner in mgr._report_owners.items() if getattr(owner, "id", None) == aid
         ]
@@ -635,17 +634,21 @@ class InlineCollections:
             logger.warning(
                 "Subagent %s: its terminal report is still running after %.0fs; "
                 "delivering the released result without waiting further",
-                getattr(info, "id", "?"),
+                aid,
                 bound,
             )
 
     async def _await_parent_idle(self, parent: str) -> None:
-        # A cancelled call closes its collection while the turn that ran it is
-        # still ending: wait (bounded) for that turn to let go, so the result
-        # plays as a new turn after it, never as a prompt inside it. The one
-        # piece of this registry that is a busy-parent wait: once the completion
-        # route fences a busy parent itself, the route owns that wait and this
-        # method is deleted (docs/system-specs/modules/subagent.md names it).
+        """Wait, bounded, for *parent*'s turn to end before a released result plays.
+
+        A cancelled call closes its collection while the turn that ran it is
+        still ending, so the result plays as a new turn after it, never as a
+        prompt inside it. TEMPORARY: the registry's one busy-parent wait, with
+        exactly one call site (``_deliver_once``; a test pins both). The general
+        busy-parent fence on the completion route owns this wait once it lands
+        (docs/system-specs/modules/subagent.md names its issue), and this method
+        is deleted then; the wire contract stays.
+        """
         from kiro_crew.subagent import INJECTION_TIMEOUT
 
         sessions = getattr(self._manager, "_sessions", None)
@@ -668,7 +671,7 @@ class InlineCollections:
             if r.state in (COLLECTING, HELD, CLAIMED) and r.deadline <= now
         ]
         if expired:
-            held = [r for r in expired if r.completion is not None and not r.retired]
+            held = [r for r in expired if r.held and not r.retired]
             if held:
                 logger.warning(
                     "spawn_sub_agents collection for %s never reported back; "
@@ -676,38 +679,59 @@ class InlineCollections:
                     parent,
                     len(held),
                 )
+            calls = {r.call for r in expired if r.state == CLAIMED}
             for rec in expired:
                 # A claim nobody confirmed is released like a dropped response:
                 # a duplicate turn is recoverable, a lost result is not.
-                if rec.completion is not None:
+                if rec.held:
                     self._release(rec, returned=False)
                 else:
-                    self._discharge(rec)
                     del records[rec.aid]
+            # Its call is over: end every member it reserved, as its drop would.
+            for call in calls:
+                for aid in self._of_call(parent, call):
+                    self._end_collection(records[aid])
         self._drop_expired_returns(parent, now)
         self._prune(parent)
 
     def _drop_expired_returns(self, parent: str, now: float) -> None:
         records = self._records.get(parent, {})
         for aid in [a for a, r in records.items() if r.state == RETURNED and r.deadline <= now]:
-            self._discharge(records[aid])
             del records[aid]
         self._prune(parent)
 
     def _schedule_expiry(self, parent: str, ttl: float) -> None:
+        """Have *parent*'s one expiry timer fire by *ttl* (plus a second) from now.
+
+        A parent has at most one timer, and it never waits longer than
+        ``_EXPIRY_SWEEP_SECS``. Every deadline a record is given is at least
+        that far away, so a timer already pending fires no later than any new
+        deadline and nothing is ever rescheduled or cancelled. When it fires it
+        re-arms for the parent's earliest remaining deadline.
+        """
+        if parent in self._timers:
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return  # no loop (sync caller): the next reserve/hold call expires it
-        loop.call_later(ttl + 1.0, self._expire, parent)
+        loop.call_later(min(max(ttl, 0.0), _EXPIRY_SWEEP_SECS) + 1.0, self._on_timer, parent)
+        self._timers.add(parent)
 
-    def _discharge(self, rec: _Record) -> None:
-        """Return what *rec*'s held completion charged to ``HELD_BYTES_BUDGET``."""
-        self._held_bytes -= rec.held_bytes
-        rec.held_bytes = 0
+    def _on_timer(self, parent: str) -> None:
+        self._timers.discard(parent)
+        self._expire(parent)
+        # Re-arm for the earliest deadline still pending.
+        records = self._records.get(parent)
+        if not records:
+            return
+        due = [
+            r.deadline for r in records.values() if r.state in (COLLECTING, HELD, CLAIMED, RETURNED)
+        ]
+        if due:
+            self._schedule_expiry(parent, min(due) - self._clock())
 
     def _remove(self, rec: _Record) -> None:
-        self._discharge(rec)
         records = self._records.get(rec.parent)
         if records is not None and records.get(rec.aid) is rec:
             del records[rec.aid]
@@ -718,81 +742,50 @@ class InlineCollections:
             del self._records[parent]
 
 
-def _held_snapshot(info: Any) -> Any | None:
-    """What a held record keeps of *info*, bar ``result``: a copy whose every
-    other field is bounded, or None when *info* is not a run record whose
-    fields can be enumerated.
+#: Each caller-supplied identity a record keeps, with its bound.
+_BOUND_OF = {
+    "parent_session": MAX_PARENT_KEY_CHARS,
+    "agent_id": MAX_AGENT_ID_CHARS,
+    "call_id": MAX_CALL_ID_CHARS,
+}
 
-    The registry never holds the run object itself, which the manager evicts on
-    its own schedule. Every object-valued field except ``_HELD_KEPT_OBJECTS`` is
-    reset to its default, the live text buffers are emptied, ``error`` is cut
-    to ``HELD_ERROR_MAX_CHARS``, and every other string field but ``result``
-    and ``result_path`` is cut to ``HELD_TEXT_MAX_CHARS``, each ending on an
-    ellipsis. ``result`` is left for ``InlineCollections.hold``, which charges
-    it, ``error`` and ``result_path`` to ``HELD_BYTES_BUDGET``.
+
+def oversized_identity(parent: str, ids: Iterable[str] = (), call: str = "") -> str:
+    """The field past its bound, ``parent_session``, ``agent_id`` or ``call_id``, else ``""``.
+
+    The entry check for every caller-supplied string a record keeps: its
+    parent key, agent id and call id. Its state, deadline and flags are set
+    here, and its result, error and status are read from the live run, never
+    stored.
     """
-    if not dataclasses.is_dataclass(info) or isinstance(info, type):
-        return None
-    snap: Any = copy.copy(info)
-    for f in dataclasses.fields(snap):
-        if f.name in _HELD_KEPT_OBJECTS or f.name in _HELD_UNCAPPED_TEXT:
-            continue
-        value = getattr(snap, f.name, None)
-        if isinstance(value, str):
-            cap = HELD_ERROR_MAX_CHARS if f.name == "error" else HELD_TEXT_MAX_CHARS
-            if f.name in _HELD_DROPPED_TEXT:
-                setattr(snap, f.name, "")
-            elif len(value) > cap:
-                setattr(snap, f.name, value[: cap - 1] + "\u2026")
-            continue
-        if isinstance(value, _SCALARS):
-            continue
-        if f.default_factory is not dataclasses.MISSING:
-            setattr(snap, f.name, f.default_factory())
-        elif f.default is not dataclasses.MISSING:
-            setattr(snap, f.name, f.default)
-    return snap
+    if len(parent) > MAX_PARENT_KEY_CHARS:
+        return "parent_session"
+    if any(len(aid) > MAX_AGENT_ID_CHARS for aid in ids):
+        return "agent_id"
+    if len(call) > MAX_CALL_ID_CHARS:
+        return "call_id"
+    return ""
 
 
-def _cut_to_bytes(text: str, budget: int, mode: str) -> str:
-    """*text* cut to at most *budget* UTF-8 bytes, keeping what ``mode`` keeps.
+def _length_of(field: str, parent: str, ids: Iterable[str], call: str) -> int:
+    """The length of the *field* ``oversized_identity`` named, for its refusal."""
+    if field == "parent_session":
+        return len(parent)
+    if field == "call_id":
+        return len(call)
+    return max((len(aid) for aid in ids), default=0)
 
-    The head, tail or both cut ``apply_completion_keep`` makes, sized on the
-    encoded bytes: a cut that lands inside a character drops only that
-    character's bytes (``errors="ignore"``), so the result is at most *budget*
-    and at least *budget* - 3 bytes whatever the script.
+
+def _owns_run(rec: _Record) -> bool:
+    """Whether *rec* still owns its run, which is then pinned against eviction.
+
+    A ``returned`` marker owns nothing: the written response carried the
+    result. A retired parent's records are fenced and dropped, except a written
+    response's settle, which is still delivering.
     """
-    from kiro_crew.context_management import _COMPLETION_BOTH_MARKER
-
-    raw = text.encode("utf-8")
-    if len(raw) <= budget:
-        return text
-    if budget <= 0:
-        return ""
-    if mode == "tail":
-        return raw[-budget:].decode("utf-8", "ignore")
-    marker = _COMPLETION_BOTH_MARKER.encode("utf-8")
-    if mode == "both" and budget > len(marker) + 2:
-        head = raw[: (budget - len(marker)) // 2].decode("utf-8", "ignore")
-        # The tail takes whatever the head's own cut left over.
-        tail_room = budget - len(marker) - len(head.encode("utf-8"))
-        return head + _COMPLETION_BOTH_MARKER + raw[-tail_room:].decode("utf-8", "ignore")
-    return raw[:budget].decode("utf-8", "ignore")
-
-
-def _cut_error_to_bytes(error: str, budget: int) -> str:
-    """*error* whole when it fits *budget* UTF-8 bytes, otherwise a fixed note.
-
-    Never empty: a run with an empty ``error`` reads as ``completed``
-    (``SubagentInfo.outcome``), which would announce a failure as a success and
-    settle a memory-wait expiry's owed report as a delivered mark. So ``error``
-    is never cut. It is kept whole, or replaced by
-    ``[error text not retained (N chars)]``, the one text a held record keeps
-    past a full budget, at most ``_HELD_ERROR_NOTE_MAX_BYTES``.
-    """
-    if len(error.encode("utf-8")) <= budget:
-        return error
-    return f"[error text not retained ({len(error)} chars)]"
+    if rec.state == RETURNED:
+        return False
+    return not rec.retired or rec.state == DELIVERING
 
 
 def _transcript_on_disk(path: Any) -> bool:
@@ -812,7 +805,7 @@ def _transcript_on_disk(path: Any) -> bool:
 def _ticket(info: Any) -> Any:
     """A separate record for one redelivery of *info*'s completion.
 
-    *info* is the held snapshot, already bounded, never the live run. The route
+    *info* is the live run record (or the gone-run error record). The route
     writes its routing flags on what it is handed. Those decide this delivery's
     outcome, so they are written on a copy that lives for that one delivery:
     the held record's flags stay what its own terminal report left them.

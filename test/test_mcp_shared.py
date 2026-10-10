@@ -2494,6 +2494,8 @@ class TestResponseOutcomeHook:
 
     @staticmethod
     def _tool(harness_ref: list, outcomes: list, done, *, block=None, cancel=False):
+        mcp_shared.register_response_outcome_tool("t")
+
         def call_tool(name, args):
             def _hook(delivered: bool) -> None:
                 answered = [r for r in harness_ref[0].responses if r[0] == 1]
@@ -2604,6 +2606,7 @@ class TestResponseOutcomeHook:
             registered.set()
             return "ok"
 
+        mcp_shared.register_response_outcome_tool("t")
         harness = _LoopHarness(monkeypatch, call_tool)
         try:
             harness.send(_tools_call(1, "t"))
@@ -2682,6 +2685,7 @@ def test_the_loop_settles_every_call_before_it_arms_the_next(monkeypatch):
         real_arm(req_id)
 
     monkeypatch.setattr(mcp_shared, "_arm_response_outcome", _arm)
+    mcp_shared.register_response_outcome_tool("t")
     answered = threading.Event()
     calls: list = []
 
@@ -2700,6 +2704,105 @@ def test_the_loop_settles_every_call_before_it_arms_the_next(monkeypatch):
         assert unsettled_at_arm == []
     finally:
         harness.close()
+
+
+def _hookless_call_observations(monkeypatch) -> dict:
+    """Dispatch one call of a tool that never registered for outcomes, and
+    record what the arming left behind while it ran and after it was answered."""
+    import threading
+
+    joins: list = []
+    monkeypatch.setattr(mcp_shared, "_register_exit_join", lambda *a: joins.append(a))
+    seen: dict = {}
+    answered = threading.Event()
+
+    def call_tool(name, args):
+        seen["arms"] = dict(mcp_shared._response_outcome_arms)
+        seen["thread_arm"] = getattr(mcp_shared._response_outcome_local, "arm", None)
+        answered.set()
+        return "ok"
+
+    harness = _LoopHarness(monkeypatch, call_tool)
+    try:
+        harness.send(_tools_call(1, "plain"))
+        assert answered.wait(timeout=10.0)
+        assert harness.wait_for(lambda: len([r for r in harness.responses if r[0] == 1]) == 1)
+    finally:
+        harness.close()
+    seen["joins"] = joins
+    seen["join_registered"] = mcp_shared._outcome_exit_join_registered
+    return seen
+
+
+_NOTHING_ARMED = {"arms": {}, "thread_arm": None, "joins": [], "join_registered": False}
+
+
+@pytest.mark.skipif(
+    not platform_compat.IS_POSIX,
+    reason="worker-thread + select() interleave is POSIX-only",
+)
+def test_a_hookless_tools_call_arms_nothing_and_registers_no_exit_join(monkeypatch):
+    """Only a tool registered for its response's outcome is armed. Any other
+    call, on any MCP server, leaves no arm and no exit join, so its exit never
+    waits on outcome reports."""
+    assert "plain" not in mcp_shared._response_outcome_tools
+    assert _hookless_call_observations(monkeypatch) == _NOTHING_ARMED
+
+
+@pytest.mark.skipif(
+    not platform_compat.IS_POSIX,
+    reason="worker-thread + select() interleave is POSIX-only",
+)
+def test_mutation_arming_every_call_is_caught(monkeypatch):
+    """Mutation pin: a dispatcher that arms every call, hook or not, arms the
+    hookless call and registers the exit join, so the check above goes red."""
+    real_arm = mcp_shared._arm_response_outcome
+    monkeypatch.setattr(mcp_shared, "_arm_for_dispatch", lambda req_id, _name: real_arm(req_id))
+    seen = _hookless_call_observations(monkeypatch)
+    assert seen != _NOTHING_ARMED
+    assert seen["thread_arm"] is not None and seen["joins"]
+
+
+def test_an_unregistered_tool_that_asks_for_its_outcome_is_told_it_was_dropped():
+    mcp_shared._arm_for_dispatch(1, "plain")
+    assert mcp_shared._response_outcome_arms == {}
+    # It can never commit: the dispatcher answers for no call it did not arm.
+    assert mcp_shared.on_response_outcome(lambda d: None) is False
+
+
+def test_a_non_string_tool_name_arms_nothing():
+    mcp_shared._arm_for_dispatch(1, ["spawn_sub_agents"])  # unhashable: never armed
+    assert mcp_shared._response_outcome_arms == {}
+
+
+def test_an_unregistered_call_clears_the_threads_arm_from_an_earlier_call():
+    mcp_shared.register_response_outcome_tool("hooked")
+    mcp_shared._arm_for_dispatch(1, "hooked")
+    mcp_shared._settle_response_outcome(1, True)
+    # The same thread then runs a hookless call: the earlier "written" outcome
+    # is not its outcome.
+    mcp_shared._arm_for_dispatch(2, "plain")
+    assert mcp_shared.on_response_outcome(lambda d: None) is False
+
+
+def test_the_exit_join_is_registered_once_by_the_first_armed_call(monkeypatch):
+    joins: list = []
+    monkeypatch.setattr(mcp_shared, "_register_exit_join", lambda *a: joins.append(a))
+    mcp_shared.register_response_outcome_tool("hooked")
+    for rid in (1, 2):
+        mcp_shared._arm_for_dispatch(rid, "hooked")
+        assert str(rid) in mcp_shared._response_outcome_arms
+        mcp_shared._settle_response_outcome(rid, False)
+    assert joins == [(mcp_shared._join_outcome_hooks, mcp_shared.OUTCOME_HOOK_EXIT_WAIT_SECS)]
+
+
+def test_an_exit_join_with_no_running_report_waits_on_nothing():
+    assert not mcp_shared._outcome_hook_threads
+    assert mcp_shared._join_outcome_hooks(mcp_shared.OUTCOME_HOOK_EXIT_WAIT_SECS) == 0
+
+
+def test_spawn_sub_agents_is_the_one_tool_registered_for_outcomes():
+    assert mcp_shared._response_outcome_tools == {"spawn_sub_agents"}
 
 
 def test_calls_armed_at_once_each_hear_only_their_own_outcome():

@@ -597,9 +597,11 @@ async def test_collecting_a_member_whose_announce_already_queued_settles_it(tmp_
     registry = InlineCollections()
     state.subagents = MagicMock(settle_queued_delivery=AsyncMock(), inline_collections=registry)
 
-    await api_spawn_mark_collected(
-        _Req(state, body={"ids": ["a1", "b1"], "parent_session": "dashboard:chat-1"})
-    )
+    for aid in ("a1", "b1"):
+        assert registry.reserve("dashboard:chat-1", aid, 600)
+    for phase in ("claim", "commit"):
+        body = {"ids": ["a1", "b1"], "parent_session": "dashboard:chat-1", "phase": phase}
+        await api_spawn_mark_collected(_Req(state, body=body))
 
     assert not [q for q in slot._queue if q.get("kind") == SUBAGENT_COMPLETION_KIND]
     assert registry.consume_collected("dashboard:chat-1", "b1")
@@ -726,25 +728,38 @@ async def test_an_unreadable_queue_answers_503_not_404() -> None:
 
 @pytest.mark.asyncio
 async def test_collected_ids_are_bounded_and_known(tmp_path) -> None:
-    """Only ids the gateway knows, each of bounded length, and never more than
-    the cap in total: an id no completion will match is never evicted."""
+    """Only ids a reservation covers, each of bounded length, and never more than
+    the cap in total: an id no completion will match is never recorded. A call
+    naming an id past the length bound is refused whole and records nothing, and
+    so is a body with no ``phase``."""
     from chat_test_helpers import _make_state
 
     from kiro_crew.dashboard.handlers import messaging
     from kiro_crew.subagent_inline_collection import InlineCollections
 
+    parent = "dashboard:chat-1"
     state = _make_state(tmp_path)
     state.get_or_create_slot("chat-1")
-    known = {f"k{i:04d}" for i in range(1500)}
+    known = [f"k{i:04d}" for i in range(1500)]
     registry = InlineCollections()
     state.subagents = MagicMock(inline_collections=registry)
-    state.subagents.get = MagicMock(side_effect=lambda aid: object() if aid in known else None)
+    refused = await messaging.api_spawn_mark_collected(
+        _Req(state, body={"ids": ["k0000", "x" * 500], "parent_session": parent, "phase": "commit"})
+    )
+    assert refused.status == 400
+    assert registry._records.get(parent, {}) == {}
+    reserved = {aid for aid in known if registry.reserve(parent, aid, 600)}
+    assert len(reserved) == messaging._COLLECTED_IDS_CAP
+    phaseless = await messaging.api_spawn_mark_collected(
+        _Req(state, body={"ids": known[:200], "parent_session": parent})
+    )
+    assert phaseless.status == 400
+    assert all(rec.state == "collecting" for rec in registry._records[parent].values())
     for start in range(0, 1500, 200):
-        ids = [f"k{i:04d}" for i in range(start, start + 200)] + ["x" * 500, "unknown1"]
-        await messaging.api_spawn_mark_collected(
-            _Req(state, body={"ids": ids, "parent_session": "dashboard:chat-1"})
-        )
-    probe = sorted(known) + ["x" * 500, "unknown1"]
-    kept = {aid for aid in probe if registry.consume_collected("dashboard:chat-1", aid)}
-    assert len(kept) == messaging._COLLECTED_IDS_CAP
-    assert kept <= known
+        ids = known[start : start + 200] + ["unknown1"]
+        for phase in ("claim", "commit"):
+            body = {"ids": ids, "parent_session": parent, "phase": phase}
+            await messaging.api_spawn_mark_collected(_Req(state, body=body))
+    probe = known + ["x" * 500, "unknown1"]
+    kept = {aid for aid in probe if registry.consume_collected(parent, aid)}
+    assert kept == reserved

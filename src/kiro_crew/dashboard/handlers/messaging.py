@@ -280,8 +280,10 @@ from kiro_crew.subagent import (  # noqa: F401
     effort_drop_reason,
     parent_spawn_allowlists,
 )
+from kiro_crew.subagent_inline_collection import MAX_AGENT_ID_CHARS as _INLINE_ID_MAX_CHARS
 from kiro_crew.subagent_inline_collection import MAX_IDS_PER_PARENT as _INLINE_IDS_PER_PARENT
 from kiro_crew.subagent_inline_collection import InlineCollections  # noqa: F401
+from kiro_crew.subagent_inline_collection import oversized_identity  # noqa: F401
 from kiro_crew.subagent_manager.admission.types import (  # noqa: F401
     QueuedReadUnavailable,
     QueuedRun,
@@ -621,11 +623,31 @@ def parent_work_supported(state: Any, parent_session: str) -> bool:
 
 
 #: Bounds on the inline-collected ids one ``mark-collected`` call names: each
-#: id's length (run ids are 16 hex characters), and the list as a whole. The
-#: list's bound is the one the inline-collection registry keeps per parent
-#: (``subagent_inline_collection.MAX_IDS_PER_PARENT``).
-_COLLECTED_ID_MAX_LEN = 128
+#: id's length, and the list as a whole. Both are the ones the inline-collection
+#: registry keeps (``subagent_inline_collection.MAX_AGENT_ID_CHARS`` and
+#: ``MAX_IDS_PER_PARENT``); run ids are 16 hex characters.
+_COLLECTED_ID_MAX_LEN = _INLINE_ID_MAX_CHARS
 _COLLECTED_IDS_CAP = _INLINE_IDS_PER_PARENT
+
+
+def _oversized_identity_refusal(state: DashboardState, field: str, length: int) -> web.Response:
+    """400 for a parent key, agent id or call id past the inline-collection bound.
+
+    Refused whole, before anything is retained, and logged once
+    (``InlineCollections.refuse_oversized``); never truncated, since a cut
+    identity could name another parent, run or call.
+    """
+    InlineCollections.refuse_oversized(field, length)
+    message, code = _OVERSIZED_IDENTITY_ERRORS[field]
+    return web.json_response({"error": message, "code": code}, status=400)
+
+
+#: The refusal of each identity ``oversized_identity`` can name.
+_OVERSIZED_IDENTITY_ERRORS = {
+    "parent_session": ("'parent_session' is too long", "parent_session_too_long"),
+    "agent_id": ("an agent id is too long", "agent_id_too_long"),
+    "call_id": ("the call id is too long", "call_id_too_long"),
+}
 
 
 _SPAWN_STATUS_MAX_LINES = 2000  # cap lines returned per spawn_status page

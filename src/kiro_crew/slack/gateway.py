@@ -611,7 +611,7 @@ def inline_collection_owns(manager: Any, slot: Any, info: Any) -> bool:
         registry = getattr(manager, "inline_collections", None)
         if not isinstance(registry, InlineCollections):
             registry = None
-        if registry is not None and registry.hold(parent_key, agent_id, info):
+        if registry is not None and registry.hold(parent_key, agent_id):
             info._delivery_queued = True
             logger.info(
                 "Subagent %s: holding completion (spawn_sub_agents is collecting it inline)",

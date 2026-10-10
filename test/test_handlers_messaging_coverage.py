@@ -568,18 +568,24 @@ class TestApiSpawnMarkCollected:
 
     @pytest.mark.parametrize("ids", [None, [], "a1"])
     def test_400_without_ids_array(self, ids: Any) -> None:
-        resp = _run(mod.api_spawn_mark_collected, _Req(_state(), {"ids": ids}))
+        resp = _run(mod.api_spawn_mark_collected, _Req(_state(), {"ids": ids, "phase": "commit"}))
         assert resp.status == 400
         assert _payload(resp)["code"] == "ids_required"
 
+    def test_400_without_phase(self) -> None:
+        resp = _run(mod.api_spawn_mark_collected, _Req(_state(), {"ids": ["a1"]}))
+        assert resp.status == 400
+        assert _payload(resp)["code"] == "invalid_phase"
+
     def test_no_slot_when_parent_is_not_a_dashboard_session(self) -> None:
-        req = _Req(_state(), {"ids": ["a1"], "parent_session": "cron:job1"})
+        req = _Req(_state(), {"ids": ["a1"], "parent_session": "cron:job1", "phase": "commit"})
         assert _payload(_run(mod.api_spawn_mark_collected, req)) == {"status": "no_slot"}
 
     def test_no_slot_when_slot_is_gone(self) -> None:
         state = _state()
         state.get_slot.return_value = None
-        req = _Req(state, {"ids": ["a1"], "parent_session": "dashboard:chat-1"})
+        body = {"ids": ["a1"], "parent_session": "dashboard:chat-1", "phase": "commit"}
+        req = _Req(state, body)
         assert _payload(_run(mod.api_spawn_mark_collected, req)) == {"status": "no_slot"}
 
     def test_records_ids_bounded_and_skips_non_strings(self) -> None:
@@ -593,8 +599,11 @@ class TestApiSpawnMarkCollected:
         state.get_slot.return_value = slot
         cap = mod._COLLECTED_IDS_CAP
         ids: list[Any] = ["", 7] + [f"a{i}" for i in range(cap + 50)]
-        req = _Req(state, {"ids": ids, "parent_session": "dashboard:chat-1"})
-        resp = _run(mod.api_spawn_mark_collected, req)
+        # The tool reserves every member before it runs; ids past the cap
+        # have no reservation to mark.
+        assert all(registry.reserve("dashboard:chat-1", f"a{i}", 600) for i in range(cap))
+        body = {"ids": ids, "parent_session": "dashboard:chat-1", "phase": "commit"}
+        resp = _run(mod.api_spawn_mark_collected, _Req(state, body))
         assert _payload(resp) == {"status": "ok", "marked": len(ids)}
         kept = [
             f"a{i}"

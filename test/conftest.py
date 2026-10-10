@@ -660,11 +660,27 @@ def _fresh_response_outcome(_floor_monkeypatch):
 
     from kiro_crew import mcp_shared
 
+    # Imported first: it registers its tool for outcomes at import, and that
+    # must land in the process-wide set, not in one test's copy below.
+    from kiro_crew.mcp_tools import spawn as spawn_tools
+
     _floor_monkeypatch.setattr(mcp_shared, "_response_outcome_arms", {})
     _floor_monkeypatch.setattr(mcp_shared, "_response_outcome_local", threading.local())
     _floor_monkeypatch.setattr(mcp_shared, "_response_outcome_dispatching", False)
+    # A tool one test registers for outcomes is not registered for the next.
+    _floor_monkeypatch.setattr(
+        mcp_shared, "_response_outcome_tools", set(mcp_shared._response_outcome_tools)
+    )
+    # Arming registers the exit join once per process: in the suite it is a
+    # no-op, so tests add no interpreter-exit hooks. A test that checks the
+    # registration records it itself.
+    _floor_monkeypatch.setattr(mcp_shared, "_outcome_exit_join_registered", False)
+    _floor_monkeypatch.setattr(mcp_shared, "_register_exit_join", lambda *_a: None)
     # A hook one test leaves running must not hold the next test's exit join.
     _floor_monkeypatch.setattr(mcp_shared, "_outcome_hook_threads", set())
+    # A collection report that fails is retried after a pause: no test waits
+    # for it in real time. A test that checks the pauses records them itself.
+    _floor_monkeypatch.setattr(spawn_tools, "_collection_retry_pause", lambda _secs: None)
 
 
 @pytest.fixture(autouse=True)
@@ -2342,7 +2358,6 @@ def _reset_create_rate_limit_buckets():
 _REAL_MCP_POST_MODULES = frozenset(
     {
         "test_ephemeral_sessions",
-        "test_inline_collection_report_deadline",
         "test_mcp_api_base_resolution",
         "test_mcp_core",
         "test_mcp_core_coverage",

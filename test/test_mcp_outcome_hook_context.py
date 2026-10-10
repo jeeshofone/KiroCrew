@@ -5,7 +5,9 @@ the worker that ran the call has cleared its caller, and a pooled backend has no
 per-session identity in its environment, so the commit or drop the hook sends is
 accepted only if it runs under the context captured when it was registered. It
 also reports AFTER the response is written, so a client that ends the server as
-soon as it has its answer must not kill the report.
+soon as it has its answer (EOF) must not kill the report. A SIGTERM does not wait
+for it: the report it cuts off leaves its claim to expire, a duplicate delivery,
+never a lost one.
 """
 
 from __future__ import annotations
@@ -168,10 +170,12 @@ def test_a_report_in_flight_survives_the_server_exiting(tmp_path) -> None:
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM has no handler on Windows")
-def test_sigterm_waits_for_a_running_report_before_it_exits(tmp_path) -> None:
-    """A real SIGTERM to a real server process: the handler joins the report
-    still running before ``os._exit``, so its marker is written. Nothing in
-    this process is patched."""
+def test_sigterm_exits_without_joining_a_running_report(tmp_path) -> None:
+    """A real SIGTERM to a real server process: the handler does NOT wait for
+    a report still running, so the process exits at once and the report never
+    lands. Its claim then expires and the result is delivered again
+    (``test_an_unconfirmed_claim_expires_into_a_delivery``): a duplicate,
+    never a loss. Nothing in this process is patched."""
     started = tmp_path / "started"
     marker = tmp_path / "committed"
     script = textwrap.dedent(f"""
@@ -180,12 +184,12 @@ def test_sigterm_waits_for_a_running_report_before_it_exits(tmp_path) -> None:
         mcp_shared._install_hard_exit_handlers()
         def hook(delivered):
             open({str(started)!r}, "w").write("1")
-            time.sleep(0.3)  # one loopback POST
+            time.sleep(120)  # a report that has not landed when the signal does
             open({str(marker)!r}, "w").write(str(delivered))
         mcp_shared._arm_response_outcome("r")
         assert mcp_shared.on_response_outcome(hook) is None
         mcp_shared._settle_response_outcome("r", True)
-        time.sleep(60)  # the server idles until the client ends it
+        time.sleep(120)  # the server idles until the client ends it
         """)
     env = {
         **os.environ,
@@ -201,60 +205,64 @@ def test_sigterm_waits_for_a_running_report_before_it_exits(tmp_path) -> None:
             assert time.monotonic() < deadline, "the report never started"
             time.sleep(0.01)
         os.kill(proc.pid, signal.SIGTERM)
-        assert proc.wait(timeout=30) == 0  # the handler's os._exit(0), not the idle
+        # The handler's os._exit(0): it neither idles out nor waits on the hook.
+        assert proc.wait(timeout=60) == 0
     finally:
         if proc.poll() is None:
             proc.kill()
             proc.wait()
-    assert marker.read_text() == "True"
+    assert not marker.exists()
 
 
-def test_a_collection_report_fits_inside_the_sigterm_wait() -> None:
-    assert spawn_tools.COLLECTION_REPORT_DEADLINE_SECS < mcp_shared.OUTCOME_HOOK_SIGNAL_WAIT_SECS
+def test_the_signal_handler_has_no_report_join() -> None:
+    """The SIGTERM path is ``logging.shutdown``, a stderr flush and ``os._exit``:
+    nothing in it reaches the outcome-hook set or its lock."""
+    import inspect
+
+    source = inspect.getsource(mcp_shared._hard_exit_on_signal)
+    assert "_join_outcome_hooks" not in source
+    assert "_outcome_hook_threads" not in source
 
 
-@pytest.mark.parametrize("phase", ["commit", "drop"])
-def test_a_failing_collection_report_stops_at_its_deadline(
-    phase: str, _floor_monkeypatch: pytest.MonkeyPatch
+def test_an_unconfirmed_claim_expires_into_a_delivery() -> None:
+    """What a report cut off by SIGTERM leaves: a claim nobody commits. Once
+    its time is up the held result is released for ordinary delivery."""
+    import asyncio
+
+    from kiro_crew.subagent_inline_collection import CLAIM_TTL_SECS, InlineCollections
+
+    now = [0.0]
+    reg = InlineCollections(clock=lambda: now[0])
+    released: list[str] = []
+
+    async def scenario() -> None:
+        assert reg.reserve(PARENT, "a1", 60, call="c1")
+        assert reg.hold(PARENT, "a1")
+        reg.finish(PARENT, ["a1"], ["a1"], call="c1")  # claimed; no commit follows
+        reg._release = lambda rec, returned: released.append(rec.aid)  # type: ignore[method-assign]
+        now[0] += CLAIM_TTL_SECS + 1
+        reg._expire(PARENT)
+
+    asyncio.run(scenario())
+    assert released == ["a1"]
+
+
+def test_a_failing_collection_report_tries_three_times_with_its_pauses(
+    _floor_monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Every attempt fails: the report gives up once its deadline is spent,
-    measured on a fake clock that each attempt and pause advances."""
-    clock = _FakeClock()
-    _floor_monkeypatch.setattr(mcp_core, "time", clock)
-    _floor_monkeypatch.setattr(spawn_tools, "_report_clock", clock.monotonic)
-    timeouts: list[float] = []
-    deadlines: list[float | None] = []
-
-    def _post(
-        _path: str, _body: Any, timeout: float = 0.0, deadline: float | None = None
-    ) -> dict[str, Any]:
-        timeouts.append(timeout)
-        deadlines.append(deadline)
-        clock.now += timeout  # the request hangs for its whole timeout
-        return {"error": "timed out"}
-
-    _floor_monkeypatch.setattr(mcp_core, "_post", _post)
-    spawn_tools._close_collection(PARENT, ["a1"], ["a1"], phase)
-    assert timeouts and clock.now <= spawn_tools.COLLECTION_REPORT_DEADLINE_SECS
-    assert all(t <= spawn_tools.COLLECTION_REPORT_DEADLINE_SECS for t in timeouts)
-    # Every attempt hands ``_send`` the same absolute end, so its own retries stay inside it.
-    assert all(d == pytest.approx(spawn_tools.COLLECTION_REPORT_DEADLINE_SECS) for d in deadlines)
-
-
-class _FakeClock:
-    """``time`` for ``mcp_core`` alone: ``monotonic`` reads, ``sleep`` advances."""
-
-    def __init__(self) -> None:
-        self.now = 0.0
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(time, name)
-
-    def monotonic(self) -> float:
-        return self.now
-
-    def sleep(self, secs: float) -> None:
-        self.now += secs
+    """Every attempt fails: three attempts, and the pauses between them go
+    through the module's own pause, never the process-wide ``time.sleep``."""
+    pauses: list[float] = []
+    posts: list[dict[str, Any]] = []
+    _floor_monkeypatch.setattr(spawn_tools, "_collection_retry_pause", pauses.append)
+    _floor_monkeypatch.setattr(
+        mcp_core, "_post", lambda _p, body, timeout=0.0: posts.append(body) or {"error": "down"}
+    )
+    spawn_tools._close_collection(PARENT, ["a1"], ["a1"], "commit", call="c1")
+    assert len(posts) == 3 and all(b["call"] == "c1" for b in posts)
+    assert pauses == list(spawn_tools.COLLECTION_RETRY_PAUSES)
+    # Every attempt and pause fits the normal exit's join of a running report.
+    assert 3 * 5.0 + sum(pauses) < mcp_shared.OUTCOME_HOOK_EXIT_WAIT_SECS
 
 
 def test_the_exit_wait_is_bounded_by_its_budget() -> None:
