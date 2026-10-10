@@ -2519,7 +2519,7 @@ class TestResponseOutcomeHook:
         harness = _LoopHarness(monkeypatch, self._tool(ref, outcomes, done))
         ref.append(harness)
         try:
-            harness.send(_tools_call(1, "t"))
+            harness.send(_tools_call(1, "spawn_sub_agents"))
             assert done.wait(timeout=10.0)
             assert outcomes == [(True, True)]
         finally:
@@ -2537,7 +2537,7 @@ class TestResponseOutcomeHook:
         )
         ref.append(harness)
         try:
-            harness.send(_tools_call(1, "t"))
+            harness.send(_tools_call(1, "spawn_sub_agents"))
             assert started.wait(timeout=5.0)
             cancel = {
                 "jsonrpc": "2.0",
@@ -2569,7 +2569,7 @@ class TestResponseOutcomeHook:
 
         monkeypatch.setattr(mcp_shared, "respond", _torn)
         try:
-            harness.send(_tools_call(1, "t"))
+            harness.send(_tools_call(1, "spawn_sub_agents"))
             assert done.wait(timeout=10.0)
             assert outcomes == [(False, True)]
         finally:
@@ -2584,7 +2584,7 @@ class TestResponseOutcomeHook:
         harness = _LoopHarness(monkeypatch, self._tool(ref, outcomes, done, cancel=True))
         ref.append(harness)
         try:
-            harness.send(_tools_call(1, "t"))
+            harness.send(_tools_call(1, "spawn_sub_agents"))
             assert done.wait(timeout=10.0)
             assert outcomes == [(False, False)]
         finally:
@@ -2606,7 +2606,7 @@ class TestResponseOutcomeHook:
 
         harness = _LoopHarness(monkeypatch, call_tool)
         try:
-            harness.send(_tools_call(1, "t"))
+            harness.send(_tools_call(1, "spawn_sub_agents"))
             assert harness.wait_for(lambda: "1" in mcp_shared._response_outcome_arms)
             mcp_shared._settle_response_outcome(1, False)  # the EOF path's settle
             release.set()
@@ -2694,12 +2694,112 @@ def test_the_loop_settles_every_call_before_it_arms_the_next(monkeypatch):
     harness = _LoopHarness(monkeypatch, call_tool)
     try:
         for rid in (1, 2, 3):
-            harness.send(_tools_call(rid, "t"))
+            harness.send(_tools_call(rid, "spawn_sub_agents"))
         assert answered.wait(timeout=10.0)
         assert harness.wait_for(lambda: len([r for r in harness.responses if r[0] == 3]) == 1)
         assert unsettled_at_arm == []
     finally:
         harness.close()
+
+
+def _hookless_call_observations(monkeypatch) -> dict:
+    """Dispatch one call of a tool other than ``spawn_sub_agents``, and
+    record what the arming left behind while it ran and after it was answered."""
+    import threading
+
+    joins: list = []
+    monkeypatch.setattr(mcp_shared, "_register_exit_join", lambda *a: joins.append(a))
+    seen: dict = {}
+    answered = threading.Event()
+
+    def call_tool(name, args):
+        seen["arms"] = dict(mcp_shared._response_outcome_arms)
+        seen["thread_arm"] = getattr(mcp_shared._response_outcome_local, "arm", None)
+        answered.set()
+        return "ok"
+
+    harness = _LoopHarness(monkeypatch, call_tool)
+    try:
+        harness.send(_tools_call(1, "plain"))
+        assert answered.wait(timeout=10.0)
+        assert harness.wait_for(lambda: len([r for r in harness.responses if r[0] == 1]) == 1)
+    finally:
+        harness.close()
+    seen["joins"] = joins
+    seen["join_registered"] = mcp_shared._outcome_exit_join_registered
+    return seen
+
+
+_NOTHING_ARMED = {"arms": {}, "thread_arm": None, "joins": [], "join_registered": False}
+
+
+@pytest.mark.skipif(
+    not platform_compat.IS_POSIX,
+    reason="worker-thread + select() interleave is POSIX-only",
+)
+def test_a_hookless_tools_call_arms_nothing_and_registers_no_exit_join(monkeypatch):
+    """Only ``spawn_sub_agents`` is armed for its response's outcome. Any other
+    call, on any MCP server, leaves no arm and no exit join, so its exit never
+    waits on outcome reports."""
+    assert _hookless_call_observations(monkeypatch) == _NOTHING_ARMED
+
+
+@pytest.mark.skipif(
+    not platform_compat.IS_POSIX,
+    reason="worker-thread + select() interleave is POSIX-only",
+)
+def test_mutation_arming_every_call_is_caught(monkeypatch):
+    """Mutation pin: a dispatcher that arms every call, hook or not, arms the
+    hookless call and registers the exit join, so the check above goes red."""
+    real_arm = mcp_shared._arm_response_outcome
+    monkeypatch.setattr(mcp_shared, "_arm_for_dispatch", lambda req_id, _name: real_arm(req_id))
+    seen = _hookless_call_observations(monkeypatch)
+    assert seen != _NOTHING_ARMED
+    assert seen["thread_arm"] is not None and seen["joins"]
+
+
+def test_another_tool_that_asks_for_its_outcome_is_told_it_was_dropped():
+    mcp_shared._arm_for_dispatch(1, "plain")
+    assert mcp_shared._response_outcome_arms == {}
+    # It can never commit: the dispatcher answers for no call it did not arm.
+    assert mcp_shared.on_response_outcome(lambda d: None) is False
+
+
+def test_a_non_string_tool_name_arms_nothing():
+    mcp_shared._arm_for_dispatch(1, ["spawn_sub_agents"])  # unhashable: never armed
+    assert mcp_shared._response_outcome_arms == {}
+
+
+def test_another_tools_call_clears_the_threads_arm_from_an_earlier_call():
+    mcp_shared._arm_for_dispatch(1, "spawn_sub_agents")
+    mcp_shared._settle_response_outcome(1, True)
+    # The same thread then runs a hookless call: the earlier "written" outcome
+    # is not its outcome.
+    mcp_shared._arm_for_dispatch(2, "plain")
+    assert mcp_shared.on_response_outcome(lambda d: None) is False
+
+
+def test_the_exit_join_is_registered_once_by_the_first_armed_call(monkeypatch):
+    joins: list = []
+    monkeypatch.setattr(mcp_shared, "_register_exit_join", lambda *a: joins.append(a))
+    for rid in (1, 2):
+        mcp_shared._arm_for_dispatch(rid, "spawn_sub_agents")
+        assert str(rid) in mcp_shared._response_outcome_arms
+        mcp_shared._settle_response_outcome(rid, False)
+    assert joins == [(mcp_shared._join_outcome_hooks, mcp_shared.OUTCOME_HOOK_EXIT_WAIT_SECS)]
+
+
+def test_an_exit_join_with_no_running_report_waits_on_nothing():
+    assert not mcp_shared._outcome_hook_threads
+    assert mcp_shared._join_outcome_hooks(mcp_shared.OUTCOME_HOOK_EXIT_WAIT_SECS) == 0
+
+
+def test_spawn_sub_agents_is_the_one_tool_armed_for_outcomes():
+    mcp_shared._arm_for_dispatch(1, "spawn_sub_agents")
+    assert set(mcp_shared._response_outcome_arms) == {"1"}
+    for rid, other in ((2, "spawn_run"), (3, "Spawn_Sub_Agents"), (4, "")):
+        mcp_shared._arm_for_dispatch(rid, other)
+    assert set(mcp_shared._response_outcome_arms) == {"1"}
 
 
 def test_calls_armed_at_once_each_hear_only_their_own_outcome():

@@ -5899,16 +5899,20 @@ class SubagentManager:
     def is_queued(self, agent_id: str) -> bool:
         return self._run_events.is_queued_impl(agent_id)
 
-    def reserve_inline_member(self, parent_session_key: str, max_wait: float) -> str:
+    def reserve_inline_member(
+        self, parent_session_key: str, max_wait: float, *, call: str = ""
+    ) -> str:
         """Mint a run id a blocking ``spawn_sub_agents`` call collects inline.
 
         Recorded in ``inline_collections`` BEFORE the run exists, so its
         completion is held from the first moment it could arrive. Pass the id to
-        ``spawn`` as ``_preassigned_id``. ``""`` means the parent's collection is
-        full; the caller refuses the spawn instead of running a member unheld.
+        ``spawn`` as ``_preassigned_id``. *call* names the blocking call, so its
+        close ends this reservation even if the call never learns the id.
+        ``""`` means the parent's collection is full; the caller refuses the
+        spawn instead of running a member unheld.
         """
         agent_id = self._mint_agent_id()
-        if not self.inline_collections.reserve(parent_session_key, agent_id, max_wait):
+        if not self.inline_collections.reserve(parent_session_key, agent_id, max_wait, call=call):
             return ""
         return agent_id
 

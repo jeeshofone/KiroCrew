@@ -34,6 +34,7 @@ if TYPE_CHECKING:
         QueuedReadUnavailable,
         QueuedRun,
         QueuedRunListing,
+        _oversized_identity_refusal,
         _redact,
         _run_belongs_to_caller,
         _sel,
@@ -42,6 +43,7 @@ if TYPE_CHECKING:
         effective_session_key,
         internal_memory_scope,
         logger,
+        oversized_identity,
         read_state,
         record_panel_dismissal_outcome,
         subagent_event_slot,
@@ -394,8 +396,12 @@ async def api_spawn_mark_collected(request: web.Request) -> web.Response:
     * ``drop``: the dispatcher dropped the response (the call was cancelled), so
       ``ids`` are released for ordinary delivery.
 
-    No ``phase`` is an older tool that sends one mark after polling: a claim and
-    its commit at once, as before.
+    A body with no ``phase`` is refused with ``400 invalid_phase``, so nothing
+    is marked and its members are delivered as ordinary completions.
+
+    ``call`` (the id the call sent as ``inline_call`` on ``/api/spawn``) makes
+    every step also end each member that call reserved, so a member whose
+    ``/api/spawn`` reply was lost is not held until its reservation expires.
     """
     state: DashboardState = request.app["state"]
     over_cap: list[int] = []
@@ -420,18 +426,41 @@ async def api_spawn_mark_collected(request: web.Request) -> web.Response:
             {"error": "body must be an object", "code": "invalid_body"}, status=400
         )
     phase = body.get("phase")
-    if phase not in (None, "claim", "commit", "drop"):
+    if phase not in ("claim", "commit", "drop"):
         return web.json_response(
             {"error": "'phase' must be claim, commit or drop", "code": "invalid_phase"},
             status=400,
         )
     ids = body.get("ids")
+    parent_session = str(body.get("parent_session", "") or "")
+    # The call this step belongs to: it also ends every member the call
+    # reserved, including one whose id the call never learned.
+    call = body.get("call")
+    if call is not None and not isinstance(call, str):
+        return web.json_response(
+            {"error": "'call' must be a string", "code": "invalid_call"}, status=400
+        )
+    # Every caller-supplied identity the registry would keep is checked whole,
+    # before anything below can retain it: the parent key, every named id and
+    # the call id.
+    named = [
+        aid
+        for raw in (ids, body.get("released"))
+        if isinstance(raw, list)
+        for aid in raw
+        if isinstance(aid, str)
+    ]
+    field = oversized_identity(parent_session, named, call or "")
+    if field:
+        lengths = {"parent_session": len(parent_session), "call_id": len(call or "")}
+        return _oversized_identity_refusal(
+            state, field, lengths.get(field) or max(len(a) for a in named)
+        )
     released = _well_formed(body.get("released"))
-    if not isinstance(ids, list) or (not ids and not released):
+    if not isinstance(ids, list) or (not ids and not released and not call):
         return web.json_response(
             {"error": "'ids' array required", "code": "ids_required"}, status=400
         )
-    parent_session = str(body.get("parent_session", "") or "")
     _, refusal = await internal_memory_scope(request, "spawn.batch", claimed_session=parent_session)
     if refusal is not None:
         return refusal
@@ -450,24 +479,14 @@ async def api_spawn_mark_collected(request: web.Request) -> web.Response:
     if not isinstance(registry, InlineCollections) or not parent_session:
         registry = None
 
-    if phase in (None, "claim") and registry is not None:
-        # Synchronous, before this handler first awaits, so a completion whose
-        # callback runs during an await below finds every named id owned and is
-        # never injected into the turn still blocked on this request.
-        registry.finish(parent_session, set(released) | returned, returned)
-    if phase is None and registry is not None:
-        # An older tool spawned its members without a reservation. Only ids
-        # this gateway knows are claimed: nothing else would ever discard them.
-        # A current tool reserved every member, so a claim that finds no record
-        # is one its commit or drop already ended, and it records nothing.
-        registry.record_collected(
-            parent_session,
-            sorted(
-                aid
-                for aid in returned
-                if state.subagents is None or state.subagents.get(aid) is not None
-            ),
-        )
+    if phase == "claim" and registry is not None:
+        # Synchronous, with no await between it and the reply: a completion
+        # whose callback runs after it finds every named id owned and is never
+        # injected into the turn still blocked on this request. A completion
+        # that runs during the earlier awaits (``request.json()``,
+        # ``internal_memory_scope``) is already held, since ``reserve`` recorded
+        # every member as collecting.
+        registry.finish(parent_session, set(released) | returned, returned, call=call)
     slot_name = dashboard_slot_key(parent_session)
     if registry is None and not (slot_name and state.get_slot(slot_name)):
         # No registry and no dashboard slot: nothing here could hold the ids.
@@ -487,9 +506,9 @@ async def api_spawn_mark_collected(request: web.Request) -> web.Response:
         # ``released`` rides on the commit too, so the collection ends even
         # when the claim was lost or this commit overtook it.
         settles = registry.commit(
-            parent_session, returned - set(queued), delivered, released=released
+            parent_session, returned - set(queued), delivered, released=released, call=call
         )
-        registry.commit(parent_session, queued, False)
+        registry.commit(parent_session, queued, False, call=None)
     if owed and state.subagents is not None:
         try:
             await state.subagents.settle_queued_delivery(owed)

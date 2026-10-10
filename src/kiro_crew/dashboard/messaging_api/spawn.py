@@ -21,6 +21,7 @@ if TYPE_CHECKING:
         DashboardState,
         KiroCrewConfig,
         ValidationError,
+        _oversized_identity_refusal,
         _redact,
         _spawn_scope_refusal,
         dashboard_slot_key,
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
         effort_applied_note,
         effort_drop_reason,
         internal_memory_scope,
+        oversized_identity,
         parent_spawn_allowlists,
         parent_work_supported,
         validate_tool_args,
@@ -130,6 +132,19 @@ async def api_spawn(request: web.Request) -> web.Response:
             {"error": "parent_session must be a string", "code": "invalid_parent_session"},
             status=400,
         )
+    inline_call = body.get("inline_call", "")
+    if not isinstance(inline_call, str):
+        return web.json_response(
+            {"error": "inline_call must be a string", "code": "invalid_inline_call"},
+            status=400,
+        )
+    if body.get("inline_collect") is True:
+        # The inline-collection registry would keep the parent key and the call
+        # id: each is refused whole, before anything is retained, never truncated.
+        field = oversized_identity(parent_session, (), inline_call)
+        if field:
+            length = len(parent_session if field == "parent_session" else inline_call)
+            return _oversized_identity_refusal(state, field, length)
     _, refusal = await internal_memory_scope(
         request, "spawn.create", claimed_session=parent_session
     )
@@ -251,7 +266,7 @@ async def api_spawn(request: web.Request) -> web.Response:
             inline_wait = float(body.get("max_wait", 0) or 0)
         except (TypeError, ValueError):
             inline_wait = 0.0
-        inline_id = reserve(parent_session, inline_wait)
+        inline_id = reserve(parent_session, inline_wait, call=inline_call)
         if not inline_id:
             return web.json_response(
                 {

@@ -217,6 +217,18 @@ _response_outcome_local = threading.local()
 #: Set once this process dispatches its first call. From then on a thread with
 #: no arm cannot learn an outcome, so it is told the response was dropped.
 _response_outcome_dispatching = False
+#: The one tool whose calls the dispatcher arms. A constant here, in the
+#: dispatcher's own module, so arming never depends on which handler module has
+#: been imported: a backend whose first frame is ``tools/call spawn_sub_agents``
+#: is armed too. Every other tool's call arms nothing, and a server none of
+#: whose calls armed registers no exit join.
+_OUTCOME_HOOK_TOOL = "spawn_sub_agents"
+#: Whether the bounded exit join of running hooks is registered. It is, once,
+#: when the first call is armed.
+_outcome_exit_join_registered = False
+#: ``atexit.register``, under this module's own name so a test can observe it
+#: without patching the process-wide ``atexit``.
+_register_exit_join: Callable[..., Any] = atexit.register
 
 
 class _ResponseArm:
@@ -240,16 +252,19 @@ def on_response_outcome(hook: Callable[[bool], None]) -> bool | None:
     away. It runs on its own daemon thread, after the call returned, so it may
     block, and under a copy of the registering thread's context, so the call's
     caller identity (``current_caller()``, the gateway-forwarded session token a
-    pooled backend authenticates with) reaches what the hook sends. Process exit
-    waits for a running hook, bounded (``_join_outcome_hooks``). Returns None
+    pooled backend authenticates with) reaches what the hook sends. Only a tool
+    ``spawn_sub_agents`` (``_OUTCOME_HOOK_TOOL``) is armed. A normal
+    exit waits for a running hook, bounded (``_join_outcome_hooks``); a SIGTERM
+    does not, and a report it cuts off costs a duplicate. Returns None
     when the hook will be called. Otherwise nothing is
     registered and the result is ``delivered`` itself:
 
     * the recorded outcome when the dispatcher already answered this call (a
       hook registered after an EOF, for example);
-    * False from a thread no dispatched call runs on, once this process
-      dispatches calls, or for a second registration by the same call: neither
-      can learn the outcome, so neither may commit;
+    * False from a thread no armed call runs on (any other tool's call
+      included), once this process dispatches calls, or for a second
+      registration by the same call: neither can learn the outcome, so neither
+      may commit;
     * True when this process never dispatched a call (a direct call): the
       result is already the caller's.
     """
@@ -266,15 +281,36 @@ def on_response_outcome(hook: Callable[[bool], None]) -> bool | None:
         return arm.outcome
 
 
+def _arm_for_dispatch(req_id: Any, tool_name: str) -> None:
+    """Arm *req_id* if *tool_name* is ``_OUTCOME_HOOK_TOOL``; otherwise arm nothing.
+
+    Any other call still marks this process as dispatching and clears the
+    thread's arm from any earlier call, so a hook it registers is told the
+    response was dropped and never commits.
+    """
+    global _response_outcome_dispatching
+    if tool_name == _OUTCOME_HOOK_TOOL:
+        _arm_response_outcome(req_id)
+        return
+    with _response_outcome_lock:
+        _response_outcome_dispatching = True
+    _response_outcome_local.arm = None
+
+
 def _arm_response_outcome(req_id: Any) -> None:
     """Arm request *req_id*, run by the CURRENT thread. Other armed calls are untouched."""
-    global _response_outcome_dispatching
+    global _response_outcome_dispatching, _outcome_exit_join_registered
     arm = _ResponseArm(str(req_id))
     with _response_outcome_lock:
         # A reused id replaces an arm nothing can answer for any more.
         stale = _response_outcome_arms.pop(arm.req, None)
         _response_outcome_arms[arm.req] = arm
         _response_outcome_dispatching = True
+        join_now = not _outcome_exit_join_registered
+        _outcome_exit_join_registered = True
+    if join_now:
+        # Interpreter exit joins only non-daemon threads, and runs this after them.
+        _register_exit_join(_join_outcome_hooks, OUTCOME_HOOK_EXIT_WAIT_SECS)
     _response_outcome_local.arm = arm
     if stale is not None:
         _drop_arm(stale)
@@ -317,12 +353,10 @@ def _drop_arm(arm: _ResponseArm) -> None:
 _outcome_hook_threads: set[threading.Thread] = set()
 _outcome_hook_threads_lock = threading.Lock()
 #: Exit's wait: room for a slow report and a second one queued behind it.
+#: Only a normal exit (EOF, ``atexit``) waits. A SIGTERM does not: a report it
+#: cuts off leaves its claim to expire, which costs a duplicate delivery,
+#: never a lost result.
 OUTCOME_HOOK_EXIT_WAIT_SECS = 20.0
-#: SIGTERM's wait, under the 5 s a script cron's ``close()`` gives
-#: ``terminate()`` before it kills the server. A collection report bounds its
-#: own retries by ``mcp_tools.spawn.COLLECTION_REPORT_DEADLINE_SECS``, which
-#: is shorter, so this wait covers a report's worst case.
-OUTCOME_HOOK_SIGNAL_WAIT_SECS = 4.0
 
 
 def _start_outcome_hook(hook: Callable[[bool], None], delivered: bool) -> None:
@@ -358,10 +392,6 @@ def _join_outcome_hooks(budget_secs: float) -> int:
             left,
         )
     return left
-
-
-# Interpreter exit joins only non-daemon threads, and runs this after them.
-atexit.register(_join_outcome_hooks, OUTCOME_HOOK_EXIT_WAIT_SECS)
 
 
 # The framing the client's first accepted message used, and so the framing of
@@ -1601,17 +1631,11 @@ def _hard_exit_on_signal(_signum: int, _frame: Any) -> None:
     crash dialog on macOS) during a provider's group teardown. Same fix as the
     gateway stub's ``_hard_exit``: drain logging, flush stderr, ``os._exit``.
     stdout is NOT flushed: another thread may hold its lock, and waiting on it
-    here would keep the process from ever exiting. A response-outcome report
-    still running gets a bounded wait first, since ``os._exit`` skips the
-    ``atexit`` join. One window remains: a signal that lands between
-    ``respond()`` returning and ``_start_outcome_hook`` registering the thread
-    finds nothing to join, so that report is lost and its claim expires into
-    a duplicate delivery, as any lost report does.
+    here would keep the process from ever exiting. ``os._exit`` also skips
+    the ``atexit`` join of response-outcome reports, so a report still running
+    is cut off: its claim expires and the result is delivered again, a
+    duplicate, never a loss.
     """
-    try:
-        _join_outcome_hooks(OUTCOME_HOOK_SIGNAL_WAIT_SECS)
-    except Exception:  # pragma: no cover - never block exit on the join
-        pass
     try:
         logging.shutdown()
     except Exception:  # pragma: no cover - never block exit on log teardown
@@ -1877,7 +1901,7 @@ def _run_stdio_dispatch_loop(
         # gateway could not name reads it instead of a process-global fallback.
         # Cleared in the same places as the caller.
         set_current_tenant_nonce(tenant_nonce)
-        _arm_response_outcome(req_id)
+        _arm_for_dispatch(req_id, tool_name)
         try:
             result_text = call_tool_fn(tool_name, tool_args)
         except ToolCancelled:
@@ -2343,7 +2367,7 @@ def _run_stdio_dispatch_loop(
                 # caller identity (an escaped exception would kill the loop).
                 set_current_caller(_caller_ctx)
                 set_current_tenant_nonce(_tenant_nonce)
-                _arm_response_outcome(req_id)
+                _arm_for_dispatch(req_id, tool_name)
                 try:
                     result_text = call_tool_fn(tool_name, tool_args)
                 except Exception as exc:

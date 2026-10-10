@@ -33,6 +33,34 @@ from kiro_crew.validation import build_tool_response
 PARENT = "cron:job1:run1"
 
 
+def _hold(reg: Any, parent: str, aid: str, info: Any = None) -> bool:
+    """``reg.hold`` with *info* as the live run its release reads back.
+
+    The registry keeps only the id, so the run record a test hands in is what
+    the bound manager's ``get`` answers for it, as ``_agents`` does live.
+    """
+    if info is not None:
+        _live_runs(reg)[aid] = info
+    return reg.hold(parent, aid)
+
+
+def _live_runs(reg: Any) -> dict:
+    mgr = reg._manager
+    runs = getattr(mgr, "_test_live_runs", None)
+    if not isinstance(runs, dict):
+        runs = {}
+        previous = getattr(mgr, "get", None)
+
+        def get(aid: str) -> Any:
+            if aid in runs:
+                return runs[aid]
+            return previous(aid) if callable(previous) else None
+
+        mgr._test_live_runs = runs
+        mgr.get = get
+    return runs
+
+
 class _Clock:
     def __init__(self) -> None:
         self.now = 1000.0
@@ -118,7 +146,7 @@ def test_a_torn_frame_is_not_reported_as_written(monkeypatch: pytest.MonkeyPatch
 async def test_a_commit_that_overtakes_its_claim_is_not_redelivered() -> None:
     reg, clock, mgr = _registry()
     assert reg.reserve(PARENT, "a1", 60)
-    assert reg.hold(PARENT, "a1", _info("a1"))
+    assert _hold(reg, PARENT, "a1", _info("a1"))
     # The response naming a1 was written; its commit lands first ...
     reg.commit(PARENT, ["a1"], True, released=["a1"])
     # ... and the slow claim after it.
@@ -134,7 +162,7 @@ async def test_a_commit_that_overtakes_its_claim_is_not_redelivered() -> None:
 async def test_a_written_commit_after_a_lost_claim_settles_and_is_not_redelivered() -> None:
     reg, clock, mgr = _registry()
     assert reg.reserve(PARENT, "a1", 7200)
-    assert reg.hold(PARENT, "a1", _info("a1"))
+    assert _hold(reg, PARENT, "a1", _info("a1"))
     # Every claim attempt failed; the response was written; the commit arrives.
     reg.commit(PARENT, ["a1"], True, released=["a1"])
     assert PARENT not in reg._records or reg._records[PARENT]["a1"].state != "held"
@@ -151,7 +179,7 @@ async def test_a_written_commit_before_the_completion_consumes_it() -> None:
     assert reg.reserve(PARENT, "a1", 60)
     reg.commit(PARENT, ["a1"], True, released=["a1"])  # the claim was lost
     reg.finish(PARENT, ["a1"], ["a1"])  # a late claim changes nothing
-    assert not reg.hold(PARENT, "a1", _info("a1"))
+    assert not _hold(reg, PARENT, "a1", _info("a1"))
     assert reg.consume_collected(PARENT, "a1")
     await _drain(reg)
     mgr._on_done.assert_not_awaited()
@@ -162,8 +190,8 @@ async def test_a_dropped_commit_after_a_lost_claim_delivers_the_held_result() ->
     reg, _clock, mgr = _registry()
     assert reg.reserve(PARENT, "a1", 60)
     assert reg.reserve(PARENT, "a2", 60)
-    assert reg.hold(PARENT, "a1", _info("a1"))
-    assert reg.hold(PARENT, "a2", _info("a2"))
+    assert _hold(reg, PARENT, "a1", _info("a1"))
+    assert _hold(reg, PARENT, "a2", _info("a2"))
     reg.commit(PARENT, ["a1"], False, released=["a1", "a2"])
     await _drain(reg)
     # Both go out by the ordinary route; neither is settled as returned.
@@ -195,7 +223,7 @@ def test_retire_then_commit_leaves_the_late_completion_fenced() -> None:
     reg.finish(PARENT, ["a1"], ["a1"])  # claimed, completion not yet seen
     reg.retire(PARENT)
     reg.commit(PARENT, ["a1"], True)
-    assert reg.hold(PARENT, "a1", _info("a1"))  # owned, and dropped by the fence
+    assert _hold(reg, PARENT, "a1", _info("a1"))  # owned, and dropped by the fence
     mgr._on_done.assert_not_called()
     mgr.settle_queued_delivery.assert_not_called()
 
@@ -205,7 +233,7 @@ async def test_a_hung_terminal_report_does_not_keep_a_released_result() -> None:
     reg, _clock, mgr = _registry()
     assert reg.reserve(PARENT, "a1", 60)
     info = _info("a1")
-    assert reg.hold(PARENT, "a1", info)
+    assert _hold(reg, PARENT, "a1", info)
     never = asyncio.Event()
     report = asyncio.get_running_loop().create_task(never.wait())
     mgr._report_owners = {report: info}
@@ -279,106 +307,124 @@ def _real_info(aid: str, result: str, result_path: str) -> Any:
 
 
 @pytest.mark.asyncio
-async def test_a_result_whose_transcript_is_on_disk_is_kept_whole(tmp_path) -> None:
-    """``completion_keep_chars=0`` leaves the run's result uncapped. While it
-    fits the budget the held copy keeps all of it, so a release carries what
-    ordinary delivery would. The run object itself is not kept."""
+async def test_a_released_member_reads_its_full_result_from_the_run() -> None:
+    """``completion_keep_chars=0`` leaves the run's result uncapped. The registry
+    keeps no text of it: a release reads the whole result back from the run, and
+    while held the run is pinned against completed-run eviction."""
     import gc
     import weakref
 
-    transcript = tmp_path / "result.txt"
-    transcript.write_text("the whole result", encoding="utf-8")
-    reg, _clock, mgr = _registry()
-    assert reg.reserve(PARENT, "a1", 60)
-    text = "x" * 5_000_000 + "THE-END"
-    info = _real_info("a1", text, str(transcript))
-    run = weakref.ref(info)
-    assert reg.hold(PARENT, "a1", info)
-    del info
-    gc.collect()
-    assert run() is None, "the registry kept the run object alive"
-    kept = reg._records[PARENT]["a1"].completion
-    assert kept.result == text and kept.result_truncated is False
-    assert kept.result_path == str(transcript)
-    assert reg._held_bytes == len(text) + len(
-        str(transcript).encode("utf-8")
-    )  # the pointer is charged too
-    reg.finish(PARENT, ["a1"], [])  # not returned: the route gets the bounded copy
-    await _drain(reg)
-    (ticket,) = mgr._on_done.await_args.args
-    assert ticket.result == text
-    assert reg._held_bytes == 0, "the delivered record still charges the budget"
+    from kiro_crew.context_management import evict_completed_agents
 
-
-@pytest.mark.asyncio
-async def test_a_transient_5mb_result_is_kept_whole_and_delivered_whole() -> None:
-    """Incognito and temporary runs write no ``result.txt``, so the held text is
-    the only copy: it is kept and released in full, charged to the budget."""
     reg, _clock, mgr = _registry()
     assert reg.reserve(PARENT, "a1", 60)
     text = "h" * 1_000 + "x" * 5_000_000 + "THE-END"
     info = _real_info("a1", text, "")
-    info.memory_mode = "incognito"
-    assert reg.hold(PARENT, "a1", info)
-    kept = reg._records[PARENT]["a1"].completion
-    assert kept.result == text and kept.result_truncated is False
-    assert reg._held_bytes == len(text)
+    info._delivery_queued = True  # what the gateway sets beside the hold
+    assert _hold(reg, PARENT, "a1", info)
+    # The run lives in the manager's table; a wave of later completions would
+    # evict it by count unless the hold pins it.
+    agents = {"a1": info}
+    for n in range(60):
+        other = _real_info(f"o{n}", "", "")
+        other.started = info.started + 1 + n
+        agents[other.id] = other
+    info.started = 0.0  # the oldest, so the first a count eviction would take
+    evict_completed_agents(agents, max_retained=5, pinned=reg.pins)
+    assert "a1" in agents, "a held run was evicted while held"
+    rec = reg._records[PARENT]["a1"]
+    assert not any(
+        isinstance(v, str) and v not in ("a1", PARENT, rec.state, rec.call)
+        for v in vars(rec).values()
+    ), "the registry kept text of the held result"
+    reg.finish(PARENT, ["a1"], [])  # not returned: released for ordinary delivery
+    await _drain(reg)
+    (ticket,) = mgr._on_done.await_args.args
+    assert ticket.result == text and ticket.result_truncated is False
+    assert ticket is not info and info._delivery_queued is True  # the run's flags untouched
+    assert not reg.pins(info), "a released run stays pinned"
+    _live_runs(reg).clear()
+    run = weakref.ref(info)
+    del info, ticket, agents
+    mgr._on_done.reset_mock()
+    gc.collect()
+    assert run() is None, "the registry kept the run object alive"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_member_is_released_with_the_runs_own_error() -> None:
+    """Error and status come from the live run at release, never from a copy,
+    so a failure that landed after the hold is announced as the failure."""
+    reg, _clock, mgr = _registry()
+    assert reg.reserve(PARENT, "a1", 60)
+    info = _real_info("a1", "partial output", "")
+    assert _hold(reg, PARENT, "a1", info)
+    info.error = "e" * 100_000  # the live run's error, whole
     reg.finish(PARENT, ["a1"], [])
     await _drain(reg)
     (ticket,) = mgr._on_done.await_args.args
-    assert ticket.result == text
-    assert reg._held_bytes == 0
+    assert ticket.error == "e" * 100_000 and ticket.outcome != "completed"
+    assert ticket.result == "partial output"
 
 
-def test_a_result_over_the_budget_is_held_in_part(
-    caplog: pytest.LogCaptureFixture,
+@pytest.mark.asyncio
+@pytest.mark.parametrize("on_disk", [True, False])
+async def test_a_run_gone_at_release_is_an_explicit_error(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, on_disk: bool
 ) -> None:
-    """One that would exceed ``HELD_BYTES_BUDGET`` is still held, so it is never
-    routed into the blocked turn: it keeps what fits, charges only that, and is
-    flagged. Freed budget is held again."""
-    import logging
+    """The held run's record left the manager (a restart-free teardown path).
+    The release is an explicit error naming what happened, never an empty
+    success, and points at the result file when it is still readable."""
+    import kiro_crew.subagent_persistence as persistence
 
-    from kiro_crew.subagent_inline_collection import HELD_BYTES_BUDGET
-
-    reg, _clock, _mgr = _registry()
-    for aid in ("a1", "a2"):
-        assert reg.reserve(PARENT, aid, 60)
-    big = "y" * (HELD_BYTES_BUDGET // 2 + 1)
-    assert reg.hold(PARENT, "a1", _real_info("a1", big, ""))
-    second = _real_info("a2", big, "")
-    with caplog.at_level(logging.WARNING, logger="kiro_crew.subagent_inline_collection"):
-        assert reg.hold(PARENT, "a2", second) is True
-    assert second.result == big, "a partial hold cut the run's own result"
-    rec = reg._records[PARENT]["a2"]
-    assert rec.result_cut_from == len(big)
-    assert 0 < rec.held_bytes <= HELD_BYTES_BUDGET - len(big)
-    assert reg._held_bytes == len(big) + rec.held_bytes <= HELD_BYTES_BUDGET
-    assert any("is held as" in r.message for r in caplog.records)
-    reg.retire(PARENT)  # drops both held results and their charges
-    assert reg._held_bytes == 0
-
-
-def test_a_result_path_naming_a_deleted_file_is_transient(tmp_path) -> None:
-    transcript = tmp_path / "result.txt"
-    transcript.write_text("gone soon", encoding="utf-8")
-    transcript.unlink()
-    reg, _clock, _mgr = _registry()
+    run_dir = tmp_path / "a1"
+    run_dir.mkdir()
+    if on_disk:
+        (run_dir / "result.txt").write_text("the whole result", encoding="utf-8")
+    monkeypatch.setattr(persistence, "agent_dir_for_display", lambda aid: tmp_path / aid)
+    reg, _clock, mgr = _registry()
+    mgr.get = MagicMock(return_value=None)
     assert reg.reserve(PARENT, "a1", 60)
-    text = "z" * 50_000
-    assert reg.hold(PARENT, "a1", _real_info("a1", text, str(transcript)))
-    kept = reg._records[PARENT]["a1"].completion
-    assert kept.result == text and kept.result_truncated is False
+    assert _hold(reg, PARENT, "a1")
+    reg.finish(PARENT, ["a1"], [])
+    await _drain(reg)
+    (ticket,) = mgr._on_done.await_args.args
+    assert ticket.id == "a1" and ticket.parent_session_key == PARENT
+    assert ticket.error.startswith("[run record gone before its held result was released")
+    assert ticket.outcome != "completed"
+    assert ticket.result == ""
+    if on_disk:
+        assert str(run_dir / "result.txt") in ticket.error
+        assert ticket.result_path == str(run_dir / "result.txt")
+    else:
+        assert ticket.error.endswith("result not retained]") and ticket.result_path == ""
+    assert _settled_ids(mgr) == [], "a gone run was marked delivered"
+
+
+@pytest.mark.asyncio
+async def test_a_returned_member_whose_run_is_gone_is_not_marked_delivered() -> None:
+    """The written response carried it, but there is no run to settle: the
+    delivered mark is left to restart recovery (a duplicate, never a loss)."""
+    reg, _clock, mgr = _registry()
+    mgr.get = MagicMock(return_value=None)
+    assert reg.reserve(PARENT, "a1", 60)
+    assert _hold(reg, PARENT, "a1")
+    reg.finish(PARENT, [], ["a1"])
+    tasks = reg.commit(PARENT, ["a1"], True, released=["a1"])
+    assert [await t for t in tasks] == ["undelivered"]
+    assert _settled_ids(mgr) == []
+    mgr._on_done.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("result_path", ["", "/no/transcript/was/written/result.txt"])
 async def test_a_held_result_with_no_transcript_is_released_whole(result_path: str) -> None:
-    """Incognito and temporary runs write no ``result.txt``, so the held text is
+    """Incognito and temporary runs write no ``result.txt``, so the run's text is
     the only copy: a dropped reply releases all of it, not a preview."""
     reg, _clock, mgr = _registry()
     assert reg.reserve(PARENT, "a1", 60)
     text = "".join(f"line {n}\n" for n in range(2_000))  # about 17,000 chars
-    assert reg.hold(PARENT, "a1", _real_info("a1", text, result_path))
+    assert _hold(reg, PARENT, "a1", _real_info("a1", text, result_path))
     reg.finish(PARENT, ["a1"], [])
     await _drain(reg)
     (ticket,) = mgr._on_done.await_args.args
@@ -386,31 +432,17 @@ async def test_a_held_result_with_no_transcript_is_released_whole(result_path: s
 
 
 @pytest.mark.asyncio
-async def test_a_completion_copy_already_cut_keeps_its_flag() -> None:
-    """A run whose completion copy was cut keeps ``result_truncated``, so the
-    route still sends the summary pointing at ``result_path``."""
-    reg, _clock, _mgr = _registry()
-    assert reg.reserve(PARENT, "a1", 60)
-    info = _real_info("a1", "head of the result", "/r/result.txt")
-    info.result_truncated = True
-    assert reg.hold(PARENT, "a1", info)
-    kept = reg._records[PARENT]["a1"].completion
-    assert kept.result == "head of the result" and kept.result_truncated is True
-
-
-@pytest.mark.asyncio
 async def test_a_released_result_still_waits_for_its_own_terminal_report(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The record keeps a snapshot, so the run's report is found by its id: the
+    """The record keeps only the id, so the run's report is found by it: the
     bounded wait runs (and says so when it gives up) instead of being skipped."""
     import logging
 
     reg, _clock, mgr = _registry()
     assert reg.reserve(PARENT, "a1", 60)
     info = _info("a1")
-    assert reg.hold(PARENT, "a1", info)
-    assert reg._records[PARENT]["a1"].completion is not info
+    assert _hold(reg, PARENT, "a1", info)
     never = asyncio.Event()
     report = asyncio.get_running_loop().create_task(never.wait())
     mgr._report_owners = {report: info}
@@ -428,134 +460,152 @@ async def test_a_released_result_still_waits_for_its_own_terminal_report(
         report.cancel()
 
 
+def _pinned(reg: InlineCollections) -> int:
+    """How many runs the registry pins, asked through ``pins`` itself."""
+    return sum(
+        1
+        for recs in reg._records.values()
+        for rec in recs.values()
+        if reg.pins(_real_info(rec.aid, "", "") if rec.parent == PARENT else None)
+    )
+
+
 @pytest.mark.asyncio
-async def test_a_held_result_drops_the_live_runs_follow_up_queue() -> None:
-    """``spawn_steer(mode="follow_up")`` appends without a count cap, so a held
-    copy keeps none of it, and the live run's own queue is left as it was."""
-    reg, _clock, _mgr = _registry()
+@pytest.mark.parametrize(
+    "path",
+    ["release", "written", "drop", "retire", "expiry", "discard", "shutdown"],
+)
+async def test_every_terminal_path_releases_the_pin(path: str) -> None:
+    """A held run is pinned against completed-run eviction only while its record
+    is on the registry. Every way a record leaves (a release, a written commit,
+    a dropped one, the parent's teardown, expiry, a refused spawn, a delivery
+    cancelled at shutdown) takes the pin with it, so ``evict_completed_agents``
+    can evict the run again. The pins are records, so the registry's
+    ``MAX_IDS_PER_PARENT`` cap bounds them."""
+    from kiro_crew.context_management import evict_completed_agents
+
+    reg, clock, _mgr = _registry()
     assert reg.reserve(PARENT, "a1", 60)
-    info = _real_info("a1", "done", "/r")
-    queue = [f"follow-up {n}" for n in range(10_000)]
-    info.pending_followups = queue
-    info.streaming_text = "s" * 40_000
-    assert reg.hold(PARENT, "a1", info)
-    kept = reg._records[PARENT]["a1"].completion
-    assert kept.pending_followups == [] and kept.streaming_text == ""
-    assert kept.delegation == {} and kept.allowed_tools == []
-    assert info.pending_followups is queue and len(queue) == 10_000
-
-
-def test_every_object_a_held_copy_keeps_is_named_bounded() -> None:
-    """Every object-valued run field is reset on the held copy to its default,
-    except the kept set; a field added later is reset without being listed."""
-    import dataclasses
-
-    from kiro_crew.subagent import SubagentInfo
-    from kiro_crew.subagent_inline_collection import (
-        _HELD_KEPT_OBJECTS,
-        _SCALARS,
-        _held_snapshot,
-    )
-
-    assert _HELD_KEPT_OBJECTS == {"_digest_settle_deliveries"}
-    info = _real_info("a1", "done", "/r")
-    info._tool_tracker.dispatch("t1", MagicMock(), {"content": "z" * 100_000})
-    assert info._tool_tracker.any_active
-    live_tracker = info._tool_tracker
-    snap = _held_snapshot(info)
-    for f in dataclasses.fields(SubagentInfo):
-        value = getattr(snap, f.name, None)
-        if f.name in _HELD_KEPT_OBJECTS or isinstance(value, _SCALARS):
-            continue
-        assert value is not getattr(info, f.name), f"{f.name} is shared with the live run"
-    assert snap._tool_tracker is not live_tracker
-    assert info._tool_tracker is live_tracker  # the live run keeps its tracker
-
-
-def test_every_text_field_a_held_copy_keeps_is_capped() -> None:
-    """Every text field but ``result``, ``error`` and ``result_path`` (task, tool
-    title) is cut to the held cap, so a text field added later is bounded
-    unlisted. ``error`` has its own larger cap; ``result_path`` is kept whole."""
-    import dataclasses
-
-    from kiro_crew.subagent import SubagentInfo
-    from kiro_crew.subagent_inline_collection import (
-        HELD_ERROR_MAX_CHARS,
-        HELD_TEXT_MAX_CHARS,
-        _held_snapshot,
-    )
-
-    assert HELD_TEXT_MAX_CHARS == 512
     info = _real_info("a1", "done", "")
-    text_fields = [
-        f.name for f in dataclasses.fields(SubagentInfo) if isinstance(getattr(info, f.name), str)
-    ]
-    assert {"task", "error", "last_tool", "_raw_task", "result_path"} <= set(text_fields)
-    for name in text_fields:
-        setattr(info, name, "w" * 100_000)
-    snap = _held_snapshot(info)
-    for name in text_fields:
-        assert len(getattr(info, name)) == 100_000, f"{name} was cut on the live run"
-        if name in ("result", "result_path"):
-            assert getattr(snap, name) == "w" * 100_000, name
-            continue
-        cap = HELD_ERROR_MAX_CHARS if name == "error" else HELD_TEXT_MAX_CHARS
-        assert len(getattr(snap, name)) <= cap, name
-        kept = getattr(snap, name)
-        assert kept == "" or kept.endswith("\u2026"), name  # emptied, or cut
-    assert snap.last_tool == "w" * (HELD_TEXT_MAX_CHARS - 1) + "\u2026"
+    info._delivery_queued = True
+    assert _hold(reg, PARENT, "a1", info)
+    assert _pinned(reg) == 1 and reg.pins(info)
+    if path == "release":
+        reg.finish(PARENT, ["a1"], [])
+        await _drain(reg)
+    elif path == "written":
+        reg.finish(PARENT, ["a1"], ["a1"])
+        await asyncio.gather(*reg.commit(PARENT, ["a1"], True))
+    elif path == "drop":
+        reg.finish(PARENT, ["a1"], ["a1"])
+        reg.commit(PARENT, ["a1"], False)
+        await _drain(reg)
+    elif path == "retire":
+        reg.retire(PARENT)
+    elif path == "expiry":
+        clock.now += 60 + 300 + 1
+        reg._expire(PARENT)
+        await _drain(reg)
+    elif path == "discard":
+        reg.discard(PARENT, "a1")
+    else:
+        hang = asyncio.Event()
+        reg._manager._sessions.is_busy = MagicMock(return_value=True)
+        with patch.object(reg, "_await_parent_idle", side_effect=lambda _p: hang.wait()):
+            reg.finish(PARENT, ["a1"], [])
+            await asyncio.sleep(0)
+            for task in list(reg._tasks):
+                task.cancel()  # the gateway's shutdown cancels the delivery
+            await asyncio.gather(*reg._tasks, return_exceptions=True)
+    assert _pinned(reg) == 0 and not reg.pins(info), f"{path} left the run pinned"
+    agents = {"a1": info, **{f"o{n}": _real_info(f"o{n}", "", "") for n in range(3)}}
+    info.started = 0.0
+    evict_completed_agents(agents, max_retained=3, pinned=reg.pins)
+    assert "a1" not in agents, f"{path}: retention still cannot evict the run"
 
 
-def _deep_chars(value: Any, seen: set[int] | None = None) -> int:
-    """Text and container entries reachable from *value*, counted once each."""
-    seen = set() if seen is None else seen
-    if id(value) in seen:
-        return 0
-    seen.add(id(value))
-    if isinstance(value, (str, bytes)):
-        return len(value)
-    if isinstance(value, dict):
-        return len(value) + sum(
-            _deep_chars(k, seen) + _deep_chars(v, seen) for k, v in value.items()
-        )
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return len(value) + sum(_deep_chars(v, seen) for v in value)
-    if hasattr(value, "__dict__") and not isinstance(value, type):
-        return _deep_chars(vars(value), seen)
-    return 0
+@pytest.mark.asyncio
+async def test_a_member_is_pinned_from_its_reservation_not_its_hold() -> None:
+    """GPT 6.1 F1 (residual/crash-data-loss). A member can finish, and be
+    followed by many newer completions, before its terminal report reaches
+    ``hold``. The pin is taken at ``reserve``, so count eviction in that window
+    cannot take the run, and the release returns the FULL result, never the
+    "run record gone" error. Pinning only at hold turns this red."""
+    from kiro_crew.context_management import evict_completed_agents
 
-
-def test_a_held_record_stays_small_after_a_large_tool_call_follow_ups_and_a_long_stream() -> None:
-    reg, _clock, _mgr = _registry()
+    reg, _clock, mgr = _registry()
     assert reg.reserve(PARENT, "a1", 60)
-    info = _real_info("a1", "x" * 2_000_000, "")
-    info._tool_tracker.dispatch("t1", MagicMock(), {"content": "z" * 1_000_000})
-    info.pending_followups = [f"follow-up {n}" * 50 for n in range(5_000)]
-    info.streaming_text = "s" * 1_000_000
-    info.task = "t" * 500_000
-    info.error = "e" * 500_000
-    assert _deep_chars(info) > 5_000_000
-    assert reg.hold(PARENT, "a1", info)
-    kept = reg._records[PARENT]["a1"].completion
-    assert not kept._tool_tracker.any_active
-    assert kept.result == info.result  # no transcript: kept whole, charged to the budget
-    kept.result = ""
-    size = _deep_chars(kept)
-    assert size < 16_000, size
+    text = "r" * 200_000 + "THE-END"
+    info = _real_info("a1", text, "")  # completed, not yet held
+    info.started = 0.0  # the oldest, so the first a count eviction would take
+    agents = {"a1": info}
+    for n in range(60):
+        other = _real_info(f"o{n}", "", "")
+        other.started = 1.0 + n
+        agents[other.id] = other
+    evict_completed_agents(agents, max_retained=50, pinned=reg.pins)
+    assert "a1" in agents, "a reserved, completed run was evicted before its hold"
+    _live_runs(reg)["a1"] = agents["a1"]
+    info._delivery_queued = True
+    assert reg.hold(PARENT, "a1")
+    reg.finish(PARENT, ["a1"], [])  # not returned: released for ordinary delivery
+    await _drain(reg)
+    (ticket,) = mgr._on_done.await_args.args
+    assert ticket.result == text and not ticket.error
+    assert "run record gone" not in (ticket.error or "")
 
 
-@pytest.mark.parametrize("completion", [MagicMock(), object(), {"id": "a1"}, "a1"])
-def test_a_completion_that_is_not_a_run_record_is_not_held(
-    completion: Any, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Its fields cannot be enumerated, so it is never copied whole into the
-    registry: the hold refuses, and the route delivers it as an ordinary one."""
-    import logging
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    ["release", "written", "drop", "retire", "expiry", "discard", "consumed"],
+)
+async def test_every_reserve_time_path_releases_the_pin(path: str) -> None:
+    """The pin ``reserve`` takes ends with collection ownership on every path a
+    record can take before it is ever held: the call's close without it, a
+    written commit (only the ``returned`` marker is left), a dropped one, the
+    parent's teardown, expiry, a refused spawn, and a consumed completion."""
+    from kiro_crew.context_management import evict_completed_agents
+
+    reg, clock, _mgr = _registry()
+    assert reg.reserve(PARENT, "a1", 60)
+    info = _real_info("a1", "done", "")
+    assert _pinned(reg) == 1 and reg.pins(info)
+    if path == "release":
+        reg.finish(PARENT, ["a1"], [])
+    elif path == "written":
+        reg.finish(PARENT, ["a1"], ["a1"])
+        await asyncio.gather(*reg.commit(PARENT, ["a1"], True))
+    elif path == "drop":
+        reg.finish(PARENT, ["a1"], ["a1"])
+        reg.commit(PARENT, ["a1"], False)
+    elif path == "retire":
+        reg.retire(PARENT)
+    elif path == "expiry":
+        clock.now += 60 + 300 + 1
+        reg._expire(PARENT)
+    elif path == "discard":
+        reg.discard(PARENT, "a1")
+    else:
+        reg.finish(PARENT, ["a1"], ["a1"])
+        await asyncio.gather(*reg.commit(PARENT, ["a1"], True))
+        assert reg.consume_collected(PARENT, "a1")
+    await _drain(reg)
+    assert _pinned(reg) == 0 and not reg.pins(info), f"{path} left the run pinned"
+    agents = {"a1": info, **{f"o{n}": _real_info(f"o{n}", "", "") for n in range(3)}}
+    info.started = 0.0
+    evict_completed_agents(agents, max_retained=3, pinned=reg.pins)
+    assert "a1" not in agents, f"{path}: retention still cannot evict the run"
+
+
+def test_a_reservation_refused_at_the_cap_takes_no_pin() -> None:
+    """The pins are the registry's records, so ``MAX_IDS_PER_PARENT`` bounds
+    them: a reservation past the cap is refused and pins nothing."""
+    from kiro_crew.subagent_inline_collection import MAX_IDS_PER_PARENT
 
     reg, _clock, _mgr = _registry()
-    assert reg.reserve(PARENT, "a1", 60)
-    with caplog.at_level(logging.WARNING, logger="kiro_crew.subagent_inline_collection"):
-        assert reg.hold(PARENT, "a1", completion) is False
-    rec = reg._records[PARENT]["a1"]
-    assert rec.completion is None and rec.state == "collecting"
-    assert any("not a run record; not holding it" in r.message for r in caplog.records)
+    for n in range(MAX_IDS_PER_PARENT):
+        assert reg.reserve(PARENT, f"m{n}", 60)
+    assert not reg.reserve(PARENT, "over", 60)
+    assert not reg.pins(_real_info("over", "", ""))
+    assert _pinned(reg) == MAX_IDS_PER_PARENT

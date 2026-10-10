@@ -50,6 +50,34 @@ from kiro_crew.subagent_inline_collection import (
 CASES = 400
 
 
+def _hold(reg: Any, parent: str, aid: str, info: Any = None) -> bool:
+    """``reg.hold`` with *info* as the live run its release reads back.
+
+    The registry keeps only the id, so the run record a test hands in is what
+    the bound manager's ``get`` answers for it, as ``_agents`` does live.
+    """
+    if info is not None:
+        _live_runs(reg)[aid] = info
+    return reg.hold(parent, aid)
+
+
+def _live_runs(reg: Any) -> dict:
+    mgr = reg._manager
+    runs = getattr(mgr, "_test_live_runs", None)
+    if not isinstance(runs, dict):
+        runs = {}
+        previous = getattr(mgr, "get", None)
+
+        def get(aid: str) -> Any:
+            if aid in runs:
+                return runs[aid]
+            return previous(aid) if callable(previous) else None
+
+        mgr._test_live_runs = runs
+        mgr.get = get
+    return runs
+
+
 @dataclass
 class _Info:
     id: str
@@ -60,7 +88,7 @@ class _Info:
     _delivery_queued: bool = False
     _report_undelivered: bool = False
     _report_owed: bool = False
-    # Charged to the registry's held-bytes budget while held.
+    # Read back from the live run at release.
     result: str = "r" * 64
     result_path: str = ""
 
@@ -117,7 +145,7 @@ def _manager(world: _World) -> Any:
         if ticket.id in world.confirmed:
             world.violations.append(f"{ticket.id}: delivered again after a confirmed write")
         # The gateway's route asks the registry first; a ticket must pass.
-        if world.registry.hold(ticket.parent_session_key, ticket.id, ticket):
+        if world.registry.hold(ticket.parent_session_key, ticket.id):
             world.violations.append(f"{ticket.id}: the ticket was held again")
         if world.registry.consume_collected(ticket.parent_session_key, ticket.id):
             world.violations.append(f"{ticket.id}: the ticket was consumed as returned")
@@ -175,7 +203,7 @@ def _complete(world: _World, aid: str) -> None:
         info._report_owed = True
     world.completed.add(aid)
     reg = world.registry
-    if reg.hold(parent, aid, info):
+    if _hold(reg, parent, aid, info):
         info._delivery_queued = True
         world.held[aid] = info
         if world.rng.random() < 0.4:
@@ -247,7 +275,7 @@ def _answer(world: _World, index: int) -> list[asyncio.Task[str]]:
             ):
                 world.reached.add(aid)  # the written response carried it
                 world.confirmed[aid] = world.now[0]
-                if rec.completion is not None:
+                if rec.held:
                     world.returned_held.add(aid)
     return reg.commit(parent, returned, written, released=call)
 
@@ -359,5 +387,4 @@ async def test_no_retired_parent_receives_output_and_nothing_undelivered_is_mark
             unsettled = world.returned_held - set(marked)
             assert not unsettled, f"seed {seed}: returned but never settled: {sorted(unsettled)}"
             assert world.registry._records == {}, f"seed {seed}: {world.registry._records}"
-            assert world.registry._held_bytes == 0, f"seed {seed}: budget charge leaked"
             assert not world.registry._tasks
