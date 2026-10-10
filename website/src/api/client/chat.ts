@@ -115,7 +115,15 @@ export function createChatEndpoints({ post, put, del, patch, j, jfetch: fetch, s
         ...(title ? { title } : {}),
         ...(artifact ? { artifact } : {}),
         ...(folder_id ? { folder_id } : {}),
-      }).then(j) as Promise<ChatSlot>
+      }).then(j).then((slot: ChatSlot) => {
+        // The session opened but was not filed into `folder_id`: every caller
+        // gets one warning with the stable code; `slot.filing_error` carries it.
+        if (slot?.filing_error) {
+          // eslint-disable-next-line no-console -- the one record of a refused filing
+          console.warn('[createChatSlot] session opened outside its folder', slot.key, slot.filing_error.code, slot.filing_error.reason)
+        }
+        return slot
+      }) as Promise<ChatSlot>
     },
     /** Inject silent background context into a slot — consumed on the next user
      * message. Used by the artifact companion chat to name the bound artifact so

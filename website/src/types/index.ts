@@ -1103,7 +1103,20 @@ export interface RemoteCrewCapabilities {
   unavailable: Record<string, string>
 }
 
+/** Why a create published its slot but did not file it into the requested
+ *  folder (`POST /api/chat/slots`). `code` is always `folder_filing_refused`;
+ *  `reason` is the folder-move path's own code (or `slot_replaced`). */
+export interface SlotFilingError {
+  code: string
+  status: number
+  reason: string
+  error: string
+}
+
 export interface ChatSlot {
+  /** Present only on a create response whose folder filing was refused: the
+   *  slot exists, unfiled. */
+  filing_error?: SlotFilingError
   /** Which namespace `agent` was chosen in: a configured member, a shared
    *  provider template, or "" when the choice was made by name alone or came
    *  back from history. Display provenance for the picker's selected row; the

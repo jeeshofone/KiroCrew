@@ -322,7 +322,8 @@ export function useAgentSession(): UseAgentSession {
         }
         const res = await issueRadarApi.saveInvestigation(repoRef, number, {
           slot_key: slot.key,
-          folder_id: folderId,
+          // A refused filing left the session outside the folder: record where it is.
+          folder_id: slot.filing_error ? '' : folderId,
           status: 'investigating',
           // NOT `findings: null` here, deliberately. Clearing at this point would
           // destroy the stored verdict the moment the replacement session opens,
