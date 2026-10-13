@@ -1824,7 +1824,7 @@ class TestDashboardSaveHoldsLock:
         slot._frozen_prefix_cache = None
 
         _prefix, foreign, dedup_dropped = _frozen_prefix_and_foreign_appends(
-            slot, path, 0, window_entries
+            slot, path, 0, window_entries, archive_dedup=lambda lines: None
         )
         foreign_contents = [json.loads(ln)["content"] for ln in foreign]
 
@@ -1905,7 +1905,9 @@ class TestForeignFoldMidIdentity:
         lines.extend(json.dumps(e) for e in disk_entries)
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         slot._frozen_prefix_cache = None
-        return _frozen_prefix_and_foreign_appends(slot, path, 0, window_entries)
+        return _frozen_prefix_and_foreign_appends(
+            slot, path, 0, window_entries, archive_dedup=lambda lines: None
+        )
 
     def test_id_matched_durable_copy_folds_without_archive_churn(
         self, tmp_path, monkeypatch
@@ -2235,7 +2237,7 @@ class TestForeignFoldMidIdentity:
         ]
 
         _prefix, foreign, dedup_dropped = _frozen_prefix_and_foreign_appends(
-            slot, path, 0, window_entries
+            slot, path, 0, window_entries, archive_dedup=lambda lines: None
         )
         assert foreign == [], "the preserved-image durable copy must fold into the window"
         assert dedup_dropped == []
@@ -2245,7 +2247,7 @@ class TestForeignFoldMidIdentity:
         slot._frozen_prefix_cache = None
         window_entries[0]["content"] = f"look ![shot]({scratch})"
         _prefix, foreign, _dropped = _frozen_prefix_and_foreign_appends(
-            slot, path, 0, window_entries
+            slot, path, 0, window_entries, archive_dedup=lambda lines: None
         )
         assert len(foreign) == 1
 
@@ -2269,7 +2271,9 @@ class TestForeignFoldMidIdentity:
             path.write_text("\n".join(lines + [json.dumps(e) for e in disk]) + "\n")
             slot._frozen_prefix_cache = None  # what a _MAX_SLOT_MESSAGES trim does
             caplog.clear()
-            _p, foreign, _d = _frozen_prefix_and_foreign_appends(slot, path, 0, [mine])
+            _p, foreign, _d = _frozen_prefix_and_foreign_appends(
+                slot, path, 0, [mine], archive_dedup=lambda lines: None
+            )
             got = [r.getMessage() for r in caplog.records]
             return foreign, [m for m in got if "another writer appended" in m]
 

@@ -132,7 +132,10 @@ class HistoryRewriteCoordinator:
         # default ensure_ascii behavior, one LF per row, and a trailing LF.
         lines = [json.dumps(metadata) + "\n"]
         lines.extend(json.dumps(message) + "\n" for message in messages)
-        atomic_write(path, "".join(lines))
+        # Synced before the rename: the dropped rows are only in the archive now,
+        # and an unsynced replacement can come back empty after a power loss,
+        # taking the kept rows with it.
+        atomic_write(path, "".join(lines), fsync=True)
         _history_facade()._restore_mtime(path, prev_mtime)
         self._log._invalidate_cache(key)
 
@@ -218,7 +221,9 @@ class HistoryRewriteCoordinator:
             except json.JSONDecodeError:
                 pass
 
-        atomic_write(path, metadata_line + "".join(kept))
+        # Synced before the rename, as compaction is: an unsynced replacement can
+        # come back empty after a power loss, and the kept rows are in no archive.
+        atomic_write(path, metadata_line + "".join(kept), fsync=True)
         _history_facade()._restore_mtime(path, prev_mtime)
         self._log._invalidate_cache(key)
         _HISTORY_LOGGER.info(

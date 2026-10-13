@@ -9,6 +9,7 @@ drops rows keeps them (or writes nothing) when the archive raises.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -17,6 +18,8 @@ import pytest
 from test_transcript_file_change_bound import _loaded_slot, _plain
 
 from kiro_crew import history as history_module
+from kiro_crew import history_rewrite
+from kiro_crew.dashboard import chat_persistence
 from kiro_crew.dashboard.chat_persistence import _save_slot_to_history
 from kiro_crew.dashboard.slot_persistence import transcript_merge
 from kiro_crew.dashboard.slot_persistence.transcript_merge import (
@@ -75,6 +78,167 @@ class TestTheArchiveSyncsItsParentOnEveryCall:
 
         history_module._archive_lines("k", ["a\n"], reason="compact", base=tmp_path)
         assert synced == [ARCHIVE_DIR_NAME, tmp_path.name]
+
+    def test_neither_directory_sync_is_best_effort(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A best-effort sync logs an EIO and returns, which would report a lost archive as durable."""
+        calls: list[dict[str, Any]] = []
+        real_fsync_dir = history_module.fsync_dir
+
+        def recording_fsync_dir(directory: Any, **kwargs: Any) -> None:
+            calls.append(kwargs)
+            real_fsync_dir(directory, **kwargs)
+
+        monkeypatch.setattr(history_module, "fsync_dir", recording_fsync_dir)
+
+        history_module._archive_lines("k", ["a\n"], reason="compact", base=tmp_path)
+
+        assert calls == [{}, {}]
+
+
+class TestTheArchiveFileIsFlushedBeforeItsSync:
+    """An fsync of a descriptor whose buffered text was never written syncs an empty file."""
+
+    def test_the_file_fsync_sees_every_byte_of_the_archive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sizes: list[int] = []
+
+        class _RecordingOs:
+            """``history``'s ``os``, recording the file size each fsync is asked to sync."""
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(os, name)
+
+            @staticmethod
+            def fsync(fd: int) -> None:
+                sizes.append(os.fstat(fd).st_size)
+                os.fsync(fd)
+
+        monkeypatch.setattr(history_module, "os", _RecordingOs())
+
+        archive = history_module._archive_lines(
+            "k", ["a" * 64 + "\n"], reason="compact", base=tmp_path
+        )
+
+        assert archive is not None
+        assert sizes == [archive.stat().st_size]
+
+
+class TestAFailedArchiveLeavesNoFile:
+    """The caller keeps the rows and retries, so the failed file is not their only copy."""
+
+    @pytest.mark.parametrize("fails", ["file", "archive-dir", "parent-dir"])
+    def test_every_retry_under_a_lasting_fault_leaves_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fails: str
+    ) -> None:
+        archive_dir = tmp_path / ARCHIVE_DIR_NAME
+        real_fsync_dir = history_module.fsync_dir
+
+        class _FailingOs:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(os, name)
+
+            @staticmethod
+            def fsync(fd: int) -> None:
+                if fails == "file":
+                    raise OSError(5, "device did not take the write")
+                os.fsync(fd)
+
+        def failing_fsync_dir(directory: Any, **kwargs: Any) -> None:
+            name = Path(directory).name
+            if (fails, name) in {("archive-dir", ARCHIVE_DIR_NAME), ("parent-dir", tmp_path.name)}:
+                raise OSError(5, "device did not take the write")
+            real_fsync_dir(directory, **kwargs)
+
+        monkeypatch.setattr(history_module, "os", _FailingOs())
+        monkeypatch.setattr(history_module, "fsync_dir", failing_fsync_dir)
+
+        for _ in range(3):
+            with pytest.raises(OSError):
+                history_module._archive_lines("k", ["a\n"], reason="compact", base=tmp_path)
+
+        assert list(archive_dir.iterdir()) == []
+
+    def test_a_removal_that_fails_still_raises_the_sync_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        def refuse_sync(*_a: Any, **_k: Any) -> None:
+            raise OSError(5, "device did not take the write")
+
+        class _NoUnlinkOs:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(os, name)
+
+            @staticmethod
+            def unlink(_path: Any) -> None:
+                raise PermissionError(13, "unlink refused")
+
+        monkeypatch.setattr(history_module, "fsync_dir", refuse_sync)
+        monkeypatch.setattr(history_module, "os", _NoUnlinkOs())
+
+        with pytest.raises(OSError) as raised:
+            history_module._archive_lines("k", ["a\n"], reason="compact", base=tmp_path)
+
+        assert raised.value.errno == 5
+        assert "Could not remove the unsynced archive" in caplog.text
+
+
+class TestTheTranscriptReplaceIsSynced:
+    """Every rewrite that drops archived rows writes its replacement with ``fsync=True``.
+
+    The archive holds the dropped rows; the kept rows live only in the replacement,
+    so an unsynced rename that comes back empty after a power loss would lose them.
+    """
+
+    @staticmethod
+    def _record(monkeypatch: pytest.MonkeyPatch, module: Any) -> list[dict[str, Any]]:
+        calls: list[dict[str, Any]] = []
+        real = module.atomic_write
+
+        def recording_atomic_write(*args: Any, **kwargs: Any) -> Any:
+            calls.append(kwargs)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(module, "atomic_write", recording_atomic_write)
+        return calls
+
+    def test_compaction(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("k", "user", "a")
+        log.append("k", "user", "b")
+        calls = self._record(monkeypatch, history_rewrite)
+
+        log.rewrite_session("k", log._read_messages("k")[:1])
+
+        assert [c.get("fsync") for c in calls] == [True]
+
+    def test_rotation(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(history_module, "_SESSION_MAX_BYTES", 400)
+        monkeypatch.setattr(history_module, "_SESSION_KEEP_LINES", 3)
+        calls = self._record(monkeypatch, history_rewrite)
+        log = ConversationLog(base_dir=tmp_path)
+
+        for i in range(12):
+            log.append("k", "user", f"message number {i:02d} with enough text to rotate")
+
+        assert list((tmp_path / ARCHIVE_DIR_NAME).glob("*.jsonl"))
+        assert calls
+        assert all(c.get("fsync") is True for c in calls)
+
+    def test_the_dashboard_save(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The one write the dashboard rewrite, file-change bound and foreign-dedup all reach."""
+        rows = [_plain(i) for i in range(4)]
+        state, slot, _path = _loaded_slot(tmp_path, monkeypatch, rows, window=4)
+        del slot.messages[2:]
+        slot._pending_rewrite = True
+        calls = self._record(monkeypatch, chat_persistence)
+
+        assert _save_slot_to_history(state, slot, rewrite=True) is True
+
+        assert list((tmp_path / ARCHIVE_DIR_NAME).glob("*.jsonl"))
+        assert [c.get("fsync") for c in calls] == [True]
 
 
 class TestCompactionFailsClosed:

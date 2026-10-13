@@ -1529,7 +1529,13 @@ archived instead of being permanently deleted:
   The parent is synced even when the directory already exists, because an
   earlier call may have created it and failed that sync. Every trigger archives
   lines its transcript rewrite is about to remove, so the archive must reach
-  disk first.
+  disk first. A failed write or sync removes the file that call created before
+  raising, so a lasting fault leaves no archive copy per retry.
+- **Durable replace**: every trigger then rewrites the transcript with
+  `atomic_write(..., fsync=True)` (rotation and compaction in
+  `history_rewrite.py`, the dashboard save in `chat_persistence.py`), so the
+  replacement's data is on disk before the rename: an unsynced replacement can
+  come back empty after a power loss, and the kept rows are in no archive.
 - **Fail closed**: an archive failure never lets the rewrite drop the rows.
   Rotation declines to rotate, compaction (`rewrite_session`) raises with the
   transcript untouched, the dashboard rewrite path raises so the save writes
