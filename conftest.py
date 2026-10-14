@@ -14,8 +14,18 @@ testpath, because what they protect is the developer's machine rather than the
 correctness of one suite. Everything that is
 merely suite-specific isolation stays in ``test/conftest.py``.
 
-The floor has eight parts, and each one exists because the "remember to isolate
+The floor has nine parts, and each one exists because the "remember to isolate
 this" contract failed at least once:
+
+* **Git auto maintenance.** ``GIT_CONFIG_GLOBAL`` points at a session-owned file
+  that turns ``maintenance.auto`` and ``gc.auto`` off, and the same keys are
+  appended through ``GIT_CONFIG_COUNT``. A fixture commit otherwise leaves a
+  detached ``git maintenance run --auto`` adding and removing lock files under
+  ``.git``, and a test that copied or walked that repo right after saw a file
+  vanish (issue #20310). See ``test/git_maintenance_helpers.py``. The git
+  location variables (``GIT_DIR``, ``GIT_INDEX_FILE``, ``GIT_WORK_TREE``, ...)
+  are removed as well: a suite started from a git hook inherits them, and a
+  fixture repo's ``git add`` would then stage into the operator's real index.
 
 * **Services.** ``$XDG_CONFIG_HOME`` is redirected and the stdlib spawn funnels
   refuse a ``systemctl``/``launchctl`` invocation carrying a mutating verb, so no
@@ -221,6 +231,7 @@ _FLOOR_PARTS = (
     "conftest_floor_restores",
     "conftest_floor_determinism",
     "conftest_floor_reporting",
+    "conftest_floor_git",
 )
 
 
@@ -343,6 +354,17 @@ from conftest_floor_restores import (  # noqa: E402,F401 -- bound for pytest and
     _restore_logger_levels,
     _resume_crew_log_eager_fold,
     _retire_crew_log_eager_fold,
+)
+
+# Git auto maintenance off and git's location variables removed for every test.
+from conftest_floor_git import (  # noqa: E402,F401 -- bound for pytest and for tests
+    _GIT_MAINTENANCE,
+    _git_global_config,
+    _git_location_unset,
+    _git_maintenance_off,
+    _git_maintenance_off_entries,
+    _git_vars_to_strip,
+    _load_git_maintenance_helpers,
 )
 
 # Host seams and process singletons pinned for every test.

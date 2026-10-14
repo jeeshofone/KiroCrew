@@ -28,6 +28,7 @@ from typing import Any
 import pytest
 import yarl
 from aiohttp.test_utils import TestClient, TestServer
+from git_maintenance_helpers import GIT_MAINTENANCE_OFF_CONFIG
 from md_notebook_helpers import _seed_template  # noqa: F401 - fixture
 from md_notebook_helpers import fixtures_fixture  # noqa: F401 - fixture
 from md_notebook_helpers import SECRET, _clone, _git, signed_client
@@ -37,6 +38,16 @@ from conftest import requires_symlinks
 from kiro_crew import atomic_write as atomic_write_mod
 from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.md_notebook import git_ops
+
+
+def test_the_seed_template_keeps_auto_maintenance_off(_seed_template: Path) -> None:
+    # The notebook runs git with its own env, and a push starts receive-pack in
+    # the remote without ours, so only each repo's own config reaches both.
+    for repo in ("remote.git", "seed"):
+        for key, value in GIT_MAINTENANCE_OFF_CONFIG:
+            got = _git("config", "--local", "--get", key, cwd=_seed_template / repo)
+            assert (key, got) == (key, value), repo
+
 
 # ---------------------------------------------------------------------------
 # Health and auth
