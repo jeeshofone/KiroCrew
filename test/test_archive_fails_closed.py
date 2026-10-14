@@ -8,6 +8,7 @@ drops rows keeps them (or writes nothing) when the archive raises.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ from typing import Any
 import pytest
 from test_transcript_file_change_bound import _loaded_slot, _plain
 
+from kiro_crew import channel_transcript_migration
 from kiro_crew import history as history_module
 from kiro_crew import history_rewrite
 from kiro_crew.dashboard import chat_persistence
@@ -160,6 +162,32 @@ class TestAFailedArchiveLeavesNoFile:
                 history_module._archive_lines("k", ["a\n"], reason="compact", base=tmp_path)
 
         assert list(archive_dir.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        "interruption", [KeyboardInterrupt, asyncio.CancelledError, SystemExit]
+    )
+    def test_an_interruption_inside_the_write_leaves_nothing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        interruption: type[BaseException],
+    ) -> None:
+        """Not only ``Exception``: a cancel or Ctrl-C mid-sync removes the file too."""
+
+        class _InterruptedOs:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(os, name)
+
+            @staticmethod
+            def fsync(_fd: int) -> None:
+                raise interruption()
+
+        monkeypatch.setattr(history_module, "os", _InterruptedOs())
+
+        with pytest.raises(interruption):
+            history_module._archive_lines("k", ["a\n"], reason="compact", base=tmp_path)
+
+        assert list((tmp_path / ARCHIVE_DIR_NAME).iterdir()) == []
 
     def test_a_removal_that_fails_still_raises_the_sync_error(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -394,3 +422,217 @@ class TestForeignDedupFailsClosed:
             "2099-01-01T00:00:00.000000",
             "2099-01-01T00:00:01.000000",
         ]
+
+
+def _record_transcript_writes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Path, dict[str, Any]]]:
+    """Record every write that reaches ``rewrite_transcript``'s ``atomic_write``."""
+    calls: list[tuple[Path, dict[str, Any]]] = []
+    real = history_rewrite.atomic_write
+
+    def recording_atomic_write(path: Any, *args: Any, **kwargs: Any) -> Any:
+        calls.append((Path(path), kwargs))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(history_rewrite, "atomic_write", recording_atomic_write)
+    return calls
+
+
+class TestEveryWholeTranscriptReplaceIsSynced:
+    """A metadata-only rewrite still renames the whole conversation over the old file.
+
+    Only line 0 changes, but the replacement carries every row, so an unsynced
+    file that comes back empty after a power loss loses the conversation, not
+    just the marker. Each site goes through ``rewrite_transcript``. The three hot
+    ones (``mark_consolidated``, the consolidation sub-offset and
+    ``update_metadata``) sync before taking the session lock instead; they are
+    pinned by ``test_history_locking_remediation.py::TestReducedLockHold``.
+    """
+
+    @staticmethod
+    def _log(tmp_path: Path) -> ConversationLog:
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("k", "user", "a")
+        log.append("k", "assistant", "b")
+        return log
+
+    def _assert_one_synced_write(
+        self, calls: list[tuple[Path, dict[str, Any]]], log: ConversationLog
+    ) -> None:
+        assert [(path, kwargs.get("fsync")) for path, kwargs in calls] == [(log._path("k"), True)]
+        # The rows are still there: the write replaced the file, it did not trim it.
+        assert [m["content"] for m in ConversationLog(base_dir=log._dir)._read_messages("k")] == [
+            "a",
+            "b",
+        ]
+
+    def test_clear_closed(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        log = self._log(tmp_path)
+        log.update_metadata("k", {"closed": True, "closed_at": 1.0})
+        calls = _record_transcript_writes(monkeypatch)
+
+        log.clear_closed("k")
+
+        self._assert_one_synced_write(calls, log)
+        assert "closed" not in log.get_metadata("k")
+
+    def test_the_agent_selection_rollback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew import execution_context
+        from kiro_crew.session_agent_selection import SelectionChange, restore_agent_selection
+
+        published = {"store": {"store_id": "default"}}
+        monkeypatch.setattr(execution_context, "restore_live_session_execution", lambda *_a: False)
+        monkeypatch.setattr(
+            ConversationLog, "__init__", _bound_init(ConversationLog.__init__, tmp_path)
+        )
+        log = self._log(tmp_path)
+        log.update_metadata("k", {execution_context.EXECUTION_CONTEXT_KEY: published})
+        calls = _record_transcript_writes(monkeypatch)
+
+        restore_agent_selection("k", SelectionChange(None, published, None))
+
+        self._assert_one_synced_write(calls, log)
+        assert execution_context.EXECUTION_CONTEXT_KEY not in log.get_metadata("k")
+
+    def test_the_helper_has_no_way_to_skip_the_sync(self) -> None:
+        import inspect
+
+        assert list(inspect.signature(history_rewrite.rewrite_transcript).parameters) == [
+            "path",
+            "content",
+        ]
+        # The staged half the hot metadata writes use has no switch either.
+        assert list(inspect.signature(history_rewrite.stage_replacement).parameters) == [
+            "path",
+            "content",
+        ]
+
+    @pytest.mark.parametrize(
+        "module",
+        [
+            "history.py",
+            "history_projection.py",
+            "history_rewrite.py",
+            "session_agent_selection.py",
+            "channel_transcript_migration.py",
+        ],
+    )
+    def test_no_transcript_module_opts_out_of_the_sync(self, module: str) -> None:
+        source = (Path(history_module.__file__).parent / module).read_text(encoding="utf-8")
+        assert "fsync=False" not in source
+
+
+def _bound_init(real_init: Any, base_dir: Path) -> Any:
+    """``ConversationLog()`` with no arguments opens *base_dir*, as the rollback does."""
+
+    def init(self: Any, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("base_dir", base_dir)
+        real_init(self, *args, **kwargs)
+
+    return init
+
+
+class TestTheChannelMigrationSyncsBeforeItDeletesTheOrphan:
+    """The orphan is the only other copy of its rows, and ``delete_session`` is permanent."""
+
+    @staticmethod
+    def _two_files(tmp_path: Path) -> tuple[ConversationLog, Path, Path]:
+        channel_stem = "slack_1785370133.085469"
+        log = ConversationLog(base_dir=tmp_path)
+        channel = tmp_path / f"{channel_stem}.jsonl"
+        orphan = tmp_path / f"dashboard_{channel_stem}.jsonl"
+        for path, content, ts in (
+            (channel, "channel", "2026-08-01T10:00:00"),
+            (orphan, "tab", "2026-08-01T11:00:00"),
+        ):
+            path.write_text(
+                json.dumps({"_type": "metadata"})
+                + "\n"
+                + json.dumps({"role": "user", "content": content, "ts": ts})
+                + "\n",
+                encoding="utf-8",
+            )
+        return log, channel, orphan
+
+    def test_the_merged_file_and_its_directory_are_synced_before_the_delete(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        log, channel, orphan = self._two_files(tmp_path)
+        order: list[str] = []
+        real_write = history_rewrite.atomic_write
+        real_fsync_dir = channel_transcript_migration.fsync_dir
+        real_delete = ConversationLog.delete_session
+
+        def recording_write(path: Any, *args: Any, **kwargs: Any) -> Any:
+            order.append(f"write:{Path(path).name}:fsync={kwargs.get('fsync')}")
+            return real_write(path, *args, **kwargs)
+
+        def recording_fsync_dir(directory: Any, **kwargs: Any) -> None:
+            order.append(f"fsync_dir:{Path(directory).name}:{kwargs}")
+            real_fsync_dir(directory, **kwargs)
+
+        def recording_delete(self: Any, key: str) -> bool:
+            order.append(f"delete:{key}")
+            return real_delete(self, key)
+
+        monkeypatch.setattr(history_rewrite, "atomic_write", recording_write)
+        monkeypatch.setattr(channel_transcript_migration, "fsync_dir", recording_fsync_dir)
+        monkeypatch.setattr(ConversationLog, "delete_session", recording_delete)
+
+        assert channel_transcript_migration.migrate_channel_transcripts(log) == 1
+
+        assert order == [
+            f"write:{channel.name}:fsync=True",
+            f"fsync_dir:{tmp_path.name}:{{}}",
+            f"delete:{orphan.stem}",
+        ]
+        assert not orphan.exists()
+
+    def test_a_failed_directory_sync_keeps_the_orphan(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        log, _channel, orphan = self._two_files(tmp_path)
+        orphan_before = orphan.read_bytes()
+        monkeypatch.setattr(channel_transcript_migration, "fsync_dir", _refuse)
+
+        assert channel_transcript_migration.migrate_channel_transcripts(log) == 0
+
+        assert orphan.read_bytes() == orphan_before
+
+    def test_an_unchanged_retry_after_a_failed_directory_sync_keeps_the_orphan(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The retry's merge is byte-identical, so it skips the write, but still syncs.
+
+        The first pass renamed the merge into place and its directory sync failed.
+        A same-boot removing pass then finds nothing to write; deleting the orphan
+        there without the sync would leave a power loss free to bring back the old
+        channel transcript with the orphan gone.
+        """
+        log, channel, orphan = self._two_files(tmp_path)
+        orphan_before = orphan.read_bytes()
+        real_fsync_dir = channel_transcript_migration.fsync_dir
+        writes: list[str] = []
+        real_write = history_rewrite.atomic_write
+
+        def recording_write(path: Any, *args: Any, **kwargs: Any) -> Any:
+            writes.append(Path(path).name)
+            return real_write(path, *args, **kwargs)
+
+        monkeypatch.setattr(history_rewrite, "atomic_write", recording_write)
+        monkeypatch.setattr(channel_transcript_migration, "fsync_dir", _refuse)
+
+        assert channel_transcript_migration.migrate_channel_transcripts(log) == 0
+        assert writes == [channel.name], "the first pass should have written the merge"
+        merged = channel.read_bytes()
+
+        assert channel_transcript_migration.migrate_channel_transcripts(log) == 0
+
+        assert writes == [channel.name], "the retry's merge should have been unchanged"
+        assert channel.read_bytes() == merged
+        assert orphan.read_bytes() == orphan_before
+
+        monkeypatch.setattr(channel_transcript_migration, "fsync_dir", real_fsync_dir)
+        assert channel_transcript_migration.migrate_channel_transcripts(log) == 1
+        assert not orphan.exists()
