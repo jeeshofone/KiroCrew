@@ -39,19 +39,24 @@ vi.mock('../hooks/useSandboxDoc', () => ({
  *  `startTransition`, so the tab's own note (an ordinary update) can be on screen
  *  while the URL still asks for the preview. `hold` keeps that navigation pending,
  *  which is what a loaded runner does to it, until the test releases it. */
-const nav = vi.hoisted(() => ({ hold: null as null | { promise: Promise<void>; release: () => void } }))
+const nav = vi.hoisted(() => ({ hold: null as null | { promise: Promise<void>; release: () => void }, suspended: 0 }))
 
 function holdNavigation() {
   let release = () => {}
+  nav.suspended = 0
   const promise = new Promise<void>((resolve) => { release = () => { nav.hold = null; resolve() } })
   nav.hold = { promise, release }
   return () => release()
 }
 
-/** Suspends the render that leaves the preview while the navigation is held. */
+/** Suspends the render that leaves the preview while the navigation is held,
+ *  and counts each suspension so a test can prove the hold engaged. */
 function NavigationGate() {
   const { search } = useLocation()
-  if (nav.hold && !search.includes('dashboard=preview')) throw nav.hold.promise
+  if (nav.hold && !search.includes('dashboard=preview')) {
+    nav.suspended += 1
+    throw nav.hold.promise
+  }
   return null
 }
 
@@ -324,7 +329,7 @@ describe('CrewDashboardTab on a preview link', () => {
       }
       return body('kept')
     })
-    vi.spyOn(api, 'memberDashboardPreviewDiscard').mockImplementation(async () => {
+    const discard = vi.spyOn(api, 'memberDashboardPreviewDiscard').mockImplementation(async () => {
       dropped = true
       return { ok: true }
     })
@@ -333,10 +338,16 @@ describe('CrewDashboardTab on a preview link', () => {
     await waitFor(async () => { await drawFrame(); expect(discardButton).not.toBeDisabled() }, LAZY)
     const release = holdNavigation()
     fireEvent.click(discardButton)
+    await waitFor(() => expect(discard).toHaveBeenCalledWith('atlas', 'Atlas', STAGED_MS))
     // The note is an ordinary update and lands first; the URL is the router's
-    // transition and is still the preview link, so reading it now proves nothing.
+    // transition, held by NavigationGate, so the URL is still the preview link.
+    // A held transition leaves that tree on screen. A suspended render outside a
+    // transition hides it behind the Suspense fallback, so the URL is read visible.
     expect(await screen.findByTestId('dashboard-preview-outcome', undefined, LAZY)).toHaveAttribute('data-outcome', 'discarded')
-    expect(screen.getByTestId('url').textContent).toBe('?member=Atlas&dashboard=preview')
+    await waitFor(() => expect(nav.suspended).toBeGreaterThan(0))
+    const url = screen.getByTestId('url')
+    expect(url).toBeVisible()
+    expect(url.textContent).toBe('?member=Atlas&dashboard=preview')
     release()
     await waitFor(() => expect(screen.getByTestId('url').textContent).toBe('?member=Atlas'))
     expect(screen.getByTestId('dashboard-preview-outcome')).toHaveAttribute('data-outcome', 'discarded')
