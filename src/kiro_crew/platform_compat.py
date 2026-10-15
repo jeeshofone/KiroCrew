@@ -48,6 +48,7 @@ from typing import (
     NamedTuple,
     Optional,
     Sequence,
+    TypeVar,
 )
 
 # Loaded with this module, so each owner is complete before the forwarding at the end of
@@ -7687,7 +7688,10 @@ def lstat_is_name_surrogate(info: os.stat_result) -> bool:
     return bool(getattr(info, "st_reparse_tag", 0) & _IO_REPARSE_TAG_NAME_SURROGATE)
 
 
-def strip_extended_length_prefix(path: Path) -> Path:
+_StrOrPath = TypeVar("_StrOrPath", str, Path)
+
+
+def strip_extended_length_prefix(path: _StrOrPath) -> _StrOrPath:
     r"""*path* without Windows' extended-length prefix; unchanged elsewhere.
 
     ``Path.resolve()`` on a file that another thread is replacing at that exact

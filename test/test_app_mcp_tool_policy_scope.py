@@ -120,7 +120,8 @@ class _WindowsPath:
         return ntpath.normpath(ntpath.join(self.cwd, path))
 
     def realpath(self, path):
-        return ntpath.realpath(self.abspath(path))
+        # Lexical only: a native realpath would look up the UNC host on Windows.
+        return self.abspath(path)
 
     def exists_at(self, *filenames):
         self.files.update(ntpath.normcase(self.realpath(f)) for f in filenames)
@@ -156,8 +157,8 @@ class TestAnotherDriveNeedsProof:
     """Through ``serves_managed_tools`` under Windows path rules, on every OS.
 
     Another drive means "not managed" only for an existing file named by an
-    absolute path with a drive and no ``\\\\?\\`` prefix; every other case
-    keeps the policy.
+    absolute path with a drive, compared without any ``\\\\?\\`` prefix; every
+    other case keeps the policy.
     """
 
     @pytest.fixture(autouse=True)
@@ -182,20 +183,62 @@ class TestAnotherDriveNeedsProof:
         windows_path.exists_at(r"\app\mcp_server.py")
         assert mcp_shared.serves_managed_tools(_handler_at(r"\app\mcp_server.py")) is True
 
+    def test_a_drive_relative_location_on_another_drive_keeps_the_policy(self, windows_path):
+        # A drive with no root resolves against that drive's cwd at call time.
+        windows_path.exists_at(r"C:app\mcp_server.py")
+        assert mcp_shared.serves_managed_tools(_handler_at(r"C:app\mcp_server.py")) is True
+
     def test_a_relative_location_on_the_package_drive_is_not_managed(self, windows_path):
         windows_path.cwd = r"D:\a\KiroCrew\KiroCrew"
         windows_path.exists_at(r"app\mcp_server.py")
         assert mcp_shared.serves_managed_tools(_handler_at(r"app\mcp_server.py")) is False
 
-    def test_a_long_path_spelling_on_one_side_keeps_the_policy(self, windows_path):
+    def test_a_long_path_spelling_of_a_package_file_is_managed(self, windows_path):
         filename = "\\\\?\\" + _WINDOWS_PACKAGE_DIR + r"\mcp_core.py"
         windows_path.exists_at(filename)
         assert mcp_shared.serves_managed_tools(_handler_at(filename)) is True
 
-    def test_a_long_path_spelling_of_the_package_keeps_the_policy(self, windows_path):
+    def test_a_long_path_spelling_of_an_app_on_another_drive_is_not_managed(self, windows_path):
+        filename = "\\\\?\\" + _APP_ON_C
+        windows_path.exists_at(filename)
+        assert mcp_shared.serves_managed_tools(_handler_at(filename)) is False
+
+    def test_a_long_path_unc_spelling_of_an_app_is_not_managed(self, windows_path):
+        filename = r"\\?\UNC\server\share\app\mcp_server.py"
+        windows_path.exists_at(filename)
+        assert mcp_shared.serves_managed_tools(_handler_at(filename)) is False
+
+    @pytest.mark.parametrize(
+        "prefix",
+        [
+            pytest.param(r"\\?\UNC", id="unc-folds-to-the-share"),
+            # Windows realpath never writes this spelling. It folds to a name with
+            # no drive, which cannot be located, so the policy stays.
+            pytest.param(r"\\?\unc", id="lowercase-unc-is-not-located"),
+        ],
+    )
+    def test_a_long_path_unc_spelling_of_a_file_on_the_share_is_managed(self, windows_path, prefix):
+        mcp_shared._PACKAGE_DIR = r"\\server\share\pkg\kiro_crew"
+        filename = prefix + r"\server\share\pkg\kiro_crew\mcp_core.py"
+        windows_path.exists_at(filename)
+        assert mcp_shared.serves_managed_tools(_handler_at(filename)) is True
+
+    def test_a_package_on_a_long_path_unc_share_still_holds_its_files(self, windows_path):
+        mcp_shared._PACKAGE_DIR = r"\\?\UNC\server\share\pkg\kiro_crew"
+        filename = r"\\server\share\pkg\kiro_crew\mcp_core.py"
+        windows_path.exists_at(filename)
+        assert mcp_shared.serves_managed_tools(_handler_at(filename)) is True
+
+    def test_a_long_path_spelling_of_the_package_leaves_another_drive_unmanaged(self, windows_path):
         mcp_shared._PACKAGE_DIR = "\\\\?\\" + _WINDOWS_PACKAGE_DIR
         windows_path.exists_at(_APP_ON_C)
-        assert mcp_shared.serves_managed_tools(_handler_at(_APP_ON_C)) is True
+        assert mcp_shared.serves_managed_tools(_handler_at(_APP_ON_C)) is False
+
+    def test_a_long_path_spelling_of_the_package_still_holds_its_files(self, windows_path):
+        mcp_shared._PACKAGE_DIR = "\\\\?\\" + _WINDOWS_PACKAGE_DIR
+        filename = _WINDOWS_PACKAGE_DIR + r"\mcp_core.py"
+        windows_path.exists_at(filename)
+        assert mcp_shared.serves_managed_tools(_handler_at(filename)) is True
 
     def test_an_unresolvable_location_keeps_the_policy(self, windows_path):
         def unresolvable(path):
