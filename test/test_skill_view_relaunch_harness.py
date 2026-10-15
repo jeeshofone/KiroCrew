@@ -316,12 +316,15 @@ async def _settle_projection_ends() -> None:
     daemon thread, so a count taken right after a spawn can still see the lease
     of a projection that has already ended: on a loaded runner that thread is
     simply not scheduled yet. The census counts what each spawn leaves behind, so
-    it waits for those releases first, under the lost-run bound. A lease that is
-    never released still fails the census strictly once the threads are done.
+    it waits for those releases first, under the lost-run bound. Once they are
+    done every ended projection has released its lease, so the census expects
+    none: a single lease that is never released fails it.
     """
     await async_wait_until(
         lambda: _ends_in_flight() == 0,
-        describe=lambda: f"{_ends_in_flight()} projection end(s) still releasing a lease",
+        describe=lambda: (
+            f"{_ends_in_flight()} {_END_THREAD!r} thread(s) still releasing a projection lease"
+        ),
     )
 
 
@@ -470,7 +473,7 @@ async def test_fifty_spawns_under_a_rewriting_launcher_never_fail_and_stay_bound
         census = _census(agents)
         assert census["aliases"] == len(AGENTS), f"spawn {spawn}: {census}"
         assert census["sidecars"] == len(AGENTS), f"spawn {spawn}: {census}"
-        assert census["leases"] <= 2, f"spawn {spawn}: {census}"
+        assert census["leases"] == 0, f"spawn {spawn}: {census}"
         assert census["alias_locks"] <= len(AGENTS), f"spawn {spawn}: {census}"
         assert census["entries"] <= 2 * len(AGENTS) + 2 * len(AGENTS) + 3, census
     assert _problems(caplog) == []
@@ -503,7 +506,10 @@ async def test_the_census_waits_until_an_ended_projection_has_released_its_lease
         assert _census(agents)["leases"] == 2  # one lease: its record and its holder
         del prepared  # the finalizer runs here, on the event-loop thread
         gc.collect()
-        await async_wait_until(parked.is_set)
+        await async_wait_until(
+            parked.is_set,
+            describe=lambda: f"no projection end ran on a {_END_THREAD!r} thread",
+        )
         assert _census(agents)["leases"] == 2, "the release was expected to be pending"
         # What the settle waits on: an end that has not released its lease yet.
         assert _ends_in_flight() == 1, "the census would count before the lease is released"
