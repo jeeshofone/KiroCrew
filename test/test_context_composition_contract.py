@@ -48,6 +48,7 @@ from kiro_crew.learn import Lesson, LessonStore
 from kiro_crew.memory import MemoryStore
 from kiro_crew.skills import SkillsLoader
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
+from kiro_crew.testing.wait import default_timeout
 
 pytestmark = [
     pytest.mark.xdist_group("context_composition_contract"),
@@ -1749,7 +1750,12 @@ class TestEagerOwners:
         assert imported == OWNER_MODULES
 
     def test_every_owner_is_loaded_by_a_fresh_import_of_the_facade(self, tmp_path: Path) -> None:
+        bound = default_timeout()
+        # A hang writes nothing on its own, so the child dumps its stack shortly
+        # before the bound and the assertion below can name the import it stopped in.
+        dump_after = bound - min(5.0, bound / 4)
         probe = (
+            f"import faulthandler; faulthandler.dump_traceback_later({dump_after!r}, exit=False)\n"
             "import json, sys\n"
             "import kiro_crew.context\n"
             f"print(json.dumps(sorted(m for m in sys.modules if m.startswith({OWNER_PACKAGE + '.'!r}))))\n"
@@ -1757,15 +1763,25 @@ class TestEagerOwners:
         env = dict(os.environ)
         src = str(Path(kiro_crew.__file__).resolve().parents[1])
         env["PYTHONPATH"] = src + os.pathsep + env.get("PYTHONPATH", "")
-        out = subprocess.run(
-            [sys.executable, "-c", probe],
-            capture_output=True,
-            check=True,
-            env=env,
-            cwd=tmp_path,
-            timeout=60,
-            **UTF8_TEXT,
-        )
+        try:
+            out = subprocess.run(
+                [sys.executable, "-c", probe],
+                capture_output=True,
+                check=True,
+                env=env,
+                cwd=tmp_path,
+                timeout=bound,
+                **UTF8_TEXT,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # On POSIX the re-raised TimeoutExpired carries undecoded bytes even with text=True.
+            stderr = exc.stderr
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", "replace")
+            raise AssertionError(
+                f"a fresh import of kiro_crew.context did not finish within {exc.timeout:g} s; "
+                f"stderr so far:\n{stderr}"
+            ) from None
         loaded = json.loads(out.stdout.splitlines()[-1])
         assert loaded == sorted(f"{OWNER_PACKAGE}.{stem}" for stem in OWNER_MODULES), out.stderr
 
