@@ -1514,12 +1514,14 @@ def serves_managed_tools(call_tool_fn: Callable[..., Any]) -> bool:
         return True
     try:
         real = os.path.realpath(filename)
+        drive = os.path.splitdrive(filename)[0]
+        located = bool(drive) and os.path.isabs(filename) and os.path.isfile(real)
     except (OSError, ValueError):
         return True
-    return _path_is_under(real, _PACKAGE_DIR)
+    return _path_is_under(real, _PACKAGE_DIR, os.path, located=located)
 
 
-def _path_is_under(path: str, root: str, pathmod: Any = os.path) -> bool:
+def _path_is_under(path: str, root: str, pathmod: Any = os.path, *, located: bool = True) -> bool:
     """Whether absolute *path* is *root* or inside it; True when that cannot be told.
 
     A path on another Windows drive is never inside *root*, but ``commonpath``
@@ -1527,11 +1529,19 @@ def _path_is_under(path: str, root: str, pathmod: Any = os.path) -> bool:
     drives first, so code on ``C:`` is not mistaken for the package on ``D:``
     (a GitHub-hosted Windows runner checks out on ``D:`` and keeps its temp dir on
     ``C:``). Any other refusal keeps the fail-closed answer.
+
+    Another drive is proof only when *located* (the caller found an existing file
+    under an absolute name with a drive) and neither side is spelled with the
+    ``\\\\?\\`` long-path prefix. A relative name, or a rooted one with no
+    drive, resolves against the cwd at call time, a missing file proves nothing,
+    and a prefix on one side only is a spelling of the same drive, so those keep
+    the policy.
     """
     path_drive = pathmod.normcase(pathmod.splitdrive(path)[0])
     root_drive = pathmod.normcase(pathmod.splitdrive(root)[0])
     if path_drive != root_drive:
-        return False
+        prefixed = path.startswith("\\\\?\\") or root.startswith("\\\\?\\")
+        return prefixed or not located
     try:
         common = pathmod.commonpath([path, root])
     except ValueError:
