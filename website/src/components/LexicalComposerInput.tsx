@@ -353,7 +353,10 @@ function ControlledValuePlugin({
 }) {
   const [editor] = useLexicalComposerContext()
 
-  useEffect(() => {
+  // Layout effect: a parent-pushed value reaches the editor in the commit
+  // that renders it, before the host's undo recorder (a layout effect of an
+  // ancestor, so it runs after this one) reads the caret for that value.
+  useLayoutEffect(() => {
     const emitted = lastEmittedRef.current
     if (emitted.value === value && sameBlocks(emitted.blocks, blocks)) return
     let current = { value: '', blocks: [] as PasteBlock[] }

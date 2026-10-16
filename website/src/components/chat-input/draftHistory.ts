@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef } from 'react'
+import { useCallback, useLayoutEffect, useMemo, useRef } from 'react'
 import type { useImeGuard } from '../../hooks/useImeGuard'
 import type { PasteBlock } from '../../utils/pasteTokens'
 import type { ComposerControl } from '../composerControl'
@@ -129,8 +129,11 @@ export function useUndoHistory({ value, pasteBlocks, autoFocusKey, composerContr
   const prevUndoAfkRef = useRef(autoFocusKey)
   const slotSettlingRef = useRef(false)
 
-  // Record undo snapshots as the controlled value changes.
-  useEffect(() => {
+  // Record undo snapshots as the controlled value changes. A layout effect
+  // records in the same commit that puts the value on screen: a passive
+  // effect can run a scheduler task later, and a Ctrl/Cmd+Z pressed in that
+  // gap would find no entry for the text the user can already see.
+  useLayoutEffect(() => {
     const selection = composerControl()?.getSelection()
     // Consume the "this change came from a DOM edit" flag exactly once per run.
     const fromUser = valueFromUserRef.current
