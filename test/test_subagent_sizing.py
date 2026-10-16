@@ -16,6 +16,7 @@ from io import StringIO
 from typing import Any
 
 import pytest
+from _clock_isolation import assert_clock_is_private
 from overload_fakes import settle_depth_emits
 
 import kiro_crew.subagent as subagent
@@ -26,6 +27,7 @@ from kiro_crew.subagent import (
     compute_memory_sized_parallel_cap,
     resolve_max_subagents,
 )
+from kiro_crew.testing.clock import ManualClock
 
 # ``SubagentManager.spawn`` refuses -- registering no task -- while the host
 # looks short of memory, which is the runner's state, not this test's input.
@@ -866,6 +868,12 @@ class TestSubtreeCpuJiffies:
         assert sub._subtree_cpu_jiffies(1) == 185
 
 
+def test_another_thread_keeps_the_real_sleep_and_clock(monkeypatch) -> None:
+    clock = ManualClock()
+    clock.install(monkeypatch, subagent)
+    assert_clock_is_private(clock, subagent)
+
+
 class TestSampleLiveCosts:
     """_sample_live_costs: high-water RSS/CPU tracking across polls."""
 
@@ -906,13 +914,12 @@ class TestSampleLiveCosts:
         m._agents = {"a1": info}
         monkeypatch.setattr(sub, "_CLK_TCK", 100)
 
-        # Control wall-clock: poll1 t=10, poll2 t=11 (dt=1s).
-        times = iter([10.0, 11.0])
-        # ``sub.time`` is the process-wide stdlib module, so asyncio and pytest
-        # also observe this patch during teardown. Keep returning the final
-        # timestamp after the two production calls instead of leaking a
-        # StopIteration into unrelated event-loop cleanup.
-        monkeypatch.setattr(sub.time, "monotonic", lambda: next(times, 11.0))
+        # Control the sampling clock: poll1 t=10, poll2 t=11 (dt=1s). On the
+        # subagent module's own ``time`` binding, which the sampler reads; that
+        # binding IS the stdlib module, so a stub on ``sub.time.monotonic`` was
+        # read by every other thread, asyncio and pytest included.
+        clock = ManualClock(monotonic_start=10.0)
+        clock.install(monkeypatch, sub)
         # jiffies: 1000 then 1100 → 100 jiffies / (100 tck * 1s) = 1.0 core.
         # RSS stays -1 so only the CPU half of the sample is under test.
         jiff = iter([1000, 1100])
@@ -922,6 +929,7 @@ class TestSampleLiveCosts:
 
         m._sample_live_costs()  # seeds baseline, no delta
         assert info.peak_cpu_cores == 0.0
+        clock.advance(1.0)
         m._sample_live_costs()  # delta → 1.0 core
         assert info.peak_cpu_cores == pytest.approx(1.0, abs=0.01)
 

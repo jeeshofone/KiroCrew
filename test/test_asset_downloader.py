@@ -23,8 +23,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from _clock_isolation import assert_clock_is_private
 
 from kiro_crew import asset_downloader as dl
+from kiro_crew.testing.clock import ManualClock
 
 #: The real ``build_opener``, captured before the autouse no-network fixture
 #: replaces it -- the handler-wiring test is about the real one.
@@ -313,14 +315,29 @@ class TestResume:
         assert state.ranges == [None]
 
 
+def _pin_clock(monkeypatch: pytest.MonkeyPatch) -> ManualClock:
+    """A clock only the downloader reads, recording its pacing sleeps.
+
+    Installed on the downloader's own ``time`` binding. That binding IS the stdlib
+    module, so patching ``dl.time.sleep`` would also record every other thread's
+    sleep in the worker.
+    """
+    clock = ManualClock(monotonic_start=0.0)
+    clock.install(monkeypatch, dl)
+    return clock
+
+
+def test_another_thread_keeps_the_real_sleep_and_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert_clock_is_private(_pin_clock(monkeypatch), dl)
+
+
 class TestRateLimit:
     def test_pacing_sleeps_and_the_payload_is_unaffected(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         open_fn, _state = _fake_urlopen()
         monkeypatch.setattr("kiro_crew.asset_downloader.build_opener", lambda *a, **k: open_fn)
-        slept: list[float] = []
-        monkeypatch.setattr(dl.time, "sleep", lambda s: slept.append(s))
+        clock = _pin_clock(monkeypatch)
         target = tmp_path / "clip.mp4"
         # 1 KiB/s over 4 KiB of payload: every chunk owes time it has not spent.
         ok, _err = dl.download_to(
@@ -328,17 +345,16 @@ class TestRateLimit:
         )
         assert ok is True
         assert target.read_bytes() == _PAYLOAD
-        assert slept and sum(slept) > 0
+        assert clock.sleeps and sum(clock.sleeps) > 0
 
     def test_no_limit_means_no_sleeping(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         open_fn, _state = _fake_urlopen()
         monkeypatch.setattr("kiro_crew.asset_downloader.build_opener", lambda *a, **k: open_fn)
-        slept: list[float] = []
-        monkeypatch.setattr(dl.time, "sleep", lambda s: slept.append(s))
+        clock = _pin_clock(monkeypatch)
         assert dl.download_to(tmp_path / "clip.mp4", _URL, sha256=_SHA, chunk_bytes=512)[0] is True
-        assert slept == []
+        assert clock.sleeps == ()
 
 
 class TestRedaction:
