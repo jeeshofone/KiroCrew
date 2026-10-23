@@ -112,6 +112,11 @@ const markAck = (state: NotificationsState, ts: string) => {
   ;(state.ackSeqByTs ??= {})[ts] = state.ackSeq
 }
 
+/** Whether the row at *ts* is a settled approval: retired, or decided with a
+ *  failed DELETE. Such a row's read state is this tab's own. */
+const isSettledApprovalRow = (state: NotificationsState, ts: string): boolean =>
+  Object.hasOwn(state.retiredApprovals ?? {}, ts) || state.dismissFailed?.[ts] === 'decided'
+
 /** Drop stamps for items `items` no longer holds. The one chokepoint for it,
  *  called from every path that shrinks the list — delete, WS remove, clear, a
  *  ring-cap eviction, and the fetch merge — because a stamp outliving its item
@@ -408,15 +413,18 @@ const notificationsSlice = createSlice({
       if (outcome === 'refused') {
         ;(state.retiredApprovals ??= {})[ts] = true
         row.acked = true
+        markAck(state, ts)
       } else if (outcome === 'dismiss_failed') {
         // The decision landed; only the clean-up failed. The row is settled
         // like a retired one, so it leaves the unread count (a local ack).
         ;(state.dismissFailed ??= {})[ts] = 'decided'
         row.acked = true
+        markAck(state, ts)
       } else if (d?.ended && !Object.hasOwn(map, ts)
         && !Object.hasOwn(state.retiredApprovals ?? {}, ts) && !Object.hasOwn(state.dismissFailed ?? {}, ts)) {
         ;(state.retiredApprovals ??= {})[ts] = { failed: action.payload.reason ?? '' }
         row.acked = true
+        markAck(state, ts)
       }
       const claimed = Object.hasOwn(state.retiredApprovals ?? {}, ts) || Object.hasOwn(state.dismissFailed ?? {}, ts)
       if (d?.ended && !Object.hasOwn(map, ts) && !claimed) removeRow(state, ts)
@@ -447,8 +455,12 @@ const notificationsSlice = createSlice({
         const stamps = state.ackSeqByTs ?? {}
         replaceRows(state, action.payload.items.map(item => {
           const stamped = stamps[item.ts]
-          if (stamped === undefined || stamped <= requestAckSeq) return item
+          // A settled approval row (retired, or decided with a failed DELETE)
+          // was marked read in this tab only (`approvalDecisionSettled`); the
+          // server still holds it unread, so its copy must not relight the badge.
           const local = state.items.find(n => n.ts === item.ts)
+          if (local && isSettledApprovalRow(state, item.ts)) return { ...item, acked: local.acked }
+          if (stamped === undefined || stamped <= requestAckSeq) return item
           return local ? { ...item, acked: local.acked } : item
         }), { endDeciding: false })
       })
