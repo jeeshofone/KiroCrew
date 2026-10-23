@@ -27,6 +27,10 @@ from typing import IO, TYPE_CHECKING, AbstractSet, Any, Literal, overload
 
 import kiro_crew._facade_mirror as _facade_mirror
 from kiro_crew import platform_compat
+from kiro_crew.atomic_write import (  # noqa: F401 - facade re-exports
+    atomic_write,
+    replace_with_retry,
+)
 from kiro_crew.chat_attachments import (
     purge_staged_attachments,
     restore_staged_attachments,

@@ -166,6 +166,45 @@ class TestReducedLockHold:
             assert meta["agent"] == "other"
 
     @pytest.mark.parametrize(("write", "applied"), _HOT_METADATA_WRITES)
+    def test_the_fallback_frees_the_stale_staged_copy_before_writing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, write, applied
+    ) -> None:
+        """The locked rebuild never needs room for two whole-transcript copies.
+
+        When an append lands after staging, the stale staged file is removed
+        before the locked rewrite writes its own copy, so a disk with room for
+        one replacement still takes the edit.
+        """
+        from kiro_crew import history_rewrite
+
+        log = _two_rows(tmp_path)
+        real_stage = history_rewrite.stage_replacement
+        real_rewrite = history_rewrite.rewrite_transcript
+        staged_names: list[str] = []
+        stale_present_at_rewrite: list[bool] = []
+
+        def stage_then_append(path, content):
+            staged = real_stage(path, content)
+            if not staged_names:
+                staged_names.append(staged)
+                log.append("k", "user", "late")
+            return staged
+
+        def recording_rewrite(path, content):
+            stale_present_at_rewrite.append(Path(staged_names[0]).exists())
+            real_rewrite(path, content)
+
+        monkeypatch.setattr(history_rewrite, "stage_replacement", stage_then_append)
+        monkeypatch.setattr(history_rewrite, "rewrite_transcript", recording_rewrite)
+
+        write(log)
+
+        assert stale_present_at_rewrite == [False], "the stale staged copy was still on disk"
+        fresh = ConversationLog(base_dir=tmp_path)
+        assert applied(fresh.get_metadata("k"))
+        assert [m["content"] for m in fresh._read_messages("k")] == ["a", "b", "late"]
+
+    @pytest.mark.parametrize(("write", "applied"), _HOT_METADATA_WRITES)
     def test_a_same_length_edit_that_restores_the_mtime_is_kept(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, write, applied
     ) -> None:

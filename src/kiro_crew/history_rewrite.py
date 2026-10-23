@@ -108,6 +108,11 @@ def rewrite_metadata_line(log: ConversationLog, key: str, build: MetadataLineBui
                 published = True  # publish_replacement owns the file from here
                 publish_replacement(staged, path)
             else:
+                # Free the stale staged copy before writing a new one, so the
+                # fallback never needs room for two whole-transcript copies.
+                if staged is not None:
+                    discard_replacement(staged)
+                    staged = None
                 path = current_path
                 content = build(path, _as_text(current))
                 if content is None:
