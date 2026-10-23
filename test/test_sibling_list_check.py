@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from git_maintenance_helpers import git_maintenance_off_entries
 from skill_script_helpers import load_skill_script
 
 from kiro_crew.platform.update_governance import _GIT_LOCATION_VARS
@@ -198,6 +199,9 @@ def _git_env() -> dict[str, str]:
             "GIT_CONFIG_SYSTEM": os.devnull,
         }
     )
+    # Pointing GIT_CONFIG_GLOBAL away drops the suite's global file, so the
+    # maintenance entries go on the env this helper built.
+    env.update(git_maintenance_off_entries(env))
     return env
 
 
@@ -291,13 +295,16 @@ def test_end_to_end_missing_git_inputs_is_an_environment_error(repo) -> None:
     assert "MERGE_BASE and HEAD_SHA are required" in out
 
 
-def test_enforce_mode_turns_a_finding_into_exit_one(repo, monkeypatch, capsys) -> None:
+def test_enforce_mode_turns_a_finding_into_exit_one(
+    repo, monkeypatch, capsys, _git_global_config
+) -> None:
     path, base, head = repo
     # main() runs git in this process: a hook's exported location must not retarget it.
-    # Only the location variables go; conftest's identity and config pins stay.
+    # Only the location variables go; conftest's identity and config pins stay. The
+    # global config is the floor's hermetic file, which holds only the maintenance keys.
     for key in [k for k in os.environ if k in _GIT_LOCATION_VARS or k == "GIT_PREFIX"]:
         monkeypatch.delenv(key)
-    assert os.environ["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert os.environ["GIT_CONFIG_GLOBAL"] == str(_git_global_config)
     monkeypatch.chdir(path)
     monkeypatch.setattr(mod, "ENFORCE_FROM", "2026-01-01")
     for key, value in {

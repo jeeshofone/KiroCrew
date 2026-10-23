@@ -11,10 +11,10 @@ here imports ``conftest``: the name is ambiguous, and an in-package app suite ru
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import pathlib
 import sys
+from importlib.util import module_from_spec, spec_from_file_location
 
 import pytest
 
@@ -30,9 +30,9 @@ def _load_git_maintenance_helpers():
     if name in sys.modules:
         return sys.modules[name]
     path = pathlib.Path(__file__).resolve().parent / f"{name}.py"
-    spec = importlib.util.spec_from_file_location(name, path)
+    spec = spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None, path
-    module = importlib.util.module_from_spec(spec)
+    module = module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module

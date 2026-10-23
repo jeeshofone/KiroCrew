@@ -296,6 +296,17 @@ from conftest_floor_determinism import (  # noqa: E402,F401 -- bound for pytest 
     seeded_rng,
 )
 
+# Git auto maintenance off and git's location variables removed for every test.
+from conftest_floor_git import (  # noqa: E402,F401 -- bound for pytest and for tests
+    _GIT_MAINTENANCE,
+    _git_global_config,
+    _git_location_unset,
+    _git_maintenance_off,
+    _git_maintenance_off_entries,
+    _git_vars_to_strip,
+    _load_git_maintenance_helpers,
+)
+
 # Data home: the import-time floor and the per-test home, SEL and ~/.kiro pins.
 from conftest_floor_home import (  # noqa: E402,F401 -- bound for pytest and for tests
     _AGENT_SPEC_HOOKS,
@@ -354,17 +365,6 @@ from conftest_floor_restores import (  # noqa: E402,F401 -- bound for pytest and
     _restore_logger_levels,
     _resume_crew_log_eager_fold,
     _retire_crew_log_eager_fold,
-)
-
-# Git auto maintenance off and git's location variables removed for every test.
-from conftest_floor_git import (  # noqa: E402,F401 -- bound for pytest and for tests
-    _GIT_MAINTENANCE,
-    _git_global_config,
-    _git_location_unset,
-    _git_maintenance_off,
-    _git_maintenance_off_entries,
-    _git_vars_to_strip,
-    _load_git_maintenance_helpers,
 )
 
 # Host seams and process singletons pinned for every test.

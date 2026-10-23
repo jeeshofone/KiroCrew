@@ -50,6 +50,9 @@ _NOT_A_GIT_ENV = {
     "test/test_apps_registry_coverage_characterization.py": (
         "builds the input mapping for registry._git_transport_env and runs no git"
     ),
+    "test/test_dev_fleet_app_trusted_helpers.py": (
+        "builds the trusted-helper mapping _build_env layers in and runs no git"
+    ),
 }
 
 

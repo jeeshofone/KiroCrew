@@ -1692,11 +1692,11 @@ class TestGitAutoMaintenanceIsOff:
         ("module_name", "helper_name", "takes_repo"),
         [
             ("test_governance_updates", "_fixture_git_env", True),
-            ("test_pipeline_conductor_claim_preflight", "_fixture_git_env", False),
+            ("test_pipeline_conductor_claim_preflight_end_to_end", "_fixture_git_env", False),
             ("test_preflight_write_permission", "_fixture_git_env", False),
             ("test_prepare_pr_diff_signals", "_git_env", False),
             ("test_prepare_pr_local_review", "_fixture_git_env", False),
-            ("test_push_guard", "_fixture_git_env", False),
+            ("push_guard_helpers", "_fixture_git_env", False),
             ("test_ratchet_scope", "_fixture_git_env", False),
         ],
     )
@@ -1779,7 +1779,7 @@ class TestGitAutoMaintenanceIsOff:
         return run
 
     def _drive_apps_registry_init(self, repo, tmp_path):
-        module = importlib.import_module("test_apps_registry")
+        module = importlib.import_module("test_apps_registry_git_transport")
         run = self._run_git(repo, module._registry_fixture_env(tmp_path))
         module._init_registry_fixture_repo(run)
         return run

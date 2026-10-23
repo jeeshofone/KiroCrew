@@ -40,7 +40,9 @@ from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.md_notebook import git_ops
 
 
-def test_the_seed_template_keeps_auto_maintenance_off(_seed_template: Path) -> None:
+def test_the_seed_template_keeps_auto_maintenance_off(
+    _seed_template: Path,  # noqa: F811 - the fixture imported above
+) -> None:
     # The notebook runs git with its own env, and a push starts receive-pack in
     # the remote without ours, so only each repo's own config reaches both.
     for repo in ("remote.git", "seed"):
