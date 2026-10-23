@@ -76,6 +76,8 @@ Object.defineProperty(window, 'matchMedia', {
 import ChatSidebar from '../pages/ChatSidebar'
 import { interruptedIdleSlots, resumeAllResultText } from '../pages/chat-sidebar/resumeAll'
 import { RESUME_ALL_DONE_EVENT } from '../hooks/useWebSocket'
+import { isChatPageSurface } from '../utils/channelOrigin'
+import countFixture from '../../../test/fixtures/resume_all_candidates.json'
 import type { Slot } from '../pages/chat-sidebar/types'
 import type { RootState } from '../store'
 import type { ChatSlot } from '../types'
@@ -117,6 +119,15 @@ function renderSidebar(slots: ChatSlot[], connected = true) {
 beforeEach(() => { localStorage.clear(); resumeAll.mockReset() })
 afterEach(() => vi.clearAllMocks())
 
+// Drains pending promise callbacks and the React updates they schedule (the
+// theme provider's boot among them), with no wall-clock wait. A test that
+// asserts on the first render calls this first, so no update lands after it.
+async function settle(): Promise<void> {
+  await act(async () => {
+    for (let i = 0; i < 10; i += 1) await Promise.resolve()
+  })
+}
+
 describe('interruptedIdleSlots', () => {
   it('counts idle interrupted local sessions and nothing else', () => {
     const rows: Slot[] = [
@@ -142,18 +153,20 @@ describe('resumeAllResultText', () => {
 })
 
 describe('chat sidebar — Resume all interrupted sessions', () => {
-  it('draws no row when nothing is interrupted', () => {
+  it('draws no row when nothing is interrupted', async () => {
     const { queryByTestId } = renderSidebar([slot('a'), slot('b', { running: true })])
+    await settle()
     expect(queryByTestId('resume-all-row')).toBeNull()
   })
 
-  it('shows the count and the action while sessions are interrupted', () => {
+  it('shows the count and the action while sessions are interrupted', async () => {
     const { getByTestId } = renderSidebar([
       slot('a', { interrupted: true }),
       slot('b', { interrupted: true }),
       slot('c', { interrupted: true, running: true }),
       slot('d'),
     ])
+    await settle()
     expect(getByTestId('resume-all-row').getAttribute('data-resume-all-count')).toBe('2')
     expect(getByTestId('resume-all-text').textContent).toBe('2 interrupted sessions')
     const button = getByTestId('resume-all-button')
@@ -201,7 +214,7 @@ describe('chat sidebar — Resume all interrupted sessions', () => {
     await waitFor(() => expect(getByTestId('resume-all-text').textContent).toBe('Resumed 1 session'))
   })
 
-  it('a non-owner gets its own message and no agent hand-off', async () => {
+  it('a non-owner gets its own message, with the agent hand-off', async () => {
     resumeAll.mockRejectedValue(Object.assign(new Error('owner authorization required'), {
       status: 403, body: JSON.stringify({ error: 'owner authorization required', code: 'owner_only' }),
     }))
@@ -209,7 +222,9 @@ describe('chat sidebar — Resume all interrupted sessions', () => {
     await act(async () => { fireEvent.click(getByTestId('resume-all-button')) })
     await waitFor(() => expect(getByTestId('resume-all-error').textContent).toContain('Only the dashboard owner can resume every session'))
     expect(getByTestId('resume-all-error').textContent).not.toContain('owner authorization required')
-    expect(getByTestId('resume-all-error').textContent).not.toContain('Ask the agent')
+    // Nothing on the sidebar is unsaved and the agent still runs for a
+    // non-owner, so the refusal keeps the hand-off (errors-use-error-notice).
+    expect(getByTestId('resume-all-error').textContent).toContain('Ask the agent')
   })
 
   it('reports a refused request through ErrorNotice and keeps the action', async () => {
@@ -274,9 +289,36 @@ describe('chat sidebar — Resume all interrupted sessions', () => {
     expect(queryByTestId('resume-all-problems')).toBeNull()
   })
 
-  it('withholds the action while the dashboard is offline', () => {
+  it('withholds the action while the dashboard is offline', async () => {
     const { getByTestId } = renderSidebar([slot('a', { interrupted: true })], false)
+    await settle()
     expect(getByTestId('resume-all-button')).toBeDisabled()
     expect(resumeAll).not.toHaveBeenCalled()
   })
+})
+
+type CountRow = Pick<ChatSlot, 'mode' | 'surface' | 'running' | 'interrupted' | 'subagents_running' | 'executor'>
+type CountCase = { name: string; slots: { key: string; row: CountRow | null }[]; expected: string[] }
+
+describe('the shared count fixture (test/fixtures/resume_all_candidates.json)', () => {
+  // ONE fixture, both suites. The pytest side checks these rows against the
+  // server's slots payload for the same facts, and `expected` against the run's
+  // candidates and `total`. Here the same rows go through the chat page's
+  // surface filter (`pageEnvironment.ts`) into the sidebar, whose count must be
+  // that same `expected`.
+  for (const c of (countFixture as { cases: CountCase[] }).cases) {
+    it(`counts exactly what the server resumes: ${c.name}`, async () => {
+      const payload = c.slots.flatMap(({ key, row }) => (row ? [slot(key, row)] : []))
+      const page = payload.filter(s => isChatPageSurface(s.surface ?? s.mode))
+      expect(interruptedIdleSlots(page as Slot[]).map(s => s.key)).toEqual(c.expected)
+      const { queryByTestId } = renderSidebar(page)
+      await settle()
+      if (c.expected.length === 0) {
+        expect(queryByTestId('resume-all-row')).toBeNull()
+        return
+      }
+      expect(queryByTestId('resume-all-row')?.getAttribute('data-resume-all-count')).toBe(String(c.expected.length))
+      expect(queryByTestId('resume-all-button')?.textContent).toBe(`Resume ${c.expected.length} sessions`)
+    })
+  }
 })

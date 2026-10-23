@@ -26,25 +26,23 @@ different blast radius and takes the owner gate the other all-slot surfaces
 (the dashboard card read, the worktree create) already take.
 
 The press is not one long request. The handler collects the candidates,
-answers ``202 {ok, total, run_id}`` at once and runs the waves as a
+answers ``202 {ok, total, run_id}`` at once and runs the resumes as a
 gateway-owned task held in ``state._background_tasks``. One run at a time: a
 press while a run is in flight answers ``409 resume_all_running`` and
 dispatches nothing. The outcome reaches owner sockets as one
 ``resume_all_done`` frame (``broadcast_ws_owners``); the per-slot changes
 reach every client through the ordinary slots push as each slot starts.
 
-Launches go out in waves of ``RESUME_ALL_WAVE_SIZE`` with a fixed
-``RESUME_ALL_STAGGER_SECS`` pause between waves. Each resumed slot starts an
-agent process, and a burst of forty starts at once loses lanes that the same
-forty, four at a time, do not. A wave runs as its own tracked task behind
-``asyncio.shield``: a cancellation of the run task itself stops it BETWEEN
-waves, never inside one, so no slot is left with a queued recovery entry and
-no runner.
+Every candidate is dispatched at once, in one ``gather``, and this module sets
+no pace of its own. Each resumed turn's cold start takes a permit from
+``SessionManager._start_sem``, the queue ``agent.cold_start_concurrency``
+sizes, and a start beyond its width waits there for a permit instead of being
+refused.
 
-The shield does not cover gateway shutdown. Nothing cancels the run task on
-its own at shutdown; loop teardown cancels every task, the wave included. A
-slot whose dispatch was in flight then keeps its queued recovery entry in
-memory only, and a restart reloads the queue.
+Nothing cancels the run task on its own. Loop teardown at gateway shutdown
+cancels it with every other task; a slot whose dispatch was in flight then
+keeps its queued recovery entry in memory only, and a restart reloads the
+queue.
 """
 
 from __future__ import annotations
@@ -73,14 +71,6 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 
 logger = logging.getLogger(__name__)
-
-#: How many continuations are dispatched concurrently in one wave. Four is the
-#: largest batch of simultaneous agent starts this gateway has booted without
-#: hitting the session-start cap (see the module docstring).
-RESUME_ALL_WAVE_SIZE = 4
-#: Fixed pause between waves. It paces the starts; it does not wait for any
-#: signal from the previous wave.
-RESUME_ALL_STAGGER_SECS = 1.5
 
 #: The slot modes the chat page lists, mirroring the frontend's
 #: ``isChatPageSurface`` (``website/src/utils/channelOrigin.ts``): an ordinary
@@ -133,16 +123,11 @@ def collect_interrupted_idle(state: DashboardState) -> list[tuple[str, _ChatSlot
         # ``summary_rows``: the rows the sidebar reads, so a restored row whose
         # window is still pending answers from its tail and nothing is read from
         # disk on the loop here. Each candidate's window loads off the loop in
-        # its own wave, before its Continue.
+        # its own dispatch, before its Continue.
         if not is_turn_interrupted(summary_rows(slot)):
             continue
         picked.append((name, slot))
     return picked
-
-
-async def _pause(secs: float) -> None:
-    """The inter-wave pause, one seam so tests can observe the stagger."""
-    await asyncio.sleep(secs)
 
 
 def _track(state: DashboardState, task: asyncio.Task[Any]) -> None:
@@ -161,30 +146,38 @@ def _track(state: DashboardState, task: asyncio.Task[Any]) -> None:
     task.add_done_callback(background.discard)
 
 
-def _new_outcome(total: int, run_id: str = "") -> dict[str, Any]:
-    out: dict[str, Any] = {
+def _new_outcome(total: int, run_id: str) -> dict[str, Any]:
+    return {
         "ok": True,
         "total": total,
+        "run_id": run_id,
         "resumed": [],
         "skipped": [],
         "failed": [],
     }
-    if run_id:
-        out["run_id"] = run_id
-    return out
 
 
-async def _resume_waves(
+async def _resume_candidates(
     state: DashboardState,
     candidates: list[tuple[str, _ChatSlot]],
     claims: Mapping[str, Any],
     outcome: dict[str, Any],
-    waves: list[asyncio.Task[None]] | None = None,
 ) -> None:
-    """Continue *candidates* wave by wave, recording each slot in *outcome*.
+    """Continue every candidate at once, recording each slot in *outcome*.
 
-    Each wave's task is appended to *waves* when given, so a cancelled caller
-    can tell whether a wave is still finishing.
+    One ``gather`` over the whole list: the cold starts the resumed turns lead
+    to wait in ``SessionManager._start_sem`` (see the module docstring).
+
+    ``resumed`` lists the slot keys whose continuation was queued and
+    dispatched. ``skipped`` carries ``{slot, code}`` for every
+    :class:`SlotContinueRefusal`: the slot was a candidate when collected but
+    ``continue_slot_turn`` found a reason not to (its turn finished meanwhile, a
+    message queued meanwhile, a pending approval, running sub-agents, two failed
+    starts in a row, or a same-name re-registration during the lock wait).
+    ``failed`` carries ``{slot, error}`` with the exception's class name for
+    anything else; the other slots are unaffected. *claims* is the caller's
+    ``app`` claim, passed to the same replaced-while-queued probe the
+    single-slot route uses.
     """
     resumed: list[str] = outcome["resumed"]
     skipped: list[dict[str, str]] = outcome["skipped"]
@@ -196,8 +189,8 @@ async def _resume_waves(
             # ``slot.messages`` reads inside ``continue_slot_turn``.
             await load_window_off_loop(slot)
             # require_interrupted: a candidate whose turn ended cleanly between
-            # the collect and its wave is refused as ``turn_not_failed``, so a
-            # finished session never gets the carry-on body nobody asked for.
+            # the collect and its dispatch is refused as ``turn_not_failed``, so
+            # a finished session never gets the carry-on body nobody asked for.
             await _ch.continue_slot_turn(
                 state,
                 slot,
@@ -212,26 +205,14 @@ async def _resume_waves(
             skipped.append({"slot": name, "code": exc.code})
             return
         except Exception as exc:
+            # Any other exception, a failed slots push after the dispatch
+            # included, fails this slot only; the others carry on.
             logger.warning("resume-all: continue failed for slot %s", name, exc_info=True)
             failed.append({"slot": name, "error": type(exc).__name__})
             return
         resumed.append(name)
 
-    async def _wave(batch: list[tuple[str, _ChatSlot]]) -> None:
-        await asyncio.gather(*(_one(name, slot) for name, slot in batch))
-
-    for start in range(0, len(candidates), RESUME_ALL_WAVE_SIZE):
-        if start:
-            await _pause(RESUME_ALL_STAGGER_SECS)
-        # The wave is its own tracked task behind a shield: a cancellation of
-        # the run lands here and stops the loop, but the wave already started
-        # runs to its end, so a slot whose recovery entry is queued always gets
-        # its dispatch. Cancellation can only stop the run BETWEEN waves.
-        wave = asyncio.ensure_future(_wave(candidates[start : start + RESUME_ALL_WAVE_SIZE]))
-        _track(state, wave)
-        if waves is not None:
-            waves.append(wave)
-        await asyncio.shield(wave)
+    await asyncio.gather(*(_one(name, slot) for name, slot in candidates))
 
     if candidates:
         logger.info(
@@ -243,31 +224,9 @@ async def _resume_waves(
         )
 
 
-async def resume_all_interrupted(
-    state: DashboardState, request: web.Request | Mapping[str, Any] | None = None
-) -> dict[str, Any]:
-    """Continue every interrupted idle slot; the outcome, never an exception.
-
-    ``resumed`` lists the slot keys whose continuation was queued and
-    dispatched. ``skipped`` carries ``{slot, code}`` for every
-    :class:`SlotContinueRefusal` -- the slot was a candidate when collected but
-    ``continue_slot_turn`` found a reason not to (its turn finished meanwhile, a
-    message queued meanwhile, a pending approval, running sub-agents, two failed
-    starts in a row, or a same-name re-registration during the lock wait).
-    ``failed`` carries ``{slot, error}`` with the exception's class name for
-    anything else; the other slots in the wave are unaffected. *request* is the
-    caller's request (or a mapping with its ``app`` claim), passed to the same
-    replaced-while-queued probe the single-slot route uses.
-    """
-    candidates = collect_interrupted_idle(state)
-    outcome = _new_outcome(len(candidates))
-    await _resume_waves(state, candidates, _claims(request), outcome)
-    return outcome
-
-
-def _claims(request: web.Request | Mapping[str, Any] | None) -> dict[str, Any]:
+def _claims(request: web.Request) -> dict[str, Any]:
     """The caller's ``app`` claim as a plain mapping the background run can keep."""
-    return {"app": request.get("app", "") if request is not None else ""}
+    return {"app": request.get("app", "")}
 
 
 def _broadcast_outcome(state: DashboardState, outcome: dict[str, Any]) -> None:
@@ -286,33 +245,24 @@ async def _run_in_background(
     claims: Mapping[str, Any],
     outcome: dict[str, Any],
 ) -> None:
-    """The run the handler starts: the waves, then one outcome frame.
+    """The run the handler starts: every candidate, then one outcome frame.
 
     Every way the run ends sends exactly one frame, from the ``finally``:
 
-    - A cancellation of the run task stops it between waves. The frame carries
-      ``cancelled: true`` and goes out once the wave that was in flight has
-      finished, so it reports what that wave did, or at once when the run was
-      cancelled during a pause. This does not cover gateway shutdown, where
-      loop teardown cancels the wave too and the sockets are closing (see the
-      module docstring).
-    - An exception that escapes the waves outside the per-slot work marks the
-      run ``ok: false`` and lists every candidate not yet recorded as failed
-      with that exception's class name. The exception is re-raised for
+    - A cancellation of the run task (loop teardown at gateway shutdown, see
+      the module docstring) marks the frame ``cancelled: true``; it reports the
+      slots recorded before the cancellation landed.
+    - An exception that escapes the per-slot work marks the run ``ok: false``
+      and lists every candidate not yet recorded as failed with that
+      exception's class name. The exception is re-raised for
       ``_log_task_exception``.
 
     A tab waiting on the run is never left pending.
     """
-    waves: list[asyncio.Task[None]] = []
-    deferred = False
     try:
-        await _resume_waves(state, candidates, claims, outcome, waves)
+        await _resume_candidates(state, candidates, claims, outcome)
     except asyncio.CancelledError:
         outcome["cancelled"] = True
-        finishing = [w for w in waves if not w.done()]
-        if finishing:
-            finishing[-1].add_done_callback(lambda _w: _broadcast_outcome(state, outcome))
-            deferred = True
         raise
     except Exception as exc:
         outcome["ok"] = False
@@ -326,8 +276,7 @@ async def _run_in_background(
         )
         raise
     finally:
-        if not deferred:
-            _broadcast_outcome(state, outcome)
+        _broadcast_outcome(state, outcome)
 
 
 def _clear_run(state: DashboardState, task: asyncio.Task[Any]) -> None:

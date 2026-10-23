@@ -6,8 +6,9 @@
  *  that ended without a reply -- the state behind the composer's Resume button
  *  and the sidebar row's "interrupted" cue. Pressing Resume in each tab is the
  *  chore this row removes: one press calls `POST /api/chat/slots/resume-all`,
- *  which starts a background run of the Continue path on every such session,
- *  four at a time, and answers at once with the run's id. The row stays
+ *  which answers at once with the run's id and runs the Continue path on every
+ *  such session in the background, all of them dispatched together: the
+ *  server's agent start queue, not this run, paces the cold starts. The row stays
  *  pending until the run's outcome arrives as a `resume_all_done` frame (the
  *  rows themselves move with the ordinary slots push meanwhile). The frame can
  *  arrive before the 202 has been read -- a short run finishes in milliseconds
@@ -40,8 +41,9 @@ export const RESUME_ALL_RESULT_MS = 6000
 
 /** How long the row waits for a run's outcome frame before giving the button
  *  back. Frames are one-shot: a socket that reconnects mid-run misses it, and
- *  the row must not stay pending forever. Generous: the server's own pacing for
- *  N sessions is about N × 0.4 s. */
+ *  the row must not stay pending forever. Generous: the run ends once every
+ *  session's Resume is dispatched, and a dispatch hands the turn to its own
+ *  task without waiting for the agent to start. */
 export function resumeAllPendingCeilingMs(total: number): number {
   return 60_000 + Math.max(0, total) * 1_000
 }
@@ -73,7 +75,7 @@ export type ResumeAllResult = {
 }
 
 /** Skip codes that need nothing from anyone: the session moved on between the
- *  count and its wave (it finished, started, queued a message, began stopping,
+ *  count and its dispatch (it finished, started, queued a message, began stopping,
  *  closed, or started sub-agents). Every other skip, and every failure, is one
  *  the owner must act on, so the row reports it through `ErrorNotice`. */
 export const RESUME_ALL_BENIGN_SKIPS: ReadonlySet<string> = new Set([
@@ -137,8 +139,8 @@ function refusalOf(e: unknown): Refusal {
 }
 
 /** The owner gate refusing the viewer: this row's route is owner-only, and a
- *  non-owner dashboard session cannot fix that by retrying or by asking the
- *  agent, so its notice says so and offers neither. */
+ *  non-owner dashboard session cannot fix that by retrying, so its notice
+ *  names the owner gate instead of the raw refusal. */
 export function isOwnerOnlyRefusal(e: unknown): boolean {
   const { status, code } = refusalOf(e)
   return status === 403 && code === 'owner_only'
@@ -155,7 +157,6 @@ export function useResumeAll({ localSlots, connected }: { localSlots: Slot[]; co
   // language even if the language switches while it is up.
   const [result, setResult] = useState<ResumeAllResult | null>(null)
   const [error, setError] = useState('')
-  const [ownerOnly, setOwnerOnly] = useState(false)
   // The sessions the last run left for the owner to act on. Kept until
   // dismissed or the next press, not for the outcome line's six seconds.
   const [problems, setProblems] = useState<ResumeAllProblem[]>([])
@@ -211,9 +212,7 @@ export function useResumeAll({ localSlots, connected }: { localSlots: Slot[]; co
         follow({ id: runId, total, adopted: true })
         return
       }
-      const owner = isOwnerOnlyRefusal(e)
-      setOwnerOnly(owner)
-      setError(owner
+      setError(isOwnerOnlyRefusal(e)
         ? i18nT('pages.chatSidebar.resume_all_owner_only')
         : errMessage(e) || i18nT('pages.chatSidebar.resume_all_failed'))
     },
@@ -259,14 +258,13 @@ export function useResumeAll({ localSlots, connected }: { localSlots: Slot[]; co
     const t = setTimeout(() => setResult(null), RESUME_ALL_RESULT_MS)
     return () => clearTimeout(t)
   }, [result])
-  const press = () => { setError(''); setOwnerOnly(false); setResult(null); setProblems([]); mutation.mutate() }
+  const press = () => { setError(''); setResult(null); setProblems([]); mutation.mutate() }
   const titles = useMemo(() => new Map(localSlots.map(s => [s.key, s.title || s.key])), [localSlots])
   const titleOf = (key: string) => titles.get(key) ?? key
   return {
     count,
     result,
     error,
-    ownerOnly,
     setError,
     problems,
     dismissProblems: () => setProblems([]),
@@ -293,7 +291,7 @@ export function resumeAllResultText(res: ResumeAllResult): string {
  *  status region would announce it twice. */
 export function renderResumeAllRow(shell: SidebarScope): React.ReactNode {
   const {
-    count, result, error, ownerOnly, setError, problems, dismissProblems, titleOf, pending, alreadyRunning, run, connected,
+    count, result, error, setError, problems, dismissProblems, titleOf, pending, alreadyRunning, run, connected,
   } = shell.resumeAll
   if (count === 0 && !result && !error && !pending && problems.length === 0) return null
   const label = i18nT('pages.chatSidebar.resume_all_sessions', { count })
@@ -339,8 +337,9 @@ export function renderResumeAllRow(shell: SidebarScope): React.ReactNode {
       )}
       {/* askAgent: the press writes nothing the sidebar holds locally, so the
           hand-off cannot destroy a draft, and the sessions stay interrupted on
-          the server for the agent to look at. Not for the owner gate: neither
-          the agent nor a retry can make a non-owner the owner. */}
+          the server for the agent to look at. That holds for the owner gate
+          too: the agent still runs for a non-owner and can say who the owner
+          is. */}
       {error && (
         <div className="mx-2 mt-2 shrink-0">
           <ErrorNotice
@@ -348,7 +347,7 @@ export function renderResumeAllRow(shell: SidebarScope): React.ReactNode {
             className="flex-wrap w-full"
             title={i18nT('pages.chatSidebar.resume_all_failed')}
             message={error}
-            askAgent={!ownerOnly}
+            askAgent
             onDismiss={() => setError('')}
             testId="resume-all-error"
           />
