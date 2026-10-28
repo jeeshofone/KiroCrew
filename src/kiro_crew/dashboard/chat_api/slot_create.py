@@ -127,6 +127,76 @@ def _retract_failed_newborn(state: DashboardState, slot: _ChatSlot) -> bool:
     return True
 
 
+async def _birth_default_project(cfg: KiroCrewConfig | None, workspace: str) -> str:
+    """The project a new slot gets when neither it nor its folder names one."""
+    cfg_proj = cfg.dashboard.default_project if cfg else ""
+
+    def resolve() -> str:
+        if isinstance(cfg_proj, str) and cfg_proj:
+            resolved = os.path.realpath(os.path.expanduser(cfg_proj))
+            # A configured default that overlaps the data home would be refused
+            # at spawn anyway, so it is skipped here like a sensitive path.
+            if (
+                os.path.isdir(resolved)
+                and not is_sensitive_path(resolved)
+                and voice_runtime_workspace_conflict(resolved) is None
+            ):
+                return resolved
+        return default_project_dir(workspace)
+
+    # Off the loop: every branch, the workspace fallback included, touches the
+    # disk or reloads config.
+    return await asyncio.to_thread(resolve)
+
+
+async def _check_new_slot_assignment(
+    cfg: KiroCrewConfig, agent: str, agent_kind: str, project: str, memory_mode: str
+) -> None:
+    """Raise where the owner's member assignment of a new slot would refuse it.
+
+    The same questions the assignment asks after the mint, with no write: the
+    member's private store must still be the member's own (the
+    ``member_store_ownership_holds`` check the pin makes), the agent must
+    resolve, and the member identity check ``_record_explicit_agent_selection``
+    makes must pass. A refusal here means the create mints, builds and files
+    nothing.
+    """
+    from kiro_crew.dashboard.chat_persistence import (
+        _member_private_selection,
+        member_store_ownership_holds,
+    )
+    from kiro_crew.execution_context import resolve_member_execution
+    from kiro_crew.memory_stores import UnknownMemoryStore
+
+    if agent_kind != "template":
+        selected, store = _member_private_selection(agent, cfg)
+        if store and not await asyncio.to_thread(
+            member_store_ownership_holds, cfg, selected, store
+        ):
+            raise UnknownMemoryStore(
+                f"Crew Member {selected!r} does not own its private memory store; "
+                "no session was created"
+            )
+
+    chosen = await asyncio.to_thread(
+        resolve_agent_bindings,
+        cfg,
+        agent,
+        project or None,
+        validate_memory_files=False,
+        selection_kind=agent_kind,
+    )
+    if chosen.selection_kind == "member":
+        await asyncio.to_thread(
+            resolve_member_execution,
+            cfg,
+            agent or chosen.resolved_alias,
+            memory_mode=memory_mode,
+            app="",
+            validate_memory_files=False,
+        )
+
+
 async def api_chat_slot_create(request: web.Request) -> web.Response:
     """POST /api/chat/slots — create a new chat slot."""
     state: DashboardState = request.app["state"]
@@ -406,6 +476,23 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                 {"error": "slot changed during agent resolution", "code": "session_rebound"},
                 status=409,
             )
+    # The owner's member assignment below can refuse a new slot's agent. Ask the
+    # same question here, before the mint, the session folder or the folder
+    # un-hide, so the common refusal builds nothing. The assignment still runs
+    # after the mint, and a refusal there is retracted as before.
+    preflight_key = _normalize_slot_key(str(name)) if name else ""
+    if (
+        cfg is not None
+        and is_owner_dashboard_request(request)
+        and (not preflight_key or preflight_key not in state._slots)
+    ):
+        preflight_project = folder_project or await _birth_default_project(cfg, workspace)
+        try:
+            await _check_new_slot_assignment(cfg, agent, agent_kind, preflight_project, memory_mode)
+        except Exception as exc:
+            from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
+
+            return _store_unavailable_response("", exc)
     # Resolved before the mint decision below: nothing may await between that
     # read and `get_or_create_slot`, and these are the two awaits this path adds.
     cron_creator = await cron_slot_creator(request)
@@ -643,16 +730,14 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
             # `name` can address an already-used slot, so clearing outright would
             # unfile a conversation that was sitting in a perfectly good folder
             # of its own. This is a chat turn, so declining the move beats
-            # failing the turn. A person opening a chat in the folder (no
-            # internal secret: the browser) claims it, so an agent's
-            # chat_folder_delete refuses it from then on.
-            if not await _unhide_folder(
-                state,
-                folder_id,
-                claim_for_person=(
-                    folder_id != previous_folder
-                    and request.headers.get("X-Internal-Secret") is None
-                ),
+            # failing the turn. The folder's un-hide and claim are writes, so
+            # they run once nothing later can refuse the create (below);
+            # this only reads whether the folder is there.
+            claim_folder = (
+                folder_id != previous_folder and request.headers.get("X-Internal-Secret") is None
+            )
+            if not await state.read_folders(
+                lambda folders: any(f["id"] == folder_id for f in folders)
             ):
                 slot.folder_id = previous_folder
                 slot._folder_changed = previous_changed
@@ -739,24 +824,7 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                 session_folder_notice = "session_folder_unavailable"
         # Default project to workspace directory so file search works out of the box
         if not slot.project:
-            cfg_proj = cfg.dashboard.default_project if cfg else ""
-            if isinstance(cfg_proj, str) and cfg_proj:
-                resolved = os.path.realpath(os.path.expanduser(cfg_proj))
-                eligible = os.path.isdir(resolved) and not is_sensitive_path(resolved)
-                if eligible:
-                    # A configured default that overlaps the data home
-                    # would be refused at spawn anyway — skip it here like
-                    # a sensitive path, falling back to the workspace
-                    # default instead of wedging every new slot. Off the
-                    # loop, because the shared scan primes runtime paths
-                    # (realpath/mkdir) on first use.
-                    eligible = (
-                        await asyncio.to_thread(voice_runtime_workspace_conflict, resolved)
-                    ) is None
-                cfg_proj = resolved if eligible else ""
-            else:
-                cfg_proj = ""
-            slot.project = cfg_proj or default_project_dir(workspace)
+            slot.project = await _birth_default_project(cfg, workspace)
         if is_new_slot and cfg is not None:
             if is_owner_dashboard_request(request):
                 assignment_key = effective_session_key(slot)
@@ -904,6 +972,17 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                     },
                     status=503,
                 )
+        if folder_applied:
+            # Past the last step that can refuse the create, so the folder's
+            # un-hide and claim are written only for a create that stands. A
+            # person opening a chat in the folder (no internal secret: the
+            # browser) claims it, so an agent's chat_folder_delete refuses it
+            # from then on. A folder deleted since the read above declines the
+            # move, as it would have at that read.
+            if not await _unhide_folder(state, folder_id, claim_for_person=claim_folder):
+                slot.folder_id = previous_folder
+                slot._folder_changed = previous_changed
+                folder_applied = False
         if folder_id or title:
             # The create/recreate request has been authorized against this
             # transcript.  Do not let a rebind while the off-loop write waits on
