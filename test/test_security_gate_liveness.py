@@ -811,7 +811,11 @@ def _url_payload_command(n: int) -> str:
 #: floor in ``paths_lists`` (per-chat steering switch-offs). Re-measured.
 #: Raised by 18, from 36,000, to 36,018, for ``paths.py``'s scratch tree-index fence:
 #: artifact reads refuse the canonical index path even during replacement.
-_PACKAGE_LINE_BUDGET = 36_018
+#: Raised by 83, from 36,018, for the credential-mint floor: it reads a quoted
+#: substitution argument, and the payload walk adds a frame per assignment whose
+#: computed value may be the program or the verb (past 8 such, the line is
+#: refused). Only refusals were added. Re-measured.
+_PACKAGE_LINE_BUDGET = 36_101
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second

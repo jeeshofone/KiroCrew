@@ -1004,6 +1004,13 @@ def _self_tokens(text_lower: str, *, resolve: bool = True) -> "list[str]":
     argv check while bash still runs it. ``_fold_line_continuations`` folds only
     the lone case and leaves the escaped run intact, matching bash.
     """
+    return _self_tokens_read(text_lower, resolve=resolve)
+
+
+def _self_tokens_read(
+    text_lower: str, *, resolve: bool, verb_at: int = -1, ambiguous: "list[int] | None" = None
+) -> "list[str]":
+    """:func:`_self_tokens`; *verb_at* and *ambiguous* are ``_resolve_local_assignments``'s."""
     try:
         # shlex treats bare newlines as whitespace, which joins separate
         # commands into one argv. Preserve those boundaries after folding
@@ -1017,7 +1024,9 @@ def _self_tokens(text_lower: str, *, resolve: bool = True) -> "list[str]":
         tokens = normalize_shell_command(command)
         if not resolve:
             return tokens
-        return _resolve_function_aliases(_resolve_local_assignments(tokens))
+        return _resolve_function_aliases(
+            _resolve_local_assignments(tokens, verb_at=verb_at, ambiguous=ambiguous)
+        )
     except Exception:
         return []
 
@@ -1112,6 +1121,25 @@ _PARAM_TRANSFORM_RE = re.compile(r"\$\{([A-Za-z_]\w*)(?::(?![-+=?])[^}]*|[#%^,/@
 _INDIRECT_VAR_USE_RE = re.compile(r"\$\{!([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
+# Most verb readings (one frame each) the payload walk builds for one source.
+_MAX_VERB_READINGS = 8
+
+
+def _mint_verb_in_own_substitution(tokens: "list[str]", idx: int) -> bool:
+    """True if the FIRST substitution from *idx* (the assignment's own) prints the verb.
+
+    An unproven close yields the whole remainder, as in ``_substitution_bodies``,
+    so a dequoted ``'`` that hides the close still reads the verb after it.
+    """
+    joined = " ".join(tokens[idx:])
+    start = joined.find("$(")
+    if start < 0:
+        return False
+    end, proven = _matching_close_paren(joined, start + 2)
+    body = joined[start + 2 : end - 1] if proven else joined[start + 2 :]
+    return any(_is_mint_verb(word) for word in body.split())
+
+
 def _mint_verb_in_substitution(tokens: "list[str]", idx: int) -> bool:
     """True if the substitution starting at *idx* prints the credential-minting verb.
 
@@ -1126,7 +1154,9 @@ def _mint_verb_in_substitution(tokens: "list[str]", idx: int) -> bool:
     return False
 
 
-def _resolve_local_assignments(tokens: "list[str]") -> "list[str]":
+def _resolve_local_assignments(
+    tokens: "list[str]", *, verb_at: int = -1, ambiguous: "list[int] | None" = None
+) -> "list[str]":
     """Substitute ``$VAR`` uses with a literal assigned earlier in the same command.
 
     Only LITERAL right-hand sides are tracked, and only assignments that appear in
@@ -1139,6 +1169,7 @@ def _resolve_local_assignments(tokens: "list[str]") -> "list[str]":
     literal the shell will run.
     """
     values: dict[str, str] = {}
+    scans = 0
     out: list[str] = []
     # ``X=<name>;$X <verb>`` glues the assignment and the next command into ONE token,
     # because ``shlex`` splits on whitespace only.  Split on top-level control operators
@@ -1209,6 +1240,23 @@ def _resolve_local_assignments(tokens: "list[str]") -> "list[str]":
             # direction -- the value only matters when ``$X`` is later used as a
             # program, and a wrong guess there is a refusal, not a bypass.
             produced = _protected_name_in_substitution(tokens, idx)
+            # A value that may be EITHER: the program scan reads dequoted tokens, so a
+            # ``'`` bash read inside double quotes (``T=$(: "'"; echo <verb>)``) runs it
+            # past the substitution into later text.  Its index goes into
+            # *ambiguous*, and the walk re-reads with *verb_at* set to each one in turn.
+            # The verb scan reads the rest of the line, so it stops once the walk's
+            # reading cap is passed (the walk then refuses the line).
+            # Every scan counts against the cap, found or not, so decoy assignments cannot
+            # make the walk quadratic; past the cap the walk refuses the line.
+            collecting = ambiguous is not None and len(ambiguous) <= _MAX_VERB_READINGS
+            if produced and ambiguous is not None and collecting:
+                scans += 1
+                if scans > _MAX_VERB_READINGS:
+                    ambiguous.extend([-1] * (_MAX_VERB_READINGS + 1))
+                elif _mint_verb_in_own_substitution(tokens, idx):
+                    ambiguous.append(idx)
+            elif produced and idx == verb_at:
+                produced = ""
             if produced:
                 values[assign.group(1)] = produced
             elif _mint_verb_in_substitution(tokens, idx):
@@ -1633,6 +1681,20 @@ def _shell_payload_walk_uncached(text_lower: str) -> "list[tuple[str, list[str]]
         if not tokens:
             continue
         out.append((source, tokens))
+        # Each such assignment's verb reading is a frame of its own, the others keeping
+        # the program reading, so every floor sees main's frame plus each one.
+        ambiguous: list[int] = []
+        if "$(" in source or "`" in source:
+            _self_tokens_read(source, resolve=True, ambiguous=ambiguous)
+        # Each reading re-runs the resolver, so past a few the line is refused as a mint
+        # instead (fail closed): unbounded frames made one check take minutes.
+        alts = (
+            [_self_tokens_read(source, resolve=True, verb_at=at) for at in ambiguous]
+            if len(ambiguous) <= _MAX_VERB_READINGS
+            else [["kirocrew", "token"]]
+        )
+        alts = [alt for alt in alts if alt != tokens]
+        out.extend((source, alt) for alt in alts)
         # Every substitution body is itself a command line -- command substitution
         # (``$( )``, backticks) and PROCESS substitution (``<( )``, ``>( )``) alike, since
         # bash runs the inner command in all of them.  Walking them here means the
@@ -1651,6 +1713,8 @@ def _shell_payload_walk_uncached(text_lower: str) -> "list[tuple[str, list[str]]
         # continuation that bash keeps literal stays literal in the body too.
         joined_here: set[str] = set()
         nested = _nested_shell_payloads(tokens, allow_join=allow_join, joined_out=joined_here)
+        for alt in alts:
+            nested += _nested_shell_payloads(alt, allow_join=allow_join, joined_out=joined_here)
         # A redirect before the ``-c`` operand hides the script from ``nested``.
         from .shell_commands import redirect_hidden_payloads  # the reader imports this module
 
