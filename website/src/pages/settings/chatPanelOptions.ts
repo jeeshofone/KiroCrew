@@ -199,6 +199,8 @@ export type KirocrewConfigShape = {
   agent?: {
     acp_backend?: string
     model?: string
+    /** The Default Model is `Auto (decision model)`, saved beside `model: 'auto'`. */
+    model_jev_route?: boolean
     role_models?: { background?: string; subagent?: string }
     role_efforts?: { background?: string; subagent?: string }
     reasoning_effort?: string

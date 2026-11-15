@@ -536,6 +536,18 @@ its own once the cache refreshes with a list that carries it.
   (`llm_pool._get_acp_backend` falls back to Kiro for codex and claude), so
   neither catalog can judge every id the picker offers. `decisions.nudge_wake.llm_model` keeps the bare-id
   grammar, because the decision gate scrubs any model `is_model_id` refuses.
+- **The Default Model's `Auto (decision model)` entry** is the chat picker's
+  `JEV_ROUTE_MODEL` row, offered under the same `website/src/lib/jevRoute.ts`
+  gate. The `agent.model` PATCH resolves it as `switch_slot_model` does for a
+  chat: it saves `auto` and records the choice as `agent.model_jev_route`, so
+  `agent.model` stays a model id for every reader; any other `agent.model` save
+  drops the flag. A new owner chat that names no model of its own starts on
+  `auto` with `slot.jev_route` set, exactly the state the picker leaves, when
+  `agent.model` still defers, it is not a Bot's own chat, no agent it runs (the
+  Crew Mode conductor included) pins a model, and `gate.is_enabled("model.route")`
+  holds for its session (`chat_api/slot_create._default_routes_new_chat`).
+  Anything else starts it on plain inherit. The Background and Subagent
+  role rows do not offer it: `model.route` never routes their turns.
 - Backends with `resolves_model_from_advertised_list` use their own advertised
   model namespace: their live session's model ids, then their persisted
   namespace cache (`_advertised_cc_models`), so "no session is up" is never read

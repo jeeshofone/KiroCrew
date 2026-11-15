@@ -91,6 +91,34 @@ def _default_template_stamp(cfg: KiroCrewConfig) -> str:
     return dispatch_kiro_agent(default_template(cfg))
 
 
+def _default_routes_new_chat(cfg: KiroCrewConfig, slot: Any, agent_kind: str) -> bool:
+    """Whether a new owner chat starts on ``Auto (decision model)``. Blocking.
+
+    True only where the chat picker's entry could arm the same chat: the Default
+    Model is saved as that entry and still defers to ``auto``, the chat names no
+    model of its own, it is not a Bot's own chat (which has no picker to undo it),
+    no agent it runs pins a model (a pin outranks the default, and a routed turn
+    would move off it), and the gate would ask ``model.route`` for this session
+    now. The Crew Mode conductor counts as an agent it runs, since the client
+    switches a new chat onto it right after the create. Reads the keystone and
+    agent files, so it runs off the loop.
+    """
+    from kiro_crew.config.loader import agent_model_pin
+    from kiro_crew.config.sections_agent_fields import normalize_agent_model
+    from kiro_crew.dashboard.chat_turn.decisions_hooks import _jev_preview_on
+
+    if cfg.agent.model_jev_route is not True or normalize_agent_model(cfg.agent.model):
+        return False
+    if slot.model or slot.mode == "member":
+        return False
+    agents = [(slot.agent, agent_kind)]
+    if getattr(cfg.dashboard, "new_chat_crew_mode", False) is True:
+        agents.append((cfg.agent.crew_mode_agent, "template"))
+    if any(agent_model_pin(cfg, name, selection_kind=kind) for name, kind in agents):
+        return False
+    return _jev_preview_on(effective_session_key(slot))
+
+
 def _created_slot_row(state: Any, request: web.Request, slot: Any) -> dict[str, Any]:
     """*slot*'s row for the create route's answer, rank-free for a scoped caller.
 
@@ -1101,6 +1129,26 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                 count_new_chat = True
                 born_crew = bool(slot.crew_mode_agent)
                 crew_repeat = born_crew and bool(crew_mode.known_roots() - {slot.key})
+        if (
+            existing_slot is None
+            and cfg is not None
+            and is_owner_dashboard_request(request)
+            and not model
+            and not body.get("ephemeral")
+            # An app page's create has written its first line above already, and
+            # the app's own model pin is its model tier.
+            and not body.get("embed_app")
+            and await asyncio.to_thread(_default_routes_new_chat, cfg, slot, agent_kind)
+        ):
+            # Exactly what the picker's entry leaves on a chat (``switch_slot_model``):
+            # the inherit row's ``auto`` plus the flag, so a restart keeps it routing
+            # through the ``auto`` arm and a manual pick ends it the same way. Set
+            # inside the suspension, before any save or frame describes the chat.
+            slot.model = "auto"
+            slot.jev_route = True
+            # The agent selection above may already have written this chat's first
+            # metadata line without a model; the dirty flush records ``auto`` there.
+            slot._dirty = True
         _sync_dashboard_slots(state)
         # Persist INSIDE the suspension, ahead of the coalesced broadcast, the
         # same ordering `session_control_parts/session_create.py`'s create span uses ("the whole

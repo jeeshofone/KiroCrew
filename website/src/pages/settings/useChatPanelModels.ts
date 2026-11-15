@@ -13,6 +13,8 @@ import { setConfigPathValue, type useOptimisticConfigPaths } from './useOptimist
 import { useAvailableModelsQuery } from '../../hooks/useAvailableModels'
 import { EFFORT_LEVELS, effortLabel, modelSupportsEffort } from '../../lib/effort'
 import { normalizeModelKey } from '../../lib/model'
+import { JEV_ROUTE_MODEL, isUnpinnedModel, jevRouteOffered, withJevRoute } from '../../lib/jevRoute'
+import { fetchDashboardConfig } from '../../api/dashboardConfigQuery'
 import { fmtNumber } from '../../i18n/format'
 import { hiddenIdsFor, hiddenModelMatcher, normalizeHiddenModels } from '../../hooks/useInteractiveModels'
 import { i18nT } from '../../i18n/t'
@@ -22,6 +24,11 @@ import type {
 } from './chatPanelOptions'
 
 type OptimisticOverlay = ReturnType<typeof useOptimisticConfigPaths>
+
+/** The model id a Default Model value runs on: the decision-model entry runs on `auto`. */
+function asModelId(model: string): string {
+  return model === JEV_ROUTE_MODEL ? 'auto' : model
+}
 
   /**
    * Mutation options for a config PATCH with an OPTIMISTIC display: the seven
@@ -241,9 +248,37 @@ export function useChatPanelModelDefaults({
   })
   // '' in config means "unset" and resolves the same way 'auto' does, so both
   // render as the 'auto' option rather than as a missing selection.
-  const defaultModel = mcCfg?.agent?.model || 'auto'
+  const savedModel = mcCfg?.agent?.model || 'auto'
+  // The gateway saves the `Auto (decision model)` entry as `auto` plus
+  // `model_jev_route`, so the entry is shown only while the model still defers.
+  const defaultModel = mcCfg?.agent?.model_jev_route === true && isUnpinnedModel(savedModel)
+    ? JEV_ROUTE_MODEL
+    : savedModel
   const shownDefaultModel = overlay.shown('agent.model', defaultModel)
-  const modelOptions = availableModels.map(m => m.name)
+  // The chat picker's gate, read the way the picker reads it. `hasSlot` is true:
+  // a save here lands in config, where the gateway resolves the entry itself, so
+  // there is no pending model that could carry it into a slot.
+  const jevDashCfgQ = useQuery<{ decisions_enabled?: boolean }>({
+    queryKey: ['dashboardConfig'],
+    queryFn: fetchDashboardConfig,
+    staleTime: 30_000,
+  })
+  const jevConsentQ = useQuery({
+    queryKey: ['decisionsConsent'],
+    queryFn: () => api.getDecisionsConsent(),
+    retry: false,
+  })
+  const jevRouteOn = jevRouteOffered(jevDashCfgQ.data, jevConsentQ.data, true)
+  // Why the entry is not offered, once both reads have answered. A failed read
+  // says nothing here, as the chat picker says nothing: the entry is simply not
+  // offered (a gateway that predates consent answers 404).
+  const jevRouteUnavailable: 'policy' | 'consent' | null =
+    jevRouteOn || !jevDashCfgQ.isSuccess
+      ? null
+      : jevDashCfgQ.data?.decisions_enabled !== true
+        ? 'policy'
+        : jevConsentQ.isSuccess ? 'consent' : null
+  const modelOptions = withJevRoute(availableModels, jevRouteOn, '').map(m => m.name)
   // A model the live backend no longer advertises must still be selectable,
   // otherwise the select would silently jump to another entry and a stray
   // change event would overwrite the user's stored choice. Both the SHOWN and
@@ -300,7 +335,7 @@ export function useChatPanelModelDefaults({
   // names the same model as the setting's `claude-opus-4-8[1m]` or `opus`.
   const resolvedModel = resolvedQ.data?.model || ''
   const resolvedKey = normalizeModelKey(resolvedModel)
-  const globalKey = normalizeModelKey(defaultModel)
+  const globalKey = normalizeModelKey(asModelId(defaultModel))
   // Only an explicit global default can be overridden: on Auto the setting
   // itself says the agent config decides, so whatever resolves is expected. The
   // SHOWN value is also accepted so a pick still in flight does not flash a
@@ -309,7 +344,7 @@ export function useChatPanelModelDefaults({
     globalKey !== 'auto' &&
     !!resolvedKey && resolvedKey !== 'auto' &&
     resolvedKey !== globalKey &&
-    resolvedKey !== normalizeModelKey(shownDefaultModel)
+    resolvedKey !== normalizeModelKey(asModelId(shownDefaultModel))
   // Which tier answered. `pinned` is the resolver's own word for "this agent's
   // record carries a model pin" (the agent's own pin, never its template's);
   // a resolved model without one came from a tier this panel cannot edit (the
@@ -351,7 +386,7 @@ export function useChatPanelModelDefaults({
   // disabled with an explanatory hint. Gated on the SHOWN model so the row's
   // enabled state tracks the trigger the user is looking at, not a value the
   // refetch has yet to replace.
-  const effortSupported = modelSupportsEffort(shownDefaultModel)
+  const effortSupported = modelSupportsEffort(asModelId(shownDefaultModel))
   const defaultEffortOpts = optimisticConfigOpts('agent.reasoning_effort', () =>
     i18nT('pages.settings.chatPanel.failed_to_save_default_reasoning_effort')
   )
@@ -478,8 +513,8 @@ export function useChatPanelModelDefaults({
   const subagentEffort = mcCfg?.agent?.role_efforts?.subagent ?? ''
   const shownBackgroundEffort = overlay.shown('agent.role_efforts.background', backgroundEffort)
   const shownSubagentEffort = overlay.shown('agent.role_efforts.subagent', subagentEffort)
-  const bgEffortSupported = modelSupportsEffort(shownBackgroundModel !== 'auto' ? shownBackgroundModel : shownDefaultModel)
-  const subEffortSupported = modelSupportsEffort(shownSubagentModel !== 'auto' ? shownSubagentModel : shownDefaultModel)
+  const bgEffortSupported = modelSupportsEffort(shownBackgroundModel !== 'auto' ? shownBackgroundModel : asModelId(shownDefaultModel))
+  const subEffortSupported = modelSupportsEffort(shownSubagentModel !== 'auto' ? shownSubagentModel : asModelId(shownDefaultModel))
   const effortLabels = EFFORT_LEVELS.map(l => (l === '' ? i18nT('pages.settings.chatPanel.model_default') : effortLabel(l)))
   const backgroundEffortOpts = optimisticConfigOpts(
     'agent.role_efforts.background', () => i18nT('pages.settings.chatPanel.failed_to_save_role_effort'),
@@ -506,6 +541,6 @@ export function useChatPanelModelDefaults({
     subagentModelMut, shownBackgroundEffort, shownSubagentEffort, bgEffortSupported,
     subEffortSupported, effortLabels, backgroundEffortMut, subagentEffortMut,
     memberEffortPinOverrides, showEffortPinNotice, resolvedEffortLabel, clearAgentEffortPinMut,
-    clearAgentEffortPinError,
+    clearAgentEffortPinError, jevRouteOn, jevRouteUnavailable,
   }
 }

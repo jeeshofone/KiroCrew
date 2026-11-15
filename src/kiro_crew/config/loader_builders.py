@@ -780,6 +780,7 @@ def _agent_section_fields(agent_data: dict) -> AgentConfig:
         approval_mode=section.get("approval_mode"),
         streaming=section.get("streaming"),
         model=section.get("model"),
+        model_jev_route=section.read("model_jev_route", _safe_bool),
         role_models=coerce_role_models(section.get("role_models")),
         role_efforts=coerce_role_efforts(section.get("role_efforts")),
         model_context_tokens=section.get("model_context_tokens"),

@@ -29,6 +29,8 @@ import { useChatPanelTypedFields } from './useChatPanelTypedFields'
 import { chatPanelConfigOpts, useChatPanelFallbackModels, useChatPanelModelDefaults } from './useChatPanelModels'
 import { AppModelsSection } from './AppModelsSection'
 import { FollowDefaultModelAction } from './FollowDefaultModelAction'
+import { DefaultModelDecisionNote } from './DefaultModelDecisionNote'
+import { JEV_ROUTE_MODEL } from '../../lib/jevRoute'
 import { KiroHarnessFallbackNote } from './KiroHarnessFallbackNote'
 import { DefaultSessionFolderSetting } from './DefaultSessionFolderSetting'
 import { SessionsPerCreatorSetting } from './SessionsPerCreatorSetting'
@@ -272,7 +274,7 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
     subagentModelMut, shownBackgroundEffort, shownSubagentEffort, bgEffortSupported,
     subEffortSupported, effortLabels, backgroundEffortMut, subagentEffortMut,
     memberEffortPinOverrides, showEffortPinNotice, resolvedEffortLabel, clearAgentEffortPinMut,
-    clearAgentEffortPinError,
+    clearAgentEffortPinError, jevRouteOn, jevRouteUnavailable,
   } = useChatPanelModelDefaults({
     qc, setPathSaveError, clearOwnPathError, overlay, dashCfg, mcCfg, optimisticConfigOpts,
     fallbackModel, shownFallbackModel, refusalFallbackModel, shownRefusalFallbackModel,
@@ -464,10 +466,13 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
             hint={i18nT('pages.settings.chatPanel.which_model_new_sessions_start_with_pick_a_model_tip')}
             value={shownDefaultModel}
             options={modelOptions}
-            optionLabels={modelOptions.map(m => (m === 'auto' ? i18nT('pages.settings.chatPanel.default_auto') : m))}
+            optionLabels={modelOptions.map(m => (m === 'auto'
+              ? i18nT('pages.settings.chatPanel.default_auto')
+              : m === JEV_ROUTE_MODEL ? i18nT('components.modelDropdownList.auto_jev') : m))}
             onChange={v => defaultModelMut.mutate(v)}
             disabled={!mcQ.isSuccess}
           />
+          <DefaultModelDecisionNote shown={shownDefaultModel} offered={jevRouteOn} unavailable={jevRouteUnavailable} />
           {showPinNotice && pinAgent && (
             <div
               className="mt-1 mb-3 flex flex-wrap items-center gap-3 text-[13px] text-warn"
@@ -557,7 +562,7 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
                 ? i18nT('pages.settings.chatPanel.model_default_applies_no_override_the_model_pick')
                 // On `auto` the backend picks the model and refuses an effort
                 // level until a specific one is selected (#11546).
-                : !shownDefaultModel || shownDefaultModel === 'auto'
+                : !shownDefaultModel || shownDefaultModel === 'auto' || shownDefaultModel === JEV_ROUTE_MODEL
                 ? i18nT('pages.settings.chatPanel.effort_default_off_on_auto')
                 : i18nT('pages.settings.chatPanel.effort_default_needs_reasoning_model')
             }

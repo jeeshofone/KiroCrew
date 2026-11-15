@@ -112,6 +112,20 @@ class AgentConfig:
         default=DEFAULT_MODEL,
         metadata=_meta("Model", "LLM model identifier. 'auto' resolves from agent config."),
     )
+    model_jev_route: bool = field(
+        default=False,
+        metadata=_meta(
+            "Default model: Auto (decision model)",
+            "Set by choosing 'Auto (decision model)' as the Default Model in Settings > "
+            "Chat > Model, which also saves 'auto' as the model. A new chat you open "
+            "then lets the decision model pick each turn's model, as if you had picked "
+            "that entry in the chat. It applies only while the model is 'auto' or "
+            "empty, the Decisions switch is on for the address config names and your "
+            "organisation allows decision models; otherwise a new chat starts on Auto "
+            "as usual. A chat on an agent that pins its own model is left on that "
+            "model. Saving any other Default Model turns this off.",
+        ),
+    )
     role_models: dict[str, str] = field(
         default_factory=dict,
         metadata=_meta(

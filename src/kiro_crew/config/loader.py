@@ -511,6 +511,20 @@ def _agent_tier_model(
     return ""
 
 
+def agent_model_pin(
+    config: KiroCrewConfig, agent_name: str | None, *, selection_kind: str = ""
+) -> str:
+    """The model *agent_name* pins for itself (tiers 1 and 2 of resolve_effective_model), or ``""``.
+
+    For a caller that must leave an agent's own model alone, such as the
+    Default Model's decision-model arm, which only applies where the agent
+    defers to the global default.
+    """
+    return _agent_tier_model(
+        config, agent_name, _model_scope_filter(config), selection_kind=selection_kind
+    )
+
+
 def _model_scope_filter(config: KiroCrewConfig, backend: str | None = None) -> Callable[[str], str]:
     namespace = capabilities_for(
         config.agent.acp_backend if backend is None else backend

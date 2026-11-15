@@ -359,6 +359,18 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
         if reason:
             return _deny(reason, f"{path_key}={value}")
 
+    # The Default Model's "Auto (decision model)" entry is resolved here, the way the
+    # chat picker's is in ``switch_slot_model``: the model saved is plain ``auto`` and
+    # the choice survives as ``agent.model_jev_route`` alone, so ``agent.model`` keeps
+    # meaning a provider model id for every reader. Any other Default Model clears it.
+    default_jev_route: bool | None = None
+    if path_key == "agent.model":
+        from kiro_crew.dashboard.chat_handlers import JEV_ROUTE_MODEL
+
+        default_jev_route = isinstance(value, str) and value.strip() == JEV_ROUTE_MODEL
+        if default_jev_route:
+            value = "auto"
+
     # Validate value
     if unset:
         pass
@@ -688,12 +700,19 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
                     },
                     status=409,
                 )
-    if not isinstance(value, dict) and await asyncio.to_thread(overlay_pins, *path_key.split(".")):
-        _log_sel("denied", f"{path_key}=overlay_owned")
+    # The Default Model's companion flag is part of the same save, so an overlay that
+    # pins it refuses the save as one pinning ``agent.model`` does.
+    overlay_paths = [] if isinstance(value, dict) else [path_key]
+    if default_jev_route is not None:
+        overlay_paths.append("agent.model_jev_route")
+    for owned in overlay_paths:
+        if not await asyncio.to_thread(overlay_pins, *owned.split(".")):
+            continue
+        _log_sel("denied", f"{owned}=overlay_owned")
         return web.json_response(
             {
                 "error": (
-                    f"{path_key} is set in config.local.json, which overrides this "
+                    f"{owned} is set in config.local.json, which overrides this "
                     "setting. Change or remove it there."
                 ),
                 "code": "config_overlay_owned",
@@ -778,6 +797,10 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
                 # section, which includes a provider list the save omitted.
                 _check_default_profile_is_saved(stored, value.get("default_profile"))
             section[parts[-1]] = stored
+            if default_jev_route:
+                section["model_jev_route"] = True
+            elif default_jev_route is False:
+                section.pop("model_jev_route", None)
             if parts[0] == "session_environments":
                 # On the merged section, under the lock: a leaf write of one
                 # provider's list, or a whole-section save that preserved one,
