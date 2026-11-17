@@ -8843,6 +8843,10 @@
       "select_many_rule": "选择一个或多个选项。"
     },
     "queueStack": {
+      "action_refused": "无法更改排队消息",
+      "cancel_no_reply": "取消没有收到回复。请再次取消。",
+      "cancel_unconfirmed": "取消可能未到达服务器。恢复前请先查看对话。",
+      "restore_to_composer": "恢复到输入框",
       "cancel_and_move_back_to_input": "取消并退回到输入框",
       "cancel_queued_message": "取消排队消息",
       "edit_queued_message": "编辑排队消息",

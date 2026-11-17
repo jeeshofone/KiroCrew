@@ -958,10 +958,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // A busy turn: steer into it, answer its question card, stop it, and the queued-message cards.
   const {
     queuedMessages, systemDeliveryCount, steer, stopTurn, keepQuestionAnswer, answerQuestionCard,
-    handleCancelQueued, handleInterruptQueued, handleEditQueued, handleEditOpenQueued, handleReorderQueued, queuePendingIds,
+    handleCancelQueued, handleInterruptQueued, handleEditQueued, handleEditOpenQueued, handleReorderQueued, queuePendingIds, queueRefusal, dismissQueueRefusal, queueUnconfirmed,
     handleSteerAction, steerActionPending, steerActionRefusals, steerActionRequestFailures,
   } = useBusyTurnControls({
     activeSlot,
+    composerOnScreen: !(splitMode && splitFeatureEnabled),
     messageQuote,
     currentSlot,
     connected,
@@ -1270,7 +1271,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               cardOwnsRecovery={cardOwnsRecovery} resumeAfterSignIn={resumeAfterSignIn} continuable={continuable} continuing={continuing} handleContinue={handleContinue} interrupted={interrupted} dockGutter={dockGutter} dockRef={dockRef}
               endQuoteFlight={endQuoteFlight} flyingQuote={flyingQuote} inputAreaRef={inputAreaRef} isAtBottom={isAtBottom} answerQuestionCard={answerQuestionCard}
               handleCancelQueued={handleCancelQueued} handleEditQueued={handleEditQueued} handleEditOpenQueued={handleEditOpenQueued} handleInterruptQueued={handleInterruptQueued} handleReorderQueued={handleReorderQueued}
-              keepQuestionAnswer={keepQuestionAnswer} queuedMessages={queuedMessages} queuePendingIds={queuePendingIds} steer={steer} stopTurn={stopTurn} systemDeliveryCount={systemDeliveryCount}
+              keepQuestionAnswer={keepQuestionAnswer} queuedMessages={queuedMessages} queuePendingIds={queuePendingIds} queueRefusal={queueRefusal} dismissQueueRefusal={dismissQueueRefusal} queueUnconfirmed={queueUnconfirmed} steer={steer} stopTurn={stopTurn} systemDeliveryCount={systemDeliveryCount}
               handleEditLastRequest={handleEditLastRequest} composerOptimizing={composerOptimizing} handleOptimizingChange={handleOptimizingChange} memorySwitching={memorySwitching}
               // Crew Mode is chosen on the welcome state: while it is on neither the
               // memory-mode chip nor the Crew Mode chip is offered. Until the first

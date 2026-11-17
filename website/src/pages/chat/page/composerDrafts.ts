@@ -408,13 +408,19 @@ export function useComposerDraftLifecycle({
     return () => window.removeEventListener('beforeunload', h)
   }, [flushDrafts, prevSlot, drafts, inputRef, fileDrafts, pendingFilesRef, pasteDrafts, pasteBlocksRef, sessionRefDrafts, pendingSessionsRef])
   // Answers a retired question card hands back land in this composer or in that slot's stored draft.
-  useEffect(() => registerMainComposer((slot, text, showingOnly) => {
-    if (slot === composerSlotRef.current) { setInput(prev => mergeIntoDraft(prev, text)); return true }
+  useEffect(() => registerMainComposer((slot, text, showingOnly, files) => {
+    const mergeFiles = (cur: readonly string[]) => [...cur, ...files.filter(f => !cur.includes(f))]
+    if (slot === composerSlotRef.current) {
+      setInput(prev => mergeIntoDraft(prev, text))
+      if (files.length) { pendingFilesRef.current = mergeFiles(pendingFilesRef.current); setPendingFiles(pendingFilesRef.current) }
+      return true
+    }
     if (showingOnly) return false
     setDraft(drafts.current, slot, mergeIntoDraft(drafts.current[slot], text))
+    if (files.length) setFileDraft(fileDrafts.current, slot, mergeFiles(fileDrafts.current[slot] ?? []))
     saveDraftsDebounced()
     return true
-  }), [composerSlotRef, setInput, drafts, saveDraftsDebounced])
+  }), [composerSlotRef, setInput, drafts, fileDrafts, pendingFilesRef, setPendingFiles, saveDraftsDebounced])
   return { reconcileFileChipsRef, onComposerDraftCommit, noCarryCreateIdsRef }
 }
 

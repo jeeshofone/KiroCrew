@@ -234,6 +234,30 @@ export function subscribePaneDraft(slot: string, onArrival: () => void): () => v
   }
 }
 
+/** The files the pane showing each slot stages now, written by that pane on
+ *  mount and on every change, so a late reader (a queue cancel confirmed
+ *  after its pane was replaced) sees the live pane's files, not an old
+ *  instance's. Keyed by an owner token: an old pane's cleanup cannot clear
+ *  the entry the pane that replaced it wrote. */
+const liveStaged = new Map<string, { owner: object; files: readonly string[] }>()
+
+export function setLivePaneStaged(slot: string, owner: object, files: readonly string[]): () => void {
+  liveStaged.set(slot, { owner, files })
+  return () => { if (liveStaged.get(slot)?.owner === owner) liveStaged.delete(slot) }
+}
+
+/** The files `slot` stages: the live pane's when one shows it, else the
+ *  parked draft's. */
+export function paneStagedFiles(slot: string): readonly string[] {
+  return liveStaged.get(slot)?.files ?? readPaneDraft(slot).files
+}
+
+/** The files the composer showing `slot` stages now (a pane or the chat
+ *  page, both publish here), or undefined when none shows it. */
+export function liveStagedFiles(slot: string): readonly string[] | undefined {
+  return liveStaged.get(slot)?.files
+}
+
 /** Whether some pane is showing `slot` right now. */
 export function hasPaneListener(slot: string): boolean {
   return (listeners.get(slot)?.size ?? 0) > 0

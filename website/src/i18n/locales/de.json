@@ -9068,6 +9068,10 @@
       "select_many_rule": "Wähle eine oder mehrere Optionen."
     },
     "queueStack": {
+      "action_refused": "Die wartende Nachricht konnte nicht geändert werden",
+      "cancel_no_reply": "Der Abbruch hat keine Antwort erhalten. Brich erneut ab.",
+      "cancel_unconfirmed": "Der Abbruch hat den Server eventuell nicht erreicht. Prüfe die Unterhaltung, bevor du wiederherstellst.",
+      "restore_to_composer": "In das Eingabefeld zurückholen",
       "cancel_and_move_back_to_input": "Abbrechen und zur Eingabe zurückkehren",
       "cancel_queued_message": "Wartende Nachricht abbrechen",
       "edit_queued_message": "Wartende Nachricht bearbeiten",

@@ -9068,6 +9068,10 @@
       "select_many_rule": "एक या अधिक विकल्प चुनो।"
     },
     "queueStack": {
+      "action_refused": "कतारबद्ध संदेश बदला नहीं जा सका",
+      "cancel_no_reply": "रद्द करने का कोई जवाब नहीं मिला। फिर से रद्द करें।",
+      "cancel_unconfirmed": "हो सकता है रद्द करना सर्वर तक न पहुँचा हो। पुनर्स्थापित करने से पहले बातचीत देखें।",
+      "restore_to_composer": "इनपुट में वापस लाएँ",
       "cancel_and_move_back_to_input": "रद्द करें और इनपुट पर वापस जाएँ",
       "cancel_queued_message": "कतारबद्ध संदेश रद्द करें",
       "edit_queued_message": "कतारबद्ध संदेश संपादित करें",

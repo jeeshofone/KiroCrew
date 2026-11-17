@@ -9293,6 +9293,10 @@
       "select_many_rule": "Choisis une ou plusieurs options."
     },
     "queueStack": {
+      "action_refused": "Impossible de modifier le message en file d'attente",
+      "cancel_no_reply": "L'annulation n'a pas reçu de réponse. Annulez à nouveau.",
+      "cancel_unconfirmed": "L'annulation n'a peut-être pas atteint le serveur. Vérifiez la conversation avant de restaurer.",
+      "restore_to_composer": "Restaurer dans la saisie",
       "cancel_and_move_back_to_input": "Annuler et revenir à la saisie",
       "cancel_queued_message": "Annuler le message en file d'attente",
       "edit_queued_message": "Modifier le message en file d'attente",

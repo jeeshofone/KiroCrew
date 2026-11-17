@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from 'react'
-import { takePaneDraft, takePaneDraftSwap, takePaneDraftReply, writePaneDraft, mergePaneDraft, subscribePaneDraft } from '../utils/chatPaneDrafts'
+import { takePaneDraft, takePaneDraftSwap, takePaneDraftReply, writePaneDraft, mergePaneDraft, subscribePaneDraft, setLivePaneStaged } from '../utils/chatPaneDrafts'
 import { mergeReplyIntoDraft } from '../utils/chatDrafts'
 import { type PasteBlock, mergeCarriedDraft } from '../utils/pasteTokens'
 import { useComposerPastes } from '../chat-core/composer/composerPastes'
@@ -19,6 +19,10 @@ import { useComposerArrivals } from '../utils/composerSendHolds'
 export function useChatPaneDraft(slotKey: string) {
   const [input, setInput] = useState('')
   const [pendingFiles, setPendingFiles] = useState<string[]>([])
+  // What this pane stages, published per slot so a late reader (a queue
+  // cancel the server confirms after this pane was replaced) reads the live one.
+  const stagedOwner = useRef({}).current
+  useEffect(() => setLivePaneStaged(slotKey, stagedOwner, pendingFiles), [slotKey, stagedOwner, pendingFiles])
   const pendingDirs = useMemo(() => parseDirTokens(input).map(t => t.rel), [input])
   // Collapsed paste blocks behind the `[ Paste #N · M lines ]` tokens in
   // `input`: the Paste atom, carried to ChatInput by the Composer root in ChatPane.tsx

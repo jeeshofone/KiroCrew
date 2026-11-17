@@ -9293,6 +9293,10 @@
       "select_many_rule": "Scegli una o più opzioni."
     },
     "queueStack": {
+      "action_refused": "Impossibile modificare il messaggio in coda",
+      "cancel_no_reply": "L'annullamento non ha ricevuto risposta. Annulla di nuovo.",
+      "cancel_unconfirmed": "L'annullamento potrebbe non aver raggiunto il server. Controlla la conversazione prima di ripristinare.",
+      "restore_to_composer": "Ripristina nell'input",
       "cancel_and_move_back_to_input": "Annulla e torna all'input",
       "cancel_queued_message": "Annulla il messaggio in coda",
       "edit_queued_message": "Modifica il messaggio in coda",

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, type MutableRefObject, type RefObject } from 'react'
+import { useCallback, useEffect, useMemo, useRef, type MutableRefObject, type RefObject } from 'react'
 
 import type { ComposerHandle } from '../../../chat-core/composer/Composer'
 import type { ComposerDraftStore } from '../../../chat-core/composer/draftStore'
@@ -11,11 +11,13 @@ import { isNonInteractiveQueued, isSystemDelivery } from '../../../components/Qu
 import { useQueuedMessageActions } from '../../../hooks/useQueuedMessageActions'
 import { useSteerRetract } from '../../../hooks/useSteerRetract'
 import { drainPendingChunks } from '../../../lib/pendingChunkDrain'
-import { store, type AppDispatch } from '../../../store'
+import { store, useAppStore, type AppDispatch } from '../../../store'
+import { slotRowByKey } from '../../../store/slotIndex'
 import { appendMessage, appendSlotMessage, capturePendingAskId, requestStop, selectComposerBusy, selectSendConfirmed, type pendingQuestionFor } from '../../../store/chatSlice'
 import type { ChatMessage, ChatSlot } from '../../../types'
 import { mergeIntoDraft, mergeRecoveredDraft, setDraft } from '../../../utils/chatDrafts'
-import { setFileDraft } from '../../../utils/chatFileDrafts'
+import { loadFileDrafts, setFileDraft } from '../../../utils/chatFileDrafts'
+import { liveStagedFiles, setLivePaneStaged } from '../../../utils/chatPaneDrafts'
 import { restoreToComposer } from '../../../utils/composerRestore'
 import { expandAll as expandPasteTokens } from '../../../utils/pasteTokens'
 import { handleStopPress, isEscalationState } from '../../../utils/stopDebounce'
@@ -65,6 +67,9 @@ interface BusyTurnControlsOptions {
   pendingQuestion: ReturnType<typeof pendingQuestionFor>
   /** Per-slot time of the last soft-stop press (the force-stop arming window). */
   softStopAtMapRef: MutableRefObject<Map<string, number>>
+  /** False while split view draws a composer per cell: the page composer is not
+   *  on screen, so it publishes no staged files (a pane owns that list). */
+  composerOnScreen?: boolean
   dispatch: AppDispatch
   /** Reports a refused slash command on the composer's notice, while its
    *  origin chat is still on screen (the restored text is then right below). */
@@ -102,11 +107,24 @@ export function useBusyTurnControls({
   staging,
   pendingQuestion,
   softStopAtMapRef,
+  composerOnScreen = true,
   dispatch,
   onSlashRefused,
   showActionError,
 }: BusyTurnControlsOptions) {
   const { drafts, fileDrafts, pasteDrafts, sessionRefDrafts, saveDrafts } = stores
+  // The Provider's store: a slot's project is read from it when a cancel confirms.
+  const appStore = useAppStore()
+  // What this page stages, published per slot so a cancel the server confirms
+  // after an older page unmounted spells its mentions against this one. Only
+  // while the page composer is mounted and on screen: in split view a pane owns
+  // the slot's live list, and the page's stale one must not overwrite it.
+  const stagedOwner = useRef({}).current
+  const livePendingFiles = staging.pendingFiles
+  useEffect(
+    () => (activeSlot && composerOnScreen && composerMountedRef.current ? setLivePaneStaged(activeSlot, stagedOwner, livePendingFiles ?? []) : undefined),
+    [activeSlot, stagedOwner, livePendingFiles, composerMountedRef, composerOnScreen],
+  )
   const { pendingFilesRef, pasteBlocksRef, setPasteBlocks, setPendingFiles, pendingSessionsRef, setPendingSessions, pickedFileTokens, mergeSlotTokens } = staging
   const allQueuedMessages = useMemo(() => messages.filter(m => m.role === 'queued'), [messages])
   // Only user-typed queued messages get the interactive (edit/cancel) card
@@ -332,11 +350,23 @@ export function useBusyTurnControls({
   // removes its recovery record after this callback, so a reload between this
   // effect and the composer's next commit must still find the restored draft.
   const restoreQueuedDraft = useCallback(
-    (text: string, files: string[], aliases?: Record<string, string[]>, quote?: MessageQuote) => {
+    (text: string, files: string[], aliases?: Record<string, string[]>, quote?: MessageQuote, forSlot?: string) => {
       // The stash carries the quote the send consumed: back as a staged card
       // when the stage is free, else in the restored text.
-      const recoveredText = messageQuote.recoverInto(text, quote ?? null)
-      const slot = composerSlotRef.current
+      // A queue cancel names the slot it was clicked in: by the server's
+      // answer the composer may show another chat, whose draft stays as it is.
+      const slot = forSlot ?? composerSlotRef.current
+      // Confirmed after this page unmounted: its stores are stale snapshots, so
+      // the restore goes through whichever composer owns the slot now (or the
+      // freshly loaded persisted draft), with the quote folded into the text.
+      // shortcut: the alias snapshot is dropped here (it lives in this page's
+      // stores), so a restored mention may come back as plain text.
+      if (slot && !composerMountedRef.current) {
+        restoreToComposer(slot, messageQuote.recoverInto(text, quote ?? null, false), files)
+        return true
+      }
+      const live = slot === composerSlotRef.current
+      const recoveredText = messageQuote.recoverInto(text, quote ?? null, live)
       if (!slot) {
         setInput(prev => mergeRecoveredDraft(prev, recoveredText))
         return false
@@ -357,6 +387,7 @@ export function useBusyTurnControls({
       // hand-deleted mention left a stale chip the next send re-attached.
       if (aliases) mergeSlotTokens(slot, aliases)
       const stored = saveDrafts()
+      if (!live) return stored
       setInput(prev => mergeRecoveredDraft(prev, recoveredText))
       // Chips MERGE like the text does: paths join whatever is already staged,
       // deduped, so a re-send serializes each attachment exactly once.
@@ -366,7 +397,7 @@ export function useBusyTurnControls({
       }
       return stored
     },
-    [mergeSlotTokens, setInput, setPendingFiles, composerSlotRef, messageQuote,
+    [mergeSlotTokens, setInput, setPendingFiles, composerSlotRef, composerMountedRef, messageQuote,
       pendingFilesRef, drafts, fileDrafts, saveDrafts],
   )
   const {
@@ -376,17 +407,25 @@ export function useBusyTurnControls({
     onEditOpen: handleEditOpenQueued,
     onReorder: handleReorderQueued,
     pendingIds: queuePendingIds,
+    refusal: queueRefusal,
+    dismissRefusal: dismissQueueRefusal,
+    unconfirmed: queueUnconfirmed,
   } = useQueuedMessageActions({
     slot: activeSlot,
     allQueued: allQueuedMessages,
     visibleQueued: queuedMessages,
     restoreDraft: restoreQueuedDraft,
-    // The restore merges into this composer, so a mention it writes back is
-    // spelled so it cannot collide with a file already staged here.
-    stagedFiles: () => pendingFilesRef.current,
-    // A mention written back for a project file is spelled relative to this
+    // The restore merges into the clicked slot's draft, so a mention it writes
+    // back is spelled so it cannot collide with a file that slot stages. While
+    // this page is mounted it owns its slots' drafts; once it unmounted, read
+    // the destination: the composer now showing the slot, else its persisted
+    // file draft, freshly loaded.
+    stagedFiles: (forSlot) => composerMountedRef.current
+      ? (forSlot === composerSlotRef.current ? pendingFilesRef.current : (fileDrafts.current[forSlot] ?? []))
+      : (liveStagedFiles(forSlot) ?? loadFileDrafts()[forSlot] ?? []),
+    // A mention written back for a project file is spelled relative to that
     // slot's project, the spelling the composer revives a chip for on undo.
-    project: () => currentSlot?.project,
+    project: (forSlot) => slotRowByKey(appStore.getState().dashboard.slots, forSlot)?.project,
   })
   // Unsend, Edit and Queue instead on a pending steer. An Edit's text comes back
   // through the same merge a cancelled queue card's does.
@@ -501,7 +540,7 @@ export function useBusyTurnControls({
   }
   return {
     queuedMessages, systemDeliveryCount, steer, stopTurn, keepQuestionAnswer, answerQuestionCard,
-    handleCancelQueued, handleInterruptQueued, handleEditQueued, handleEditOpenQueued, handleReorderQueued, queuePendingIds,
+    handleCancelQueued, handleInterruptQueued, handleEditQueued, handleEditOpenQueued, handleReorderQueued, queuePendingIds, queueRefusal, dismissQueueRefusal, queueUnconfirmed,
     handleSteerAction, steerActionPending, steerActionRefusals, steerActionRequestFailures,
   }
 }

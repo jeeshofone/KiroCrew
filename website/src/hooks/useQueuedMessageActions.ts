@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api/client'
-import { useAppDispatch } from '../store'
-import { cancelQueuedMessage, editQueuedMessage, queueEntryAttachments } from '../store/chatSlice'
+import { useAppDispatch, useAppSelector } from '../store'
+import { cancelQueuedMessage, editQueuedMessage, queueEntryAttachments, refreshSlot, warmSlotCache } from '../store/chatSlice'
+import { ApiError } from '../api/apiError'
 import { restoreQueuedContent } from '../utils/fileTokens'
+import { dropUnconfirmedCancel, getUnconfirmedCancel, recordUnconfirmedCancel, useUnconfirmedCancels } from '../utils/unconfirmedCancels'
 import { quoteBlock, readMessageQuote, stripQuoteBlock, type MessageQuote } from '../chat-core/composer/messageQuote'
 import { markDictated } from '../chat-core/composer/dictationProvenance'
 import type { ChatMessage } from '../types'
@@ -49,6 +51,15 @@ export const queuedSendStash = new Map<string, QueuedSendRecord>()
 
 /** The queue-card callbacks `QueueStack` takes, plus the in-flight set it
  *  disables its controls from. */
+/** A cancel or edit the server refused, with its answer, for the host to show. */
+export interface QueueActionRefusal {
+  /** The slot whose queue refused: the host shows it only on that chat. */
+  slot: string
+  queueId: string
+  /** `status` 0 when the request got no HTTP answer. */
+  error: ApiError
+}
+
 export interface QueuedMessageActions {
   onCancel: (queueId: string) => void
   onInterrupt: (queueId: string) => void
@@ -60,8 +71,31 @@ export interface QueuedMessageActions {
    *  does not send the words being changed; a save releases it on its own. */
   onEditOpen: (queueId: string, open: boolean) => void
   onReorder: (queueId: string, direction: 'next' | 'later') => void
+  /** The last cancel or edit the server refused (not a 404, which is the entry
+   *  having already left the queue), shown by the host through `ErrorNotice`
+   *  until `dismissRefusal`. */
+  refusal: QueueActionRefusal | null
+  dismissRefusal: () => void
   /** Feed straight to `QueueStack`'s `pendingIds`. */
   pendingIds: ReadonlySet<string>
+  /** Cancels whose DELETE got no HTTP answer: they may or may not have landed,
+   *  so the client decides nothing and keeps each entry's own payload until the
+   *  person restores or dismisses it (`UnconfirmedCancels`). */
+  unconfirmed: UnconfirmedCancels
+}
+
+/** The slot's unconfirmed cancels (`utils/unconfirmedCancels`), for the host to draw. */
+export interface UnconfirmedCancels {
+  /** The entries, as they were at the click. */
+  messages: readonly ChatMessage[]
+  /** Those the server still lists: their queue card keeps Cancel, and the
+   *  host only notes the cancel got no reply. The rest are unconfirmed cards
+   *  with Restore and Dismiss. */
+  listedIds: ReadonlySet<string>
+  /** Put an unlisted entry's text, attachments and quote back, once, and drop it. */
+  onRestore: (queueId: string) => void
+  /** Drop it without touching the composer. */
+  onDismiss: (queueId: string) => void
 }
 
 export interface QueuedMessageActionsOptions {
@@ -90,21 +124,25 @@ export interface QueuedMessageActionsOptions {
    *  or the recovered text refers to attachments the re-send will not carry.
    *  Omitted, the recovered state is dropped, which is what cancelling in a
    *  split pane did before #5891 and what no host should do.
+   *  `forSlot` is the slot the cancel was clicked in: the server confirms
+   *  later, so a host writes that slot's draft and touches its live composer
+   *  only while it still shows that slot.
    */
-  restoreDraft?: (text: string, files: string[], aliases?: Record<string, string[]>, quote?: MessageQuote) => void
-  /** The paths the host composer has staged right now. A cancelled card's
-   *  restore MERGES into that composer, so a mention the parser writes back
+  restoreDraft?: (text: string, files: string[], aliases: Record<string, string[]> | undefined, quote: MessageQuote | undefined, forSlot: string) => void
+  /** The paths the clicked slot has staged when the server confirms: its live
+   *  composer, or its parked draft when the host shows another slot. The
+   *  restore MERGES into that draft, so a mention the parser writes back
    *  must not use a suffix one of those files also has: two cards naming
    *  `x/a.txt` and `y/a.txt`, cancelled in turn, would otherwise both come
-   *  back as `@a.txt` and the next send would bind both to one file. Read at
-   *  cancel time; omitted, the parser only checks the card's own files. */
-  stagedFiles?: () => readonly string[]
-  /** The host composer's project root, read at cancel time. A mention the
+   *  back as `@a.txt` and the next send would bind both to one file.
+   *  Omitted, the parser only checks the card's own files. */
+  stagedFiles?: (forSlot: string) => readonly string[]
+  /** The clicked slot's project root, read when the server confirms. A mention the
    *  parser writes back for a file under it is spelled relative to it, the
    *  way the picker inserts it, because that is the only spelling the
    *  composer revives a chip for when the mention is deleted and undone.
    *  Omitted, the parser uses the shortest unambiguous suffix. */
-  project?: () => string | undefined
+  project?: (forSlot: string) => string | undefined
   /** The host composer's dictation scope (`dictationProvenance`), so a
    *  cancelled dictated card marks the composer it goes back into. */
   dictationScope?: string
@@ -129,10 +167,10 @@ const queueIdOf = (m: ChatMessage): string | undefined => m.meta?.queueId as str
  * deliberately SERVER-AUTHORITATIVE where this one is optimistic — the inverse
  * contract, for a documented reason. See that file, and the PR for #5891.
  *
- * Cancel and edit stay optimistic and still swallow a failed mutation, matching
- * what both hosts did before this hook existed. Item 1 of #5891 — rollback or
- * dispatch-after-success, plus an error surface — is a contract change with two
- * viable answers, and lands here, once, when someone picks one.
+ * Cancel is pessimistic: the card and the composer change only after the server
+ * confirms, because a refused cancel would otherwise leave the message's words
+ * ready to send while it stays queued. Edit stays optimistic. Either one, when
+ * refused, is rebuilt from the server's listing and shown through `refusal`.
  */
 export function useQueuedMessageActions({
   slot,
@@ -145,6 +183,17 @@ export function useQueuedMessageActions({
 }: QueuedMessageActionsOptions): QueuedMessageActions {
   const dispatch = useAppDispatch()
   const [pendingIds, setPendingIds] = useState<ReadonlySet<string>>(() => new Set())
+  const [refusal, setRefusal] = useState<QueueActionRefusal | null>(null)
+  const activeSlotRef = useRef<string | null>(null)
+  activeSlotRef.current = useAppSelector(s => s.chat.activeSlot)
+  const dismissRefusal = useCallback(() => setRefusal(null), [])
+  /** Show a failed Send now or reorder: nothing optimistic to undo, so only the
+   *  notice. Every failure shows, a 404 too: these endpoints answer a stale
+   *  entry or order with 400/409, and a 404 means the chat itself is gone. */
+  const showFailure = useCallback((queueId: string, err: unknown) => {
+    if (!slot) return
+    setRefusal({ slot, queueId, error: err instanceof ApiError ? err : new ApiError(0, err instanceof Error ? err.message : String(err)) })
+  }, [slot])
 
   // Reads happen inside callbacks that must NOT be re-created when the queue
   // changes: `QueueStack` is memo-compared on callback identity, so a new
@@ -213,83 +262,137 @@ export function useQueuedMessageActions({
   // useQueuedMessageActions.test.tsx pins that release survives the remount.
   /** Latch the card for the life of the request so a second click cannot fire a
    *  duplicate, releasing on either outcome. Used by the two actions whose
-   *  optimistic dispatch settles the card itself: cancel retires it and edit
-   *  rewrites it, so the response is the whole story and there is nothing left
-   *  to wait for.
+   *  response settles the card: cancel retires it once confirmed and edit
+   *  rewrites it, so there is nothing left to wait for.
    *
-   *  The failure path stays silent, matching what both hosts did before this
-   *  hook existed and leaving item 1 of #5891 to decide otherwise. It must still
-   *  release, or one lost request freezes a card until the queue drains. */
+   *  A refused cancel or edit rebuilds the cards from the server and shows
+   *  why (`reconcileOnRefusal`). It must still release, or one lost request
+   *  freezes a card until the queue drains. */
   const run = useCallback((queueId: string, call: Promise<unknown>) => {
     markPending(queueId, true)
     const release = () => markPending(queueId, false)
     call.then(release, release)
   }, [markPending])
 
-  const onCancel = useCallback((queueId: string) => {
+  /** After a cancel or edit the server refused, rebuild the slot's queued
+   *  cards from the server's own listing, so their order, text and `written`
+   *  mark are the server's, not a guess. Any failure but a 404 (the entry
+   *  having left the queue) is kept as `refusal` for the host to show on that
+   *  chat. The composer is never touched here: a cancel only fills it once the
+   *  server has confirmed (`onCancel`). */
+  const reconcileOnRefusal = useCallback((queueId: string, call: Promise<unknown>, lostShownByCard = false) => {
     if (!slot) return
-    const msg = allQueuedRef.current.find(m => queueIdOf(m) === queueId)
+    // The open chat refetches through `refreshSlot`; any other slot (a pane's)
+    // through `warmSlotCache`, which rebuilds that slot's cached rows.
+    const refetch = () => {
+      if (activeSlotRef.current === slot) void dispatch(refreshSlot({ key: slot }))
+      else void dispatch(warmSlotCache(slot))
+    }
+    call.catch(err => {
+      refetch()
+      // No HTTP answer, or 404, on a cancel: its kept entry says so instead.
+      const status = err instanceof ApiError ? err.status : 0
+      if (lostShownByCard && (status === 0 || status === 404)) return
+      if (err instanceof ApiError && err.status === 404) return
+      // `status` 0: no HTTP answer, so it may or may not have landed.
+      setRefusal({ slot, queueId, error: err instanceof ApiError ? err : new ApiError(0, err instanceof Error ? err.message : String(err)) })
+    })
+  }, [slot, dispatch])
+
+  /** Put a cancelled entry's text, attachments and quote into its slot's draft.
+   *  `project` and `dictationScope` are the slot's (read at the click for an
+   *  unconfirmed cancel, which may be restored long after). */
+  const restoreEntry = useCallback((slot: string, queueId: string, msg: ChatMessage | undefined, project: string | undefined, dictationScope: string | undefined) => {
     // An app-authored entry is cancellable (that is the user's undo for an
     // unwanted app message) but never draft-restored: merging the app
     // envelope into the human composer would corrupt the draft AND launder
     // app text into user authorship on the next send.
     const isAppEntry = (msg?.meta?.kind as string) === 'mcp_app_message'
-    if (msg?.content && !isAppEntry) {
-      // Restore by QUEUE IDENTITY: the record was stored under the queue id
-      // the send receipt returned, which is the id this cancel carries — so a
-      // hit is this card's own pre-send state by construction, whatever its
-      // content collides with (duplicate texts, erased-image-token captions,
-      // other tabs). The record is consumed either way; `sent` guards the one
-      // same-id hazard (see QueuedSendRecord). No stash hit — a reload,
-      // another tab's card, an edited entry — falls to the strict parser,
-      // handed the entry's own attachment list when the server echoed one
-      // on the row (`meta.files`, the same list a user row carries): with
-      // it the parser matches each marker by exact text, so a spaced path
-      // restores whole and an inline marker comes back as an `@` mention;
-      // without it the parser claims only byte-exact round-trippable shapes
-      // and is never worse than the verbatim restore this replaced.
-      const stashed = queuedSendStash.get(queueId)
-      if (stashed) queuedSendStash.delete(queueId)
-      const hit = stashed && stashed.sent === msg.content
-      // A stash hit restores `raw`, which never carried the dictation note, and
-      // says whether its words were dictated, so the provenance goes back with
-      // it. Without a stash nothing records that, and the card's text is
-      // restored as it stands: a dictation note in it stays visible rather than
-      // being guessed at, since the same words could be ones the user typed.
-      if (hit && stashed.dictated) markDictated(slot, dictationScopeRef.current)
-      const content = msg.content
-      // Without a stash hit the row's own `meta.quote` (the gateway carries
-      // it on the entry) is the quote, and its block comes off the head of
-      // the parsed text so the host restages a card, not raw `>` lines.
-      // Accepted only while its block still opens the text: a record the
-      // row kept past an edit that deleted the block is not restaged.
-      const rowMetaQuote = hit ? null : readMessageQuote(msg.meta as Record<string, unknown> | undefined)
-      const rowQuote = rowMetaQuote && content.startsWith(quoteBlock(rowMetaQuote)) ? rowMetaQuote : undefined
-      // The block comes off BEFORE the parse: the parser's producer-block
-      // patterns are anchored at offset 0, so a quote on the head would hide
-      // an image block behind it and the file would restore as literal text.
-      const parsed = hit
-        ? { text: stashed.raw, files: stashed.files, aliases: stashed.aliases }
-        : restoreQueuedContent(
-          rowQuote ? stripQuoteBlock(content, rowQuote) : content,
-          queueEntryAttachments(msg.meta).files,
-          stagedFilesRef.current?.(),
-          projectRef.current?.(),
-        )
-      const { files, text, aliases } = parsed
-      // The stash carries the alias map the send-clear dropped. The parser
-      // carries one only for a mention it wrote back from an inline marker
-      // (the entry's list proved the path), so that chip and mention stay
-      // reconciled too; any other parser restore has none, which falls into
-      // the documented reload-limitation class rather than corrupting.
-      const quote = hit ? stashed.quote : rowQuote
-      if (quote) restoreDraftRef.current?.(text, files, aliases, quote)
-      else restoreDraftRef.current?.(text, files, aliases)
-    }
-    // Optimistically remove the card; the WS echo is a no-op if already gone.
-    dispatch(cancelQueuedMessage({ slot, queue_id: queueId }))
-    run(queueId, api.cancelQueuedMessage(slot, queueId))
-  }, [slot, dispatch, run])
+    if (!msg?.content || isAppEntry) return
+    // Restore by QUEUE IDENTITY: the record was stored under the queue id
+    // the send receipt returned, which is the id this cancel carries — so a
+    // hit is this card's own pre-send state by construction, whatever its
+    // content collides with (duplicate texts, erased-image-token captions,
+    // other tabs). The record is consumed either way; `sent` guards the one
+    // same-id hazard (see QueuedSendRecord). No stash hit — a reload,
+    // another tab's card, an edited entry — falls to the strict parser,
+    // handed the entry's own attachment list when the server echoed one
+    // on the row (`meta.files`, the same list a user row carries): with
+    // it the parser matches each marker by exact text, so a spaced path
+    // restores whole and an inline marker comes back as an `@` mention;
+    // without it the parser claims only byte-exact round-trippable shapes
+    // and is never worse than the verbatim restore this replaced.
+    const stashed = queuedSendStash.get(queueId)
+    if (stashed) queuedSendStash.delete(queueId)
+    const hit = stashed && stashed.sent === msg.content
+    // A stash hit restores `raw`, which never carried the dictation note, and
+    // says whether its words were dictated, so the provenance goes back with
+    // it. Without a stash nothing records that, and the card's text is
+    // restored as it stands: a dictation note in it stays visible rather than
+    // being guessed at, since the same words could be ones the user typed.
+    if (hit && stashed.dictated) markDictated(slot, dictationScope)
+    const content = msg.content
+    // Without a stash hit the row's own `meta.quote` (the gateway carries
+    // it on the entry) is the quote, and its block comes off the head of
+    // the parsed text so the host restages a card, not raw `>` lines.
+    // Accepted only while its block still opens the text: a record the
+    // row kept past an edit that deleted the block is not restaged.
+    const rowMetaQuote = hit ? null : readMessageQuote(msg.meta as Record<string, unknown> | undefined)
+    const rowQuote = rowMetaQuote && content.startsWith(quoteBlock(rowMetaQuote)) ? rowMetaQuote : undefined
+    // The block comes off BEFORE the parse: the parser's producer-block
+    // patterns are anchored at offset 0, so a quote on the head would hide
+    // an image block behind it and the file would restore as literal text.
+    const parsed = hit
+      ? { text: stashed.raw, files: stashed.files, aliases: stashed.aliases }
+      : restoreQueuedContent(
+        rowQuote ? stripQuoteBlock(content, rowQuote) : content,
+        queueEntryAttachments(msg.meta).files,
+        stagedFilesRef.current?.(slot),
+        project,
+      )
+    const { files, text, aliases } = parsed
+    // The stash carries the alias map the send-clear dropped. The parser
+    // carries one only for a mention it wrote back from an inline marker
+    // (the entry's list proved the path), so that chip and mention stay
+    // reconciled too; any other parser restore has none, which falls into
+    // the documented reload-limitation class rather than corrupting.
+    const quote = hit ? stashed.quote : rowQuote
+    // Into the slot the cancel was clicked in, not whichever is shown now.
+    restoreDraftRef.current?.(text, files, aliases, quote, slot)
+  }, [])
+
+  const onCancel = useCallback((queueId: string) => {
+    if (!slot) return
+    const msg = allQueuedRef.current.find(m => queueIdOf(m) === queueId)
+    // Pessimistic: the card stays (its actions disabled while the request is
+    // in flight) and the composer is untouched until the server confirms. A
+    // refusal then needs no undo, because nothing was put anywhere.
+    const clickProject = projectRef.current?.(slot)
+    const clickScope = dictationScopeRef.current
+    const call = api.cancelQueuedMessage(slot, queueId)
+    // Confirmed: the card goes (the WS echo is a no-op if it is already gone)
+    // and its words go into the clicked slot's draft, live only if shown.
+    call.then(() => {
+      dropUnconfirmedCancel(slot, queueId)
+      dispatch(cancelQueuedMessage({ slot, queue_id: queueId }))
+      restoreEntry(slot, queueId, msg, projectRef.current?.(slot), clickScope)
+    }, err => {
+      // No HTTP status, or 404 (the entry left the queue, cancelled or sent):
+      // no answer, so the client decides nothing and keeps the payload in the
+      // shared registry for the person. While the listing still holds the
+      // entry its ordinary card keeps Cancel; once it is gone the host draws
+      // the unconfirmed card. Any other status is a refusal and settles it.
+      const status = err instanceof ApiError ? err.status : 0
+      if (msg && (status === 0 || status === 404)) {
+        const kept = getUnconfirmedCancel(slot, queueId)
+        recordUnconfirmedCancel(kept ?? { slot, queueId, msg, project: clickProject, dictationScope: clickScope })
+        return
+      }
+      dropUnconfirmedCancel(slot, queueId)
+    })
+    reconcileOnRefusal(queueId, call, !!msg)
+    run(queueId, call)
+  }, [slot, dispatch, run, reconcileOnRefusal, restoreEntry])
 
   const onInterrupt = useCallback((queueId: string) => {
     if (!slot) return
@@ -307,10 +410,13 @@ export function useQueuedMessageActions({
         setHeldUntilRetired(prev => (prev.has(queueId) ? prev : new Set(prev).add(queueId)))
       },
       // Rejected: nothing was promoted and the card is still the same card, so
-      // release at once and let the user try again.
-      () => markPending(queueId, false),
+      // release at once, say why, and let the user try again.
+      (err: unknown) => {
+        markPending(queueId, false)
+        showFailure(queueId, err)
+      },
     )
-  }, [slot, markPending])
+  }, [slot, markPending, showFailure])
 
   // One card's hold, save and release go out one after another: sent side by
   // side, a close could reach the server before its own open and leave a hold
@@ -332,13 +438,14 @@ export function useQueuedMessageActions({
     const trimmed = content.trim()
     if (!trimmed) return
     // Optimistically update the card; the WS event reconciles other clients.
-    dispatch(editQueuedMessage({ slot, queue_id: queueId, content: trimmed, ...(pastes ? { pastes } : {}) }))
     const save = inOrder(slot, queueId, () => api.editQueuedMessage(slot, queueId, trimmed))
+    reconcileOnRefusal(queueId, save)
+    dispatch(editQueuedMessage({ slot, queue_id: queueId, content: trimmed, ...(pastes ? { pastes } : {}) }))
     // A refused or lost save never reaches the server's release, so the hold
     // its open editor placed is released here instead of waiting out the deadline.
     save.catch(() => inOrder(slot, queueId, () => api.holdQueuedMessageEdit(slot, queueId, false)).catch(() => undefined))
     run(queueId, save)
-  }, [slot, dispatch, run, inOrder])
+  }, [slot, dispatch, run, inOrder, reconcileOnRefusal])
 
   // Fire-and-forget like the rest: a failed hold leaves the drain as it was
   // before holds existed, and a 404 means the entry already left the queue.
@@ -369,11 +476,32 @@ export function useQueuedMessageActions({
     // inside QueueStack: with no optimistic move, a latch would freeze the arrows
     // on a card that has not visibly moved yet, and the repeat it would block is
     // an identical full-order PUT the server can absorb.
-    api.reorderQueuedMessages(slot, next).catch(() => undefined)
+    api.reorderQueuedMessages(slot, next).catch((err: unknown) => showFailure(queueId, err))
+  }, [slot, showFailure])
+
+  // Every host showing the slot draws the shared registry's entries.
+  const lost = useUnconfirmedCancels(slot)
+  const listedIds = useMemo(() => new Set(allQueued.map(queueIdOf).filter((id): id is string => !!id)), [allQueued])
+  const onRestoreUnconfirmed = useCallback((queueId: string) => {
+    if (!slot) return
+    const entry = getUnconfirmedCancel(slot, queueId)
+    // Never while the server still lists it: that entry is still queued.
+    if (!entry || allQueuedRef.current.some(m => queueIdOf(m) === queueId)) return
+    dropUnconfirmedCancel(slot, queueId)
+    restoreEntry(slot, queueId, entry.msg, entry.project, entry.dictationScope)
+  }, [slot, restoreEntry])
+  const onDismissUnconfirmed = useCallback((queueId: string) => {
+    if (slot) dropUnconfirmedCancel(slot, queueId)
   }, [slot])
+  const unconfirmed = useMemo<UnconfirmedCancels>(() => ({
+    messages: lost.map(e => e.msg),
+    listedIds: new Set(lost.map(e => e.queueId).filter(id => listedIds.has(id))),
+    onRestore: onRestoreUnconfirmed,
+    onDismiss: onDismissUnconfirmed,
+  }), [lost, listedIds, onRestoreUnconfirmed, onDismissUnconfirmed])
 
   return useMemo(
-    () => ({ onCancel, onInterrupt, onEdit, onEditOpen, onReorder, pendingIds }),
-    [onCancel, onInterrupt, onEdit, onEditOpen, onReorder, pendingIds],
+    () => ({ onCancel, onInterrupt, onEdit, onEditOpen, onReorder, pendingIds, refusal: refusal?.slot === slot ? refusal : null, dismissRefusal, unconfirmed }),
+    [onCancel, onInterrupt, onEdit, onEditOpen, onReorder, pendingIds, refusal, slot, dismissRefusal, unconfirmed],
   )
 }

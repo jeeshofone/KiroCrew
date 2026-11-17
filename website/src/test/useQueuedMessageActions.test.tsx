@@ -111,7 +111,7 @@ describe('useQueuedMessageActions — cancel', () => {
     const { get, store } = renderActions({ restoreDraft })
     await act(async () => { get().onCancel('q1') })
     // Plain text round-trips the parser unchanged, with nothing to re-stage.
-    expect(restoreDraft).toHaveBeenCalledWith('run the tests', [], undefined)
+    expect(restoreDraft).toHaveBeenCalledWith('run the tests', [], undefined, undefined, 'chat-1')
     expect(apiMocks.cancelQueuedMessage).toHaveBeenCalledWith('chat-1', 'q1')
     // Optimistic: the card is gone without waiting for the WS echo.
     expect(queueIdsIn(store)).toEqual(['q2'])
@@ -129,7 +129,7 @@ describe('useQueuedMessageActions — cancel', () => {
     queuedSendStash.set('q1', { raw: 'summarize this', files: [spaced], sent })
     const { get } = renderActions({ rows, restoreDraft })
     await act(async () => { get().onCancel('q1') })
-    expect(restoreDraft).toHaveBeenCalledWith('summarize this', [spaced], undefined)
+    expect(restoreDraft).toHaveBeenCalledWith('summarize this', [spaced], undefined, undefined, 'chat-1')
     // Consumed: a record restores exactly once.
     expect(queuedSendStash.has('q1')).toBe(false)
   })
@@ -141,7 +141,7 @@ describe('useQueuedMessageActions — cancel', () => {
     const rows = [queued('q1', `book the room\n\n${DICTATION_NOTE}`)]
     const { get } = renderActions({ rows, restoreDraft })
     await act(async () => { get().onCancel('q1') })
-    expect(restoreDraft).toHaveBeenCalledWith(`book the room\n\n${DICTATION_NOTE}`, [], undefined)
+    expect(restoreDraft).toHaveBeenCalledWith(`book the room\n\n${DICTATION_NOTE}`, [], undefined, undefined, 'chat-1')
     expect(isDictated('chat-1')).toBe(false)
   })
 
@@ -151,7 +151,7 @@ describe('useQueuedMessageActions — cancel', () => {
     queuedSendStash.set('q1', { raw: 'book the room', files: [], sent, dictated: true })
     const { get } = renderActions({ rows: [queued('q1', sent)], restoreDraft })
     await act(async () => { get().onCancel('q1') })
-    expect(restoreDraft).toHaveBeenCalledWith('book the room', [], undefined)
+    expect(restoreDraft).toHaveBeenCalledWith('book the room', [], undefined, undefined, 'chat-1')
     expect(isDictated('chat-1')).toBe(true)
   })
 
@@ -170,7 +170,7 @@ describe('useQueuedMessageActions — cancel', () => {
     const rows = [{ ...row, meta: { ...(row.meta ?? {}), quote } }]
     const { get } = renderActions({ rows, restoreDraft })
     await act(async () => { get().onCancel('q1') })
-    expect(restoreDraft).toHaveBeenCalledWith('why?', [], undefined, quote)
+    expect(restoreDraft).toHaveBeenCalledWith('why?', [], undefined, quote, 'chat-1')
   })
 
   it('a row whose text was edited past its quote block restages no quote from the stale record', async () => {
@@ -180,7 +180,7 @@ describe('useQueuedMessageActions — cancel', () => {
     const rows = [{ ...row, meta: { ...(row.meta ?? {}), quote } }]
     const { get } = renderActions({ rows, restoreDraft })
     await act(async () => { get().onCancel('q1') })
-    expect(restoreDraft).toHaveBeenCalledWith('why?', [], undefined)
+    expect(restoreDraft).toHaveBeenCalledWith('why?', [], undefined, undefined, 'chat-1')
   })
 
   it('a stash hit hands the consumed whole-message quote back, so the host restages the card', async () => {
@@ -191,7 +191,7 @@ describe('useQueuedMessageActions — cancel', () => {
     queuedSendStash.set('q1', { raw: 'why?', files: [], sent, quote })
     const { get } = renderActions({ rows, restoreDraft })
     await act(async () => { get().onCancel('q1') })
-    expect(restoreDraft).toHaveBeenCalledWith('why?', [], undefined, quote)
+    expect(restoreDraft).toHaveBeenCalledWith('why?', [], undefined, quote, 'chat-1')
   })
 
   it('a stash hit hands the alias map back so restored mentions stay reconciled (fork GPT review)', async () => {
@@ -206,7 +206,7 @@ describe('useQueuedMessageActions — cancel', () => {
     queuedSendStash.set('q1', { raw: 'check @src/main.ts', files: ['/repo/src/main.ts'], sent, aliases })
     const { get } = renderActions({ rows, restoreDraft })
     await act(async () => { get().onCancel('q1') })
-    expect(restoreDraft).toHaveBeenCalledWith('check @src/main.ts', ['/repo/src/main.ts'], aliases)
+    expect(restoreDraft).toHaveBeenCalledWith('check @src/main.ts', ['/repo/src/main.ts'], aliases, undefined, 'chat-1')
   })
 
   it('an entry edited after send fails the `sent` guard and falls to the parser', async () => {
@@ -217,7 +217,7 @@ describe('useQueuedMessageActions — cancel', () => {
     queuedSendStash.set('q1', { raw: 'summarize this', files: ['/tmp/a.pdf'], sent: 'summarize this\n[attached_file 1] /tmp/a.pdf' })
     const { get } = renderActions({ rows, restoreDraft })
     await act(async () => { get().onCancel('q1') })
-    expect(restoreDraft).toHaveBeenCalledWith('actually, deploy instead', [], undefined)
+    expect(restoreDraft).toHaveBeenCalledWith('actually, deploy instead', [], undefined, undefined, 'chat-1')
   })
 
   it('a foreign card (no stash record) decomposes producer markers via the parser', async () => {
@@ -227,7 +227,7 @@ describe('useQueuedMessageActions — cancel', () => {
     const rows = [queued('q1', 'summarize the report\n[attached_file 1] /tmp/report.docx')]
     const { get } = renderActions({ rows, restoreDraft })
     await act(async () => { get().onCancel('q1') })
-    expect(restoreDraft).toHaveBeenCalledWith('summarize the report', ['/tmp/report.docx'], undefined)
+    expect(restoreDraft).toHaveBeenCalledWith('summarize the report', ['/tmp/report.docx'], undefined, undefined, 'chat-1')
   })
 
   it('a foreign card carrying the entry\'s attachment list restores a spaced path whole', async () => {
@@ -242,7 +242,7 @@ describe('useQueuedMessageActions — cancel', () => {
     const rows = [{ ...queued('q1', sent), meta: { queueId: 'q1', files: [spaced] } } as ChatMessage]
     const { get } = renderActions({ rows, restoreDraft })
     await act(async () => { get().onCancel('q1') })
-    expect(restoreDraft).toHaveBeenCalledWith('summarize this', [spaced], undefined)
+    expect(restoreDraft).toHaveBeenCalledWith('summarize this', [spaced], undefined, undefined, 'chat-1')
   })
 
   it('the same foreign card WITHOUT the list keeps the marker verbatim (legacy entry)', async () => {
@@ -251,7 +251,7 @@ describe('useQueuedMessageActions — cancel', () => {
     const restoreDraft = vi.fn()
     const { get } = renderActions({ rows: [queued('q1', sent)], restoreDraft })
     await act(async () => { get().onCancel('q1') })
-    expect(restoreDraft).toHaveBeenCalledWith(sent, [], undefined)
+    expect(restoreDraft).toHaveBeenCalledWith(sent, [], undefined, undefined, 'chat-1')
   })
 
   it('a foreign card with an inline mention restores the mention, the chip and its alias (#14617)', async () => {
@@ -264,7 +264,7 @@ describe('useQueuedMessageActions — cancel', () => {
     const rows = [{ ...queued('q1', sent), meta: { queueId: 'q1', files: ['/repo/a.txt'] } } as ChatMessage]
     const { get } = renderActions({ rows, restoreDraft })
     await act(async () => { get().onCancel('q1') })
-    expect(restoreDraft).toHaveBeenCalledWith('check @a.txt, please', ['/repo/a.txt'], { '/repo/a.txt': ['@a.txt'] })
+    expect(restoreDraft).toHaveBeenCalledWith('check @a.txt, please', ['/repo/a.txt'], { '/repo/a.txt': ['@a.txt'] }, undefined, 'chat-1')
   })
 
   it('spells a restored mention past the files the host composer already stages', async () => {
@@ -276,7 +276,7 @@ describe('useQueuedMessageActions — cancel', () => {
     const rows = [{ ...queued('q1', sent), meta: { queueId: 'q1', files: ['/repo/y/a.txt'] } } as ChatMessage]
     const { get } = renderActions({ rows, restoreDraft, stagedFiles: () => ['/repo/x/a.txt'] })
     await act(async () => { get().onCancel('q1') })
-    expect(restoreDraft).toHaveBeenCalledWith('against @y/a.txt', ['/repo/y/a.txt'], { '/repo/y/a.txt': ['@y/a.txt'] })
+    expect(restoreDraft).toHaveBeenCalledWith('against @y/a.txt', ['/repo/y/a.txt'], { '/repo/y/a.txt': ['@y/a.txt'] }, undefined, 'chat-1')
   })
 
   it('spells a restored mention of a project file relative to the host project', async () => {
@@ -287,7 +287,7 @@ describe('useQueuedMessageActions — cancel', () => {
     const rows = [{ ...queued('q1', sent), meta: { queueId: 'q1', files: ['/repo/main/src/a.ts'] } } as ChatMessage]
     const { get } = renderActions({ rows, restoreDraft, project: () => '/repo/main' })
     await act(async () => { get().onCancel('q1') })
-    expect(restoreDraft).toHaveBeenCalledWith('check @src/a.ts', ['/repo/main/src/a.ts'], { '/repo/main/src/a.ts': ['@src/a.ts'] })
+    expect(restoreDraft).toHaveBeenCalledWith('check @src/a.ts', ['/repo/main/src/a.ts'], { '/repo/main/src/a.ts': ['@src/a.ts'] }, undefined, 'chat-1')
   })
 
   it('an entry edited to drop its first attachment restores the renumbered survivor from the replaced list', async () => {
@@ -305,7 +305,7 @@ describe('useQueuedMessageActions — cancel', () => {
     queuedSendStash.set('q1', { raw: '', files: [other, spaced], sent })
     const { get } = renderActions({ rows, restoreDraft })
     await act(async () => { get().onCancel('q1') })
-    expect(restoreDraft).toHaveBeenCalledWith('', [spaced], undefined)
+    expect(restoreDraft).toHaveBeenCalledWith('', [spaced], undefined, undefined, 'chat-1')
   })
 
   it('the stash still wins over the row list — it holds the typed text itself', async () => {
@@ -317,7 +317,7 @@ describe('useQueuedMessageActions — cancel', () => {
     queuedSendStash.set('q1', { raw: sent, files: [spaced], sent: wire })
     const { get } = renderActions({ rows, restoreDraft })
     await act(async () => { get().onCancel('q1') })
-    expect(restoreDraft).toHaveBeenCalledWith(sent, [spaced], undefined)
+    expect(restoreDraft).toHaveBeenCalledWith(sent, [spaced], undefined, undefined, 'chat-1')
   })
 
   it('restores nothing when the host supplies no composer sink', async () => {

@@ -59,6 +59,8 @@ import { useStableCallbackProps } from '../useStableCallbackProps'
 import type { ComposerTypingLock } from '../shared-crew/useComposerTypingLock'
 import SessionControlHost from '../../../components/SessionControlHost'
 import ErrorNotice from '../../../components/ErrorNotice'
+import type { QueueActionRefusal, UnconfirmedCancels as UnconfirmedCancelsState } from '../../../hooks/useQueuedMessageActions'
+import { UnconfirmedCancels } from '../../../components/UnconfirmedCancels'
 import KiroSignInPrompt from '../../../components/KiroSignInPrompt'
 import { pinIsWithheld } from '../../../lib/model'
 import FollowUpCard, { type FollowupStartMode } from '../../../components/FollowUpCard'
@@ -287,6 +289,10 @@ interface ComposerDockViewProps {
   keepQuestionAnswer: (text: string, questions?: { question: string; }[]) => void
   queuedMessages: ChatMessage[]
   queuePendingIds: ReadonlySet<string>
+  /** A cancel or edit the server refused, shown above the queue cards. */
+  queueRefusal: QueueActionRefusal | null
+  dismissQueueRefusal: () => void
+  queueUnconfirmed?: UnconfirmedCancelsState
   steer: (opts?: { auto?: boolean; text?: string; }) => void
   stopTurn: () => void
   systemDeliveryCount: number
@@ -353,7 +359,7 @@ export default function ComposerDockView({
   followupStartInNewChat, followupStartInWorktree, displayMode, _modelPinActive, _modelPinAgent, _modelPinPinned, _pinShownModel, _slotProject, defaultEffort, effectiveEffort, effortLevelsOverride,
   effortSupported, effortAutoNote = false, ultracode, fastMode, fastUnavailable, modelMarker, pinModelToAgentMut, projectBranch, projectGit, projectGitError, shownModel, cardOwnsRecovery, resumeAfterSignIn, continuable, continuing, handleContinue, interrupted, dockGutter, dockRef,
   endQuoteFlight, flyingQuote, inputAreaRef, isAtBottom, answerQuestionCard, handleCancelQueued, handleEditQueued, handleEditOpenQueued, handleInterruptQueued, handleReorderQueued, keepQuestionAnswer, queuedMessages,
-  queuePendingIds, steer, stopTurn, systemDeliveryCount, handleEditLastRequest, composerOptimizing, handleOptimizingChange, memorySwitching, showComposerMemoryChip, switchMemoryMode, composerAbove, typingLock, composerPresence,
+  queuePendingIds, queueRefusal, dismissQueueRefusal, queueUnconfirmed, steer, stopTurn, systemDeliveryCount, handleEditLastRequest, composerOptimizing, handleOptimizingChange, memorySwitching, showComposerMemoryChip, switchMemoryMode, composerAbove, typingLock, composerPresence,
   composerSessionControls, crewModeOffered, crewModeMidChatOffered = false, turnOnCrewMode, turnOffCrewMode, crewModeSwitching = null, agentPickerHidden = false, crewChipPressed = false, agentSwitchLocked = false, steerWorker, steerWorkerRoot = '',
 }: ComposerDockViewProps) {
   // A chat on a Session Environment runs in its workspace; see ChatPane.
@@ -425,6 +431,30 @@ export default function ComposerDockView({
                 `right: dockGutter` keeps the scrollbar column clear (above). */}
             <div ref={dockRef} className="absolute left-0 bottom-0 pointer-events-none" style={{ right: dockGutter }} data-testid="composer-dock-root" {...{ [SELECTION_INERT_ATTR]: '' }} data-scroll-peek-stop="">
               <JumpToBottomButton visible={!isAtBottom && messages.length > 0} onClick={() => scrollBottom(true)} />
+              {/* No hand-off: the composer below holds this chat's unsaved draft,
+                  which a hand-off would unmount. A refused queue cancel or edit
+                  says why here, above the status stack (whose children are
+                  pinned) and in the composer's column. `dock-inert` gives it
+                  back the pointer events the dock root turns off. */}
+              {queueRefusal && (
+                <div className="dock-inert">
+                  <div className="mx-auto w-full px-4 mb-1" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
+                    <ErrorNotice
+                      message={queueRefusal.error.message}
+                      title={i18nT('components.queueStack.action_refused')}
+                      onDismiss={dismissQueueRefusal}
+                      testId="queue-action-refused"
+                    />
+                  </div>
+                </div>
+              )}
+              {queueUnconfirmed && queueUnconfirmed.messages.length > 0 && (
+                <div className="dock-inert">
+                  <div className="mx-auto w-full mb-1" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
+                    <UnconfirmedCancels {...queueUnconfirmed} />
+                  </div>
+                </div>
+              )}
               {/* Status chrome never claims more than half the pane. The dock
                   is anchored to the pane's bottom edge and grows upward, so an
                   opening keyboard — which shrinks the layout viewport — would

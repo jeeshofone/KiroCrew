@@ -36,6 +36,7 @@ import { Btn } from './ui'
 import ChatDropOverlay from './ChatDropOverlay'
 import PaneDim from './PaneDim'
 import PendingQuestionCard from './PendingQuestionCard'
+import { UnconfirmedCancels } from './UnconfirmedCancels'
 import QueueStack, { SubagentDeliveryProgress, splitPaneMessages } from './QueueStack'
 import McpLoadingBar from '../pages/chat/McpLoadingBar'
 import SubagentProgressBar from '../pages/chat/SubagentProgressBar'
@@ -62,7 +63,8 @@ import { selectionCapabilitiesFailed } from '../lib/effort'
 import { isUnpinnedModel } from '../lib/jevRoute'
 import { useQueuedMessageActions } from '../hooks/useQueuedMessageActions'
 import { usePinnedScrollOrigin } from '../hooks/usePinnedScrollOrigin'
-import { useAppSelector, useAppDispatch, store } from '../store'
+import { useAppSelector, useAppDispatch, useAppStore, store } from '../store'
+import { paneStagedFiles } from '../utils/chatPaneDrafts'
 import { PANE_HYDRATE_LIMIT, selectSlotMessages, selectSlotStreamState, selectSlotToolLog, selectComposerBusy, hydrateSlotMessages, clearSlotHydrated, holdHydratedSlotPane, appendSlotMessage, loadOlderMessages, loadOlderSlotMessages, stageToMainComposer, pendingQuestionFor } from '../store/chatSlice'
 import { deriveFollowUpOptions } from '../app-sdk/protocol'
 import { appendFollowUpOption, removeFollowUpOption, selectSingleFollowUpOption, type OwnedSuffix } from '../lib/followUpToggle'
@@ -154,7 +156,7 @@ export default function ChatPane({
   const draft = useChatPaneDraft(slotKey)
   const {
     input, setInput, pendingFiles, setPendingFiles, pendingDirs, composerPastes, carryIntoComposer,
-    slotKeyRef, inputRef, pendingFilesRef, mountedRef, restoreIntoComposer,
+    slotKeyRef, inputRef, mountedRef, restoreIntoComposer,
   } = draft
   // In-pane report of a title rename / regenerate that did not land (#9727):
   // the main header routes the same failure into its action banner.
@@ -225,6 +227,7 @@ export default function ChatPane({
   // has_more freezes at mount while a later bounded warm can truncate the cache.
   const warmHasMore = useAppSelector((s) => s.chat.slotPaneHasMore?.[slotKey])
   const paneSlot = useAppSelector((s) => slotRowByKey(s.dashboard.slots, slotKey))
+  const appStore = useAppStore()
   // Children accepted but still queued behind the spawn caps: delegated work the
   // slots frame's `subagents_running` does not count. Read only as the pill
   // seam's `delegatedOnly` input, so this caption and the header pill resolve
@@ -365,11 +368,17 @@ export default function ChatPane({
   // can be seconds away. `busy` alone is the store's word, and the store has
   // no pending-turn mark for a slot that is not the active one.
   const composerBusy = busy || awaitingReply
+  // A crewmate's chat draws a queued message as the person's own bubble, which
+  // the next drain sends. A held entry (the server's `meta.held`) is the
+  // exception: no drain sends it, so it keeps the queue card and its send, edit
+  // and cancel controls.
+  const crewmateHeldQueue = useMemo(() => (crewmate ? queuedMessages.filter(m => m.meta?.held === true) : []), [crewmate, queuedMessages])
+  const crewmateBubbleQueue = useMemo(() => queuedMessages.filter(m => !crewmateHeldQueue.includes(m)), [queuedMessages, crewmateHeldQueue])
   // Queued rows are drawn in place from the slot's full row list, so a parked
   // message sits where it was sent (`withQueuedAsBubbles`).
   const messages = useMemo(
-    () => (crewmate ? filterCrewmateChatWithBrowser(withQueuedAsBubbles(allMessages, queuedMessages)) : paneMessages),
-    [crewmate, allMessages, paneMessages, queuedMessages],
+    () => (crewmate ? filterCrewmateChatWithBrowser(withQueuedAsBubbles(allMessages, crewmateBubbleQueue)) : paneMessages),
+    [crewmate, allMessages, paneMessages, crewmateBubbleQueue],
   )
   // A queued turn opens without the composer going idle (#20350).
   const projectTurnKey = useMemo(() => stagedProjectTurnKey(messages), [messages])
@@ -757,10 +766,14 @@ export default function ChatPane({
     onEditOpen: onEditOpenQueued,
     onReorder: onReorderQueued,
     pendingIds: queuePendingIds,
+    refusal: queueRefusal,
+    dismissRefusal: dismissQueueRefusal,
+    unconfirmed: queueUnconfirmed,
   } = useQueuedMessageActions({
     slot: slotKey,
     allQueued: allQueuedMessages,
-    visibleQueued: queuedMessages,
+    // The cards the stack draws, so a reorder moves among the cards on screen.
+    visibleQueued: crewmate ? crewmateHeldQueue : queuedMessages,
     dictationScope: PANE_DICTATION_SCOPE,
     // Adapter: the hook's third argument is the queued send's mention-alias
     // snapshot, which only ChatPage's composer can re-adopt (pendingFileTokens
@@ -768,13 +781,18 @@ export default function ChatPane({
     // alias store -- restoreIntoComposer's own third parameter is its
     // paste-block list -- so the adapter pins the two-argument call and the
     // alias map is dropped here by construction rather than misread as pastes.
-    restoreDraft: (text, files, _aliases, quote) => restoreIntoComposer(recoverQuoteInto(text, quote ?? null), files),
-    // restoreIntoComposer merges, so a mention written back must not share a
-    // spelling with a file this pane's composer already stages.
-    stagedFiles: () => pendingFilesRef.current,
-    // Spell a mention for a file in this pane's project the way the pane's
+    // A queue cancel names the slot it was clicked in; restoreIntoComposer
+    // parks the words in that slot's draft when the pane now shows another.
+    restoreDraft: (text, files, _aliases, quote, forSlot = slotKeyRef.current) =>
+      restoreIntoComposer(recoverQuoteInto(text, quote ?? null, mountedRef.current && forSlot === slotKeyRef.current), files, [], forSlot),
+    // restoreIntoComposer merges into the clicked slot's draft, so a mention
+    // written back must not share a spelling with a file that slot stages:
+    // the live pane's showing it (one that replaced this pane included), else
+    // its parked draft.
+    stagedFiles: paneStagedFiles,
+    // Spell a mention for a file in that slot's project the way the pane's
     // picker inserts it, relative to that project.
-    project: () => paneSlot?.project,
+    project: (forSlot) => slotRowByKey(appStore.getState().dashboard.slots, forSlot)?.project,
   })
   // The Crew Mode dispatch-notice reveal is the host's single `onOpenCrewTab`
   // (one reveal path: switch to the card's slot so the panel it opens is that
@@ -1140,9 +1158,23 @@ export default function ChatPane({
             cancellable — hiding real state is worse than showing a card the
             surface did not intend. */}
         {/* A crewmate's chat draws a queued message as the person's own
-            bubble in the thread instead (`withQueuedAsBubbles`). */}
-        {!crewmate && queuedMessages.length > 0 && (
-          <QueueStack key={slotKey} messages={queuedMessages} onCancel={onCancelQueued} onInterrupt={crewmate ? undefined : onInterruptQueued} onEdit={onEditQueued} onEditOpen={onEditOpenQueued} onReorder={onReorderQueued} pendingIds={queuePendingIds} />
+            bubble in the thread instead (`withQueuedAsBubbles`), all but a
+            held entry, which waits here for the person to act on it. */}
+        {/* No hand-off: the composer holds this pane's unsaved draft, which a
+            hand-off would unmount. A refused cancel or edit says why here. */}
+        {queueRefusal && (
+          <div className="px-4">
+            <ErrorNotice
+              message={queueRefusal.error.message}
+              title={i18nT('components.queueStack.action_refused')}
+              onDismiss={dismissQueueRefusal}
+              testId="queue-action-refused"
+            />
+          </div>
+        )}
+        <UnconfirmedCancels {...queueUnconfirmed} />
+        {(crewmate ? crewmateHeldQueue : queuedMessages).length > 0 && (
+          <QueueStack key={slotKey} messages={crewmate ? crewmateHeldQueue : queuedMessages} onCancel={onCancelQueued} onInterrupt={onInterruptQueued} onEdit={onEditQueued} onEditOpen={onEditOpenQueued} onReorder={onReorderQueued} pendingIds={queuePendingIds} />
         )}
 
         {/* The pending ask_question card shares the message column's gutter and
@@ -1333,8 +1365,7 @@ export default function ChatPane({
           continuable={resume.composerResume}
           continueIsRecovery={resume.interrupted}
           resumeAfterSignIn={resume.resumeAfterSignIn}
-          // A crewmate's chat has no queue card to send (`withQueuedAsBubbles`).
-          restoredQueueCount={crewmate ? 0 : queuedMessages.filter(m => m.meta?.restored === true).length}
+          restoredQueueCount={crewmate ? crewmateHeldQueue.length : queuedMessages.filter(m => m.meta?.restored === true).length}
           onContinue={resume.onContinue}
           continuing={resume.continuing}
           // Steer path on the pane too (it was queue-only before): busy panes

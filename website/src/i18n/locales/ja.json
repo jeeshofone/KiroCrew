@@ -8843,6 +8843,10 @@
       "select_many_rule": "オプションを1つ以上選択してください。"
     },
     "queueStack": {
+      "action_refused": "キューに入っているメッセージを変更できませんでした",
+      "cancel_no_reply": "キャンセルに応答がありませんでした。もう一度キャンセルしてください。",
+      "cancel_unconfirmed": "キャンセルがサーバーに届いていない可能性があります。復元する前に会話を確認してください。",
+      "restore_to_composer": "入力欄に戻す",
       "cancel_and_move_back_to_input": "キャンセルして入力に戻る",
       "cancel_queued_message": "キューに入っているメッセージをキャンセル",
       "edit_queued_message": "キューに入っているメッセージを編集",

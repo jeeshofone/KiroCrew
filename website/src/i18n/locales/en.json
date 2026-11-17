@@ -5669,6 +5669,10 @@
       "submit": "Submit"
     },
     "queueStack": {
+      "action_refused": "Couldn't change the queued message",
+      "cancel_no_reply": "The cancel got no reply. Cancel again.",
+      "cancel_unconfirmed": "The cancel may not have reached the server. Check the conversation before restoring.",
+      "restore_to_composer": "Restore to composer",
       "cancel_and_move_back_to_input": "Cancel and move back to input",
       "cancel_queued_message": "Cancel queued message",
       "edit_queued_message": "Edit queued message",

@@ -8843,6 +8843,10 @@
       "select_many_rule": "옵션을 하나 이상 선택하세요."
     },
     "queueStack": {
+      "action_refused": "대기 중인 메시지를 변경하지 못했습니다",
+      "cancel_no_reply": "취소에 대한 응답이 없습니다. 다시 취소하세요.",
+      "cancel_unconfirmed": "취소가 서버에 도달하지 않았을 수 있습니다. 복원하기 전에 대화를 확인하세요.",
+      "restore_to_composer": "입력창으로 복원",
       "cancel_and_move_back_to_input": "취소하고 입력창으로 되돌리기",
       "cancel_queued_message": "대기 중인 메시지 취소",
       "edit_queued_message": "대기 중인 메시지 편집",

@@ -9293,6 +9293,10 @@
       "select_many_rule": "Elige una o más opciones."
     },
     "queueStack": {
+      "action_refused": "No se pudo cambiar el mensaje en cola",
+      "cancel_no_reply": "La cancelación no obtuvo respuesta. Vuelve a cancelar.",
+      "cancel_unconfirmed": "Puede que la cancelación no haya llegado al servidor. Revisa la conversación antes de restaurar.",
+      "restore_to_composer": "Restaurar en el cuadro de entrada",
       "cancel_and_move_back_to_input": "Cancelar y volver al cuadro de entrada",
       "cancel_queued_message": "Cancelar el mensaje en cola",
       "edit_queued_message": "Editar el mensaje en cola",
