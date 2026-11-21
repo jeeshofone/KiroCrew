@@ -1,12 +1,9 @@
 name: Windows proxy evidence (PR 34175)
 
 on:
+  push:
+    branches: [evidence/34175-windows-proxy]
   workflow_dispatch:
-    inputs:
-      base_sha:
-        description: Upstream commit the candidate patch applies to
-        required: true
-        default: b6091e46a28c5e8e3b65d71c1e711634d58f95c8
 
 permissions:
   contents: read
@@ -33,7 +30,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: kirodotdev/KiroCrew
-          ref: ${{ inputs.base_sha }}
+          ref: b6091e46a28c5e8e3b65d71c1e711634d58f95c8
           path: src
           sparse-checkout: |
             src
