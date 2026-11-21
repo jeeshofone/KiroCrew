@@ -1,0 +1,86 @@
+name: Windows proxy evidence (PR 34175)
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_sha:
+        description: Upstream commit the candidate patch applies to
+        required: true
+        default: b6091e46a28c5e8e3b65d71c1e711634d58f95c8
+
+permissions:
+  contents: read
+
+jobs:
+  evidence:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      PROXY_LOG: ${{ github.workspace }}\proxy-connect.log
+    steps:
+      - name: Host
+        shell: pwsh
+        run: |
+          Get-ComputerInfo -Property OsName, OsVersion, OsBuildNumber, WindowsVersion | Format-List
+          "ImageOS=$env:ImageOS ImageVersion=$env:ImageVersion"
+
+      - name: Evidence harness
+        uses: actions/checkout@v4
+        with:
+          path: harness
+
+      - name: Upstream source at base
+        uses: actions/checkout@v4
+        with:
+          repository: kirodotdev/KiroCrew
+          ref: ${{ inputs.base_sha }}
+          path: src
+          sparse-checkout: |
+            src
+            pyproject.toml
+            README.md
+            LICENSE
+
+      - name: Apply the candidate patch
+        shell: pwsh
+        working-directory: src
+        run: |
+          git config user.email evidence@example.invalid
+          git config user.name evidence
+          git apply --include='src/*' ..\harness\tools\evidence\candidate.patch
+          git status --short
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        shell: pwsh
+        working-directory: src
+        run: |
+          python -m pip install --disable-pip-version-check -q -e .
+          python -c "import sys, slack_sdk, aiohttp; print(sys.version); print('slack_sdk', slack_sdk.version.__version__, 'aiohttp', aiohttp.__version__)"
+
+      - name: Start the logging proxy
+        shell: pwsh
+        run: |
+          New-Item -ItemType File -Force $env:PROXY_LOG | Out-Null
+          Start-Process -NoNewWindow python -ArgumentList "harness\tools\evidence\logging_proxy.py", "3128", "$env:PROXY_LOG"
+          Start-Sleep -Seconds 3
+
+      - name: Prove no proxy variable is set
+        shell: cmd
+        run: |
+          set HTTP_PROXY=
+          set HTTPS_PROXY=
+          set NO_PROXY=
+          set http_proxy=
+          set https_proxy=
+          set no_proxy=
+          (set | findstr /i proxy) || echo no proxy variables set
+
+      - name: Run the registry cases
+        shell: pwsh
+        run: |
+          Remove-Item Env:HTTP_PROXY, Env:HTTPS_PROXY, Env:NO_PROXY, Env:ALL_PROXY -ErrorAction SilentlyContinue
+          python harness\tools\evidence\run_cases.py

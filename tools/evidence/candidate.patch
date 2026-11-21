@@ -1,0 +1,804 @@
+From 864c7e3a81d67e5e7bc3e71a32b90b344e92ae2c Mon Sep 17 00:00:00 2001
+From: jeeshofone <will.laws@me.com>
+Date: Mon, 9 Nov 2026 22:31:21 +0000
+Subject: [PATCH] fix(channels): use the system proxy for the Slack Web API and
+ Telegram
+
+The Slack websocket and the gateway's aiohttp calls pick their proxy with
+http_proxy.resolve_proxy, which on Windows falls back to the registry
+through urllib.request.getproxies. The slack_sdk Web API clients were
+built with no proxy, so they read the environment only, and Telegram's
+resolver did the same. On a Windows host whose only egress is the system
+proxy, the two legs of one channel took different routes.
+
+Pass proxy=resolve_proxy(SLACK_API_URL) at every slack_sdk client the
+gateway builds, and let Telegram fall back to resolve_proxy when no proxy
+variable is set. Nothing is exported to kiro-cli or any other child. The
+shared bypass check now matches host and host:port, and no longer raises
+on an out-of-range port.
+
+Fixes #34152
+---
+ docs/guides/windows-install.md                | 11 +++
+ docs/system-specs/modules/messaging.md        |  2 +-
+ src/kiro_crew/cli_setup.py                    |  6 +-
+ .../dashboard/messaging_api/slack_settings.py |  6 +-
+ .../messaging_api/telegram_settings.py        |  7 +-
+ .../dashboard/slack_code_settings.py          |  3 +-
+ .../dashboard/slack_shared_access.py          |  5 +-
+ src/kiro_crew/http_proxy.py                   | 60 +++++++++++--
+ src/kiro_crew/slack/client.py                 |  3 +-
+ src/kiro_crew/slack/enterprise.py             |  3 +-
+ src/kiro_crew/slack/events.py                 |  4 +-
+ src/kiro_crew/slack/owner_claim.py            |  7 +-
+ src/kiro_crew/slack/reconnect.py              |  7 +-
+ src/kiro_crew/slack/socket_mode_proxy.py      | 13 +--
+ src/kiro_crew/telegram/client.py              |  1 +
+ src/kiro_crew/telegram/client_http.py         | 32 +++++--
+ test/test_channel_token_check_proxy.py        |  6 +-
+ test/test_cli_setup_slack.py                  |  2 +-
+ test/test_env_credential_secret_refs.py       |  2 +-
+ test/test_http_proxy.py                       | 53 ++++++++++++
+ test/test_slack_client_proxy.py               | 78 +++++++++++++++++
+ test/test_telegram_client.py                  | 84 +++++++++++++++++++
+ 22 files changed, 356 insertions(+), 39 deletions(-)
+ create mode 100644 test/test_slack_client_proxy.py
+
+diff --git a/docs/guides/windows-install.md b/docs/guides/windows-install.md
+index a89dc940e3..ff70fafd95 100644
+--- a/docs/guides/windows-install.md
++++ b/docs/guides/windows-install.md
+@@ -1061,6 +1061,17 @@ its window, does not start at boot, and is not restarted if it exits.
+   response instead of crashing. The web terminal itself works here on a
+   ConPTY shell; only its tab title, completions and the live cwd handed to chat are POSIX-only (see
+   the per-feature table).
++- **Slack or Telegram cannot connect on a proxy-only network**: Windows keeps
++  the system proxy (Settings > Network > Proxy) in the registry, not in the
++  environment. When no proxy variable is set, the gateway's Slack and Telegram
++  clients read that manual proxy through Python's standard registry lookup
++  (`urllib.request.getproxies`), so every leg of a channel takes the same
++  route. The bypass list ("Don't use the proxy server for addresses beginning
++  with") is honoured by the same standard matcher, `<local>` included. A setup
++  script (PAC) is not read; with PAC only, set `HTTPS_PROXY` and `NO_PROXY` as
++  user environment variables. Any proxy variable already in the environment
++  wins. The model traffic of `kiro-cli` and every other child process is not
++  changed: they see only the environment.
+ 
+ ## Related
+ 
+diff --git a/docs/system-specs/modules/messaging.md b/docs/system-specs/modules/messaging.md
+index 3f97148e21..2f5f21ccd3 100644
+--- a/docs/system-specs/modules/messaging.md
++++ b/docs/system-specs/modules/messaging.md
+@@ -4910,7 +4910,7 @@ Slack settings API they are registered in the dashboard route block (NOT
+ - `PUT /api/telegram/config` — requires a direct-local request (same gate as
+   the Slack save); remote gets 403. Validate-first/commit-last. Pasted tokens
+   are shape-checked (`<bot_id>:<secret>`) and verified against Telegram
+-  `getMe` (through the same `_api_base` resolver and forward-proxy rule the Telegram client uses, the proxy bypassed for a loopback base, with redirects refused) before storage; rejection returns 400 and writes nothing, network
++  `getMe` (through the same `_api_base` resolver and forward-proxy rule the Telegram client uses, the proxy bypassed for a loopback base or a `NO_PROXY` host, with redirects refused) before storage; rejection returns 400 and writes nothing, network
+   failure saves with `verify_warning`. `bot_token_clear` must be a strict
+   boolean. The secret lands in `config_dir/.env` as `TELEGRAM_BOT_TOKEN` via
+   the same atomic 0600 write, and `os.environ` is synced afterward. Setting
+diff --git a/src/kiro_crew/cli_setup.py b/src/kiro_crew/cli_setup.py
+index 6678c1aad3..032a8e5ece 100644
+--- a/src/kiro_crew/cli_setup.py
++++ b/src/kiro_crew/cli_setup.py
+@@ -49,6 +49,7 @@ from kiro_crew.constants import MIN_NODE_VERSION, format_node_version
+ from kiro_crew.dashboard.urls import _resolve_hostname_bounded
+ from kiro_crew.hidden_leaf_staging import EnvStagingRefused
+ from kiro_crew.host_timezone import LOCAL_TIMEZONE, detect_host_timezone, is_local_timezone
++from kiro_crew.http_proxy import SLACK_API_URL, resolve_proxy
+ from kiro_crew.sandbox import unavailable_kind
+ from kiro_crew.secrets.migrate import _env_lock_path
+ from kiro_crew.security import redact
+@@ -722,7 +723,9 @@ def _verify_slack_secret(key: str, token: str) -> tuple[bool | None, str]:
+     token = resolve_env_credential(key, token)
+     if not token:
+         return False, "the secret:// reference cannot be resolved from the vault"
+-    client = WebClient(token=token, timeout=_SLACK_VERIFY_TIMEOUT)
++    client = WebClient(
++        token=token, timeout=_SLACK_VERIFY_TIMEOUT, proxy=resolve_proxy(SLACK_API_URL)
++    )
+     try:
+         if key == CRED_SLACK_APP_TOKEN:
+             client.apps_connections_open(app_token=token)
+@@ -759,6 +762,7 @@ def _verify_slack_owner_id(bot_token: str, owner_id: str) -> tuple[bool | None,
+     client = WebClient(
+         token=resolve_env_credential(CRED_SLACK_BOT_TOKEN, bot_token),
+         timeout=_SLACK_VERIFY_TIMEOUT,
++        proxy=resolve_proxy(SLACK_API_URL),
+     )
+     try:
+         resp = client.users_info(user=owner_id)
+diff --git a/src/kiro_crew/dashboard/messaging_api/slack_settings.py b/src/kiro_crew/dashboard/messaging_api/slack_settings.py
+index d95f4569bc..4b10fab231 100644
+--- a/src/kiro_crew/dashboard/messaging_api/slack_settings.py
++++ b/src/kiro_crew/dashboard/messaging_api/slack_settings.py
+@@ -47,7 +47,11 @@ async def _validate_slack_token(key: str, token: str) -> str | None:
+     from slack_sdk.errors import SlackApiError
+     from slack_sdk.web.async_client import AsyncWebClient
+ 
+-    client = AsyncWebClient(token=token, timeout=_TOKEN_VERIFY_TIMEOUT)
++    from kiro_crew.http_proxy import SLACK_API_URL, resolve_proxy
++
++    client = AsyncWebClient(
++        token=token, timeout=_TOKEN_VERIFY_TIMEOUT, proxy=resolve_proxy(SLACK_API_URL)
++    )
+     try:
+         if key == "SLACK_APP_TOKEN":
+             await client.apps_connections_open(app_token=token)
+diff --git a/src/kiro_crew/dashboard/messaging_api/telegram_settings.py b/src/kiro_crew/dashboard/messaging_api/telegram_settings.py
+index 1fdaf5f289..c7a79ec4b0 100644
+--- a/src/kiro_crew/dashboard/messaging_api/telegram_settings.py
++++ b/src/kiro_crew/dashboard/messaging_api/telegram_settings.py
+@@ -49,7 +49,7 @@ async def _validate_telegram_token(token: str) -> str | None:
+     """
+     import aiohttp  # noqa: F811
+ 
+-    from kiro_crew.telegram.client import _api_base, _resolve_proxy, _url_is_loopback
++    from kiro_crew.telegram.client_http import _api_base, _proxy_for_url, _resolve_proxy
+ 
+     timeout = aiohttp.ClientTimeout(total=_TOKEN_VERIFY_TIMEOUT)
+     # Built from the SAME TELEGRAM_API_BASE_URL resolver the client uses
+@@ -58,9 +58,8 @@ async def _validate_telegram_token(token: str) -> str | None:
+     # never target a different host than the live channel; unset falls back to
+     # the public host.
+     verify_url = _api_base().format(token=token, method="getMe")
+-    # The client's forward-proxy rule (``_proxy_for``): the env proxy, except
+-    # that a loopback base never leaves the machine.
+-    proxy = None if _url_is_loopback(verify_url) else _resolve_proxy()
++    # The client's own forward-proxy rule: loopback and NO_PROXY hosts go direct.
++    proxy = _proxy_for_url(verify_url, _resolve_proxy())
+     async with aiohttp.ClientSession(timeout=timeout) as session:
+         # verify_url carries the bot token; refuse a proxy redirect to a
+         # plaintext http:// Location rather than follow it off-box, matching the
+diff --git a/src/kiro_crew/dashboard/slack_code_settings.py b/src/kiro_crew/dashboard/slack_code_settings.py
+index 9702482436..8b3f4b3ba2 100644
+--- a/src/kiro_crew/dashboard/slack_code_settings.py
++++ b/src/kiro_crew/dashboard/slack_code_settings.py
+@@ -31,6 +31,7 @@ from kiro_crew.config.sections_slack import (
+     CODE_CHANNEL_DEFAULT_MAX,
+ )
+ from kiro_crew.effort import is_valid_effort
++from kiro_crew.http_proxy import SLACK_API_URL, resolve_proxy
+ from kiro_crew.slack import features as slack_features
+ from kiro_crew.slack import scope_probe
+ 
+@@ -761,7 +762,7 @@ async def manifest_status(cfg: Any, bot_token: str, *, refresh: bool = False) ->
+     else:
+         from slack_sdk.web.async_client import AsyncWebClient
+ 
+-        client = AsyncWebClient(token=bot_token, timeout=10)
++        client = AsyncWebClient(token=bot_token, timeout=10, proxy=resolve_proxy(SLACK_API_URL))
+         if refresh:
+             # Check again re-probes like a reconnect: a workspace an admin has
+             # since enabled must read as such, so a runtime "feature_disabled"
+diff --git a/src/kiro_crew/dashboard/slack_shared_access.py b/src/kiro_crew/dashboard/slack_shared_access.py
+index 1636be08c3..958507eb74 100644
+--- a/src/kiro_crew/dashboard/slack_shared_access.py
++++ b/src/kiro_crew/dashboard/slack_shared_access.py
+@@ -30,6 +30,7 @@ from aiohttp import web
+ 
+ from kiro_crew.config.sections_slack import is_slack_user_id, shared_user_ids
+ from kiro_crew.dashboard.origin import is_direct_local_request
++from kiro_crew.http_proxy import SLACK_API_URL, resolve_proxy
+ from kiro_crew.sel import sel
+ from kiro_crew.slack import shared_access
+ 
+@@ -72,7 +73,9 @@ async def _slack_identity() -> tuple[str, str]:
+ def _web_client(token: str) -> Any:
+     from slack_sdk.web.async_client import AsyncWebClient
+ 
+-    return AsyncWebClient(token=token, timeout=10) if token else None
++    if not token:
++        return None
++    return AsyncWebClient(token=token, timeout=10, proxy=resolve_proxy(SLACK_API_URL))
+ 
+ 
+ def _user_view(verdict: shared_access.Verdict) -> dict[str, Any]:
+diff --git a/src/kiro_crew/http_proxy.py b/src/kiro_crew/http_proxy.py
+index 1e76f73125..13ab819f21 100644
+--- a/src/kiro_crew/http_proxy.py
++++ b/src/kiro_crew/http_proxy.py
+@@ -2,9 +2,15 @@
+ 
+ from __future__ import annotations
+ 
++import logging
+ import urllib.parse
+ import urllib.request
+ 
++logger = logging.getLogger(__name__)
++
++# The Slack Web API base the slack_sdk clients call; their proxy is picked for it.
++SLACK_API_URL = "https://slack.com/api/"
++
+ 
+ def resolve_proxy(url: str) -> str | None:
+     """Select HTTPS then HTTP proxy, respecting the destination host's bypass list.
+@@ -16,10 +22,54 @@ def resolve_proxy(url: str) -> str | None:
+     proxy = proxies.get("https") or proxies.get("http")
+     if not proxy:
+         return None
++    scheme = urllib.parse.urlsplit(proxy).scheme.lower()
++    if scheme not in _USABLE_PROXY_SCHEMES:
++        # A Windows `socks=` entry reaches here as socks4://, which the HTTP
++        # clients cannot speak; connect direct, as with no proxy at all.
++        _warn_unusable_scheme(scheme)
++        return None
++    return None if is_bypassed(url) else proxy
++
++
++# The proxy schemes aiohttp and slack_sdk can use. The stdlib already turns a
++# Windows `http=` or `https=` entry into an http:// URL.
++_USABLE_PROXY_SCHEMES = frozenset({"http", "https"})
++_warned_schemes: set[str] = set()
++
++
++def _warn_unusable_scheme(scheme: str) -> None:
++    if scheme in _warned_schemes:
++        return
++    _warned_schemes.add(scheme)
++    logger.warning(
++        "Ignoring a %s:// system proxy: the HTTP clients cannot use it, so they connect direct",
++        scheme or "schemeless",
++    )
++
++
++def is_bypassed(url: str, *, environment_only: bool = False) -> bool:
++    """True when the bypass list names *url*'s host, bare or as ``host:port``.
++
++    The port is the URL's own or its scheme's default. ``resolve_proxy``, Slack
++    Socket Mode and Telegram use this one rule. ``environment_only`` reads
++    ``NO_PROXY`` alone: the OS fallback can resolve the host, which blocks, so
++    a caller on the event loop whose proxy came from the environment uses it.
++    """
+     parsed = urllib.parse.urlparse(url)
+     host = parsed.hostname or ""
+-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+-    # A bypass entry may name the bare host or ``host:port``, as Socket Mode checks.
+-    if urllib.request.proxy_bypass(host) or urllib.request.proxy_bypass(f"{host}:{port}"):
+-        return None
+-    return proxy
++    if not host:
++        return False
++    default_port = 443 if parsed.scheme in ("https", "wss") else 80
++    try:
++        port = parsed.port or default_port
++    except ValueError:
++        # An out-of-range port must not make the shared check raise; fall back
++        # to the scheme default so the bare-host check still runs.
++        port = default_port
++    # typeshed omits proxy_bypass_environment; the runtime has it.
++    bypass = (
++        urllib.request.proxy_bypass_environment  # type: ignore[attr-defined]
++        if environment_only
++        else urllib.request.proxy_bypass
++    )
++    return bool(bypass(host) or bypass(f"{host}:{port}"))
+diff --git a/src/kiro_crew/slack/client.py b/src/kiro_crew/slack/client.py
+index f6e7e7598d..ab47912c79 100644
+--- a/src/kiro_crew/slack/client.py
++++ b/src/kiro_crew/slack/client.py
+@@ -20,7 +20,7 @@ from slack_sdk.http_retry.response import HttpResponse
+ from slack_sdk.http_retry.state import RetryState
+ from slack_sdk.web.async_client import AsyncWebClient
+ 
+-from kiro_crew.http_proxy import resolve_proxy
++from kiro_crew.http_proxy import SLACK_API_URL, resolve_proxy
+ from kiro_crew.slack.agent_sessions.fence import note_message, turn_muted
+ from kiro_crew.slack.channel_policy import require_channel
+ from kiro_crew.slack.team_ids import use_channel_team_store
+@@ -464,6 +464,7 @@ class RealSlackClient(SlackClientOps):
+         self._web = AsyncWebClient(
+             token=bot_token,
+             retry_handlers=[_ConnectSetupRetryHandler(max_retry_count=_SLACK_CONNECT_RETRY_COUNT)],
++            proxy=resolve_proxy(SLACK_API_URL),
+         )
+         # Channel→workspace team_id cache. Populated ONLY from
+         # conversations_info()'s home-workspace answer by
+diff --git a/src/kiro_crew/slack/enterprise.py b/src/kiro_crew/slack/enterprise.py
+index c14a5b320b..a1cf40c99b 100644
+--- a/src/kiro_crew/slack/enterprise.py
++++ b/src/kiro_crew/slack/enterprise.py
+@@ -27,6 +27,7 @@ from kiro_crew.config.loader import (
+     config_path,
+     read_config_for_update,
+ )
++from kiro_crew.http_proxy import SLACK_API_URL, resolve_proxy
+ from kiro_crew.sel import sel
+ 
+ logger = logging.getLogger(__name__)
+@@ -530,7 +531,7 @@ def _validate_enterprise_unheld(
+     try:
+         from slack_sdk.web import WebClient
+ 
+-        client = WebClient(token=bot_token)
++        client = WebClient(token=bot_token, proxy=resolve_proxy(SLACK_API_URL))
+         resp = client.auth_test()
+     except Exception:
+         # auth.test failed (missing slack_sdk or API error): the workspace
+diff --git a/src/kiro_crew/slack/events.py b/src/kiro_crew/slack/events.py
+index 21440f1263..aa0d1c56cd 100644
+--- a/src/kiro_crew/slack/events.py
++++ b/src/kiro_crew/slack/events.py
+@@ -66,7 +66,7 @@ from kiro_crew.dashboard.handlers import get_update_info
+ from kiro_crew.dashboard.token_auth import LINK_WINDOW_SECS, MAX_SESSION_TTL_SECS, parse_duration
+ from kiro_crew.executors import subprocess_executor
+ from kiro_crew.hooks import safe_read_file
+-from kiro_crew.http_proxy import resolve_proxy
++from kiro_crew.http_proxy import SLACK_API_URL, resolve_proxy
+ from kiro_crew.mcp_discovery import list_servers
+ from kiro_crew.messaging.commands import note_user_stop
+ from kiro_crew.messaging.dispatch import admit_inbound_callback
+@@ -306,7 +306,7 @@ async def init_socket_mode(
+         orch.slack = None
+         return
+ 
+-    web_client = AsyncWebClient(token=orch._bot_token)
++    web_client = AsyncWebClient(token=orch._bot_token, proxy=resolve_proxy(SLACK_API_URL))
+     # slack.shared_access checks each listed id with this client (users.info).
+     install_shared_access(web_client)
+     orch._socket_client = WSSocketModeClient(
+diff --git a/src/kiro_crew/slack/owner_claim.py b/src/kiro_crew/slack/owner_claim.py
+index f05eb4d478..500279fc55 100644
+--- a/src/kiro_crew/slack/owner_claim.py
++++ b/src/kiro_crew/slack/owner_claim.py
+@@ -38,6 +38,7 @@ from dataclasses import asdict, dataclass
+ from typing import Any
+ 
+ from kiro_crew.config.loader import CRED_OWNER_ID, CRED_SLACK_APP_TOKEN, CRED_SLACK_BOT_TOKEN
++from kiro_crew.http_proxy import SLACK_API_URL, resolve_proxy
+ from kiro_crew.sel import sel
+ from kiro_crew.validation import USER_ID_RE
+ 
+@@ -351,7 +352,11 @@ class OwnerClaim:
+     def _web_client(self, bot: str) -> Any:
+         from slack_sdk.web.async_client import AsyncWebClient
+ 
+-        return AsyncWebClient(token=bot, timeout=int(_SLACK_TIMEOUT_SECS))
++        return AsyncWebClient(
++            token=bot,
++            timeout=int(_SLACK_TIMEOUT_SECS),
++            proxy=resolve_proxy(SLACK_API_URL),
++        )
+ 
+     def _socket_client(self, app: str, web: Any) -> Any:
+         from kiro_crew.slack.socket_mode_proxy import ProxySelectingSocketModeClient
+diff --git a/src/kiro_crew/slack/reconnect.py b/src/kiro_crew/slack/reconnect.py
+index 24f0eddcc2..3a8cde7e63 100644
+--- a/src/kiro_crew/slack/reconnect.py
++++ b/src/kiro_crew/slack/reconnect.py
+@@ -67,6 +67,7 @@ from kiro_crew.config.loader import (
+     CRED_SLACK_BOT_TOKEN,
+     KiroCrewConfig,
+ )
++from kiro_crew.http_proxy import SLACK_API_URL, resolve_proxy
+ 
+ if TYPE_CHECKING:
+     from kiro_crew.slack.gateway import GatewayOrchestrator
+@@ -132,7 +133,11 @@ async def probe_workspace(bot_token: str) -> str:
+     from slack_sdk.web.async_client import AsyncWebClient
+ 
+     return await _team_of(
+-        AsyncWebClient(token=bot_token, timeout=int(_WORKSPACE_PROBE_TIMEOUT_SECS))
++        AsyncWebClient(
++            token=bot_token,
++            timeout=int(_WORKSPACE_PROBE_TIMEOUT_SECS),
++            proxy=resolve_proxy(SLACK_API_URL),
++        )
+     )
+ 
+ 
+diff --git a/src/kiro_crew/slack/socket_mode_proxy.py b/src/kiro_crew/slack/socket_mode_proxy.py
+index ddff9c6e3a..bc86bc693d 100644
+--- a/src/kiro_crew/slack/socket_mode_proxy.py
++++ b/src/kiro_crew/slack/socket_mode_proxy.py
+@@ -41,6 +41,8 @@ import websockets
+ import websockets.uri
+ from slack_sdk.socket_mode.websockets import SocketModeClient
+ 
++from kiro_crew.http_proxy import is_bypassed
++
+ logger = logging.getLogger(__name__)
+ 
+ # websockets 15 is the first release that detects a proxy, and the first whose
+@@ -73,22 +75,13 @@ def _is_socks(proxy: str) -> bool:
+     return urllib.parse.urlparse(proxy).scheme.lower().startswith("socks")
+ 
+ 
+-def _bypassed(uri: str) -> bool:
+-    parsed = urllib.parse.urlparse(uri)
+-    host = parsed.hostname or ""
+-    if not host:
+-        return False
+-    port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+-    return bool(urllib.request.proxy_bypass(host) or urllib.request.proxy_bypass(f"{host}:{port}"))
+-
+-
+ def select_socket_mode_proxy(uri: str) -> str | None:
+     """Return the proxy URL to open ``uri`` through, or ``None`` for direct.
+ 
+     Raises :class:`SocksProxyUnavailable` when the only proxy configured for
+     ``uri`` is a SOCKS one and ``python-socks`` is not installed.
+     """
+-    if _ws_get_proxy is None or _bypassed(uri):
++    if _ws_get_proxy is None or is_bypassed(uri):
+         return None
+     proxy: str | None = _ws_get_proxy(websockets.uri.parse_uri(uri))
+     if proxy is None or not _is_socks(proxy) or _socks_supported():
+diff --git a/src/kiro_crew/telegram/client.py b/src/kiro_crew/telegram/client.py
+index 54f2de5daf..320f493439 100644
+--- a/src/kiro_crew/telegram/client.py
++++ b/src/kiro_crew/telegram/client.py
+@@ -1747,6 +1747,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
+         _METHOD_TAIL,
+         _api_base,
+         _is_loopback_host,
++        _proxy_for_url,
+         _record_api_duration,
+         _url_is_loopback,
+     )
+diff --git a/src/kiro_crew/telegram/client_http.py b/src/kiro_crew/telegram/client_http.py
+index 39c02995f6..335a95890b 100644
+--- a/src/kiro_crew/telegram/client_http.py
++++ b/src/kiro_crew/telegram/client_http.py
+@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any, Callable, Sequence
+ 
+ import aiohttp
+ 
++from kiro_crew.http_proxy import is_bypassed, resolve_proxy
+ from kiro_crew.messaging.outbound_files import OutboundFile, upload_filename
+ from kiro_crew.metrics.provider import get_recorder
+ 
+@@ -173,17 +174,31 @@ def _record_api_duration(
+         logger.debug("telegram api duration metric emit failed", exc_info=True)
+ 
+ 
++def _proxy_for_url(url: str, proxy: str | None) -> str | None:
++    """*proxy* for *url*, or ``None`` for a loopback or ``NO_PROXY`` host.
++
++    Shared by the client and the dashboard token check so both take the same
++    route to the same host.
++    """
++    if not proxy or _url_is_loopback(url):
++        return None
++    # NO_PROXY only: this runs on the event loop, and the OS fallback can block
++    # on a DNS lookup.
++    if is_bypassed(url, environment_only=True):
++        return None
++    return proxy
++
++
+ def _proxy_for(self: TelegramClient, url: str) -> str | None:
+     """The forward proxy to use for *url*, or ``None`` to bypass it.
+ 
+     A loopback destination must never traverse a remote forward proxy: the
+     request URL carries the bot token, so routing a ``http://127.0.0.1``
+     call through ``HTTPS_PROXY`` would leak the token off-box in plaintext.
+-    For every non-loopback host the configured proxy is used unchanged.
++    A host on the environment's ``NO_PROXY`` list connects directly too, so
++    a bypass the system proxy settings name is honoured here as well.
+     """
+-    if _url_is_loopback(url):
+-        return None
+-    return self._proxy
++    return _proxy_for_url(url, self._proxy)
+ 
+ 
+ async def _call_raw(self: TelegramClient, method: str, params: dict, timeout: int = 15) -> Any:
+@@ -454,9 +469,14 @@ async def _api_request(
+ 
+ 
+ def _resolve_proxy() -> str | None:
+-    """Resolve outbound proxy from environment."""
++    """Resolve the outbound proxy: the environment first, then the OS settings.
++
++    With no proxy variable set, the Bot API host's proxy comes from
++    ``http_proxy.resolve_proxy``, the reader the Slack clients use, so on
++    Windows Telegram takes the system proxy from the registry as they do.
++    """
+     for var in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"):
+         val = os.environ.get(var)
+         if val:
+             return val
+-    return None
++    return resolve_proxy(_api_base())
+diff --git a/test/test_channel_token_check_proxy.py b/test/test_channel_token_check_proxy.py
+index b0aa05679d..76badb99bb 100644
+--- a/test/test_channel_token_check_proxy.py
++++ b/test/test_channel_token_check_proxy.py
+@@ -56,8 +56,10 @@ class _Session:
+         (messaging._validate_webex_token, None, _PROXY),
+         # A loopback Bot API base keeps the token on the machine, as the client does.
+         (messaging._validate_telegram_token, "http://127.0.0.1:8081/bot{token}/{method}", None),
++        # A base host on NO_PROXY connects directly, as the client does.
++        (messaging._validate_telegram_token, "https://tg.direct.example/bot{token}/{method}", None),
+     ],
+-    ids=["discord", "telegram", "webex", "telegram-loopback-base"],
++    ids=["discord", "telegram", "webex", "telegram-loopback-base", "telegram-no-proxy-base"],
+ )
+ async def test_token_check_uses_the_channel_proxy(
+     monkeypatch: pytest.MonkeyPatch,
+@@ -68,6 +70,8 @@ async def test_token_check_uses_the_channel_proxy(
+     for var in _PROXY_VARS:
+         monkeypatch.delenv(var, raising=False)
+     monkeypatch.setenv("HTTPS_PROXY", _PROXY)
++    monkeypatch.delenv("no_proxy", raising=False)
++    monkeypatch.setenv("NO_PROXY", "tg.direct.example")
+     if telegram_base is None:
+         monkeypatch.delenv("TELEGRAM_API_BASE_URL", raising=False)
+     else:
+diff --git a/test/test_cli_setup_slack.py b/test/test_cli_setup_slack.py
+index 2c1bf6dbe9..31f7652ec0 100644
+--- a/test/test_cli_setup_slack.py
++++ b/test/test_cli_setup_slack.py
+@@ -35,7 +35,7 @@ class _FakeWebClient:
+ 
+     calls: list[tuple[str, str]] = []
+ 
+-    def __init__(self, token: str = "", timeout: int = 0) -> None:
++    def __init__(self, token: str = "", timeout: int = 0, proxy: str | None = None) -> None:
+         self.token = token
+ 
+     def apps_connections_open(self, app_token: str) -> dict[str, object]:
+diff --git a/test/test_env_credential_secret_refs.py b/test/test_env_credential_secret_refs.py
+index 4337e94145..deb8cd8a63 100644
+--- a/test/test_env_credential_secret_refs.py
++++ b/test/test_env_credential_secret_refs.py
+@@ -406,7 +406,7 @@ def test_the_slack_wizard_checks_a_kept_reference_as_its_secret(
+     tokens: list[str] = []
+ 
+     class _Client:
+-        def __init__(self, token: str, timeout: float) -> None:
++        def __init__(self, token: str, timeout: float, proxy: str | None = None) -> None:
+             tokens.append(token)
+ 
+         def auth_test(self) -> dict:
+diff --git a/test/test_http_proxy.py b/test/test_http_proxy.py
+index 3b0e3c6287..fc767532d7 100644
+--- a/test/test_http_proxy.py
++++ b/test/test_http_proxy.py
+@@ -77,3 +77,56 @@ def test_proxy_settings_are_read_per_call(monkeypatch):
+     assert http_proxy.resolve_proxy("https://updates.example/feed") is None
+     assert proxies.call_count == 2
+     assert bypass.call_count == 3
++
++
++@pytest.mark.parametrize("environment_only", [True, False], ids=["environment", "os"])
++def test_bypass_check_does_not_raise_on_an_out_of_range_port(monkeypatch, environment_only):
++    # A base URL such as TELEGRAM_API_BASE_URL ending in :99999 must not make
++    # the shared check raise ValueError, which Telegram's call paths do not catch.
++    url = "https://tg.example:99999/botT/getMe"
++    # Pin the OS matcher to the environment-only variant, as the test above
++    # does, so the os case never reads this host's own registry or settings.
++    monkeypatch.setattr(
++        http_proxy.urllib.request,
++        "proxy_bypass",
++        http_proxy.urllib.request.proxy_bypass_environment,
++    )
++    for name in ("no_proxy", "NO_PROXY"):
++        monkeypatch.delenv(name, raising=False)
++    assert http_proxy.is_bypassed(url, environment_only=environment_only) is False
++    monkeypatch.setenv("NO_PROXY", "tg.example")
++    assert http_proxy.is_bypassed(url, environment_only=environment_only) is True
++
++
++@pytest.mark.parametrize(
++    ("proxies", "expected"),
++    [
++        # What the stdlib returns for a Windows `ProxyServer` of `127.0.0.1:3128`.
++        (
++            {"http": "http://127.0.0.1:3128", "https": "http://127.0.0.1:3128"},
++            "http://127.0.0.1:3128",
++        ),
++        # `http=127.0.0.1:3128;https=127.0.0.1:3128`: an https= entry is still http://.
++        (
++            {"http": "http://127.0.0.1:3128", "https": "http://127.0.0.1:3128"},
++            "http://127.0.0.1:3128",
++        ),
++        # `socks=127.0.0.1:1080`: the stdlib copies a socks4:// URL into http and https.
++        (
++            {
++                "socks": "socks://127.0.0.1:1080",
++                "http": "socks4://127.0.0.1:1080",
++                "https": "socks4://127.0.0.1:1080",
++            },
++            None,
++        ),
++        ({"https": "socks5://127.0.0.1:1080"}, None),
++    ],
++    ids=["single-server", "per-protocol", "windows-socks", "socks5"],
++)
++def test_only_a_proxy_the_clients_can_use_is_returned(monkeypatch, proxies, expected):
++    monkeypatch.setattr(http_proxy.urllib.request, "getproxies", lambda: proxies)
++    monkeypatch.setattr(http_proxy.urllib.request, "proxy_bypass", lambda host: False)
++    monkeypatch.setattr(http_proxy, "_warned_schemes", set())
++
++    assert http_proxy.resolve_proxy("https://slack.com/api/") == expected
+diff --git a/test/test_slack_client_proxy.py b/test/test_slack_client_proxy.py
+new file mode 100644
+index 0000000000..149e28f787
+--- /dev/null
++++ b/test/test_slack_client_proxy.py
+@@ -0,0 +1,78 @@
++"""Every slack_sdk Web API client is built with an explicit proxy.
++
++slack_sdk reads only the proxy environment variables when ``proxy`` is None.
++The other Slack legs (Socket Mode and the aiohttp calls) take their proxy from
++``http_proxy.resolve_proxy``, which on Windows also reads the system proxy from
++the registry. A client built without ``proxy=`` would take a different route
++from those legs, so this test refuses any such construction under ``src/``.
++"""
++
++from __future__ import annotations
++
++import ast
++from pathlib import Path
++from typing import Any
++
++import pytest
++
++_SRC = Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
++_CLIENTS = {"WebClient", "AsyncWebClient"}
++_PROXY_VARS = ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy")
++
++
++def _no_proxy_env(monkeypatch: Any) -> None:
++    # slack_sdk falls back to these when proxy is None, so clear them.
++    for name in _PROXY_VARS:
++        monkeypatch.delenv(name, raising=False)
++
++
++def _constructions() -> list[tuple[str, int, bool]]:
++    found = []
++    for path in sorted(_SRC.rglob("*.py")):
++        if "_vendor" in path.parts:
++            continue
++        tree = ast.parse(path.read_text(encoding="utf-8"))
++        for node in ast.walk(tree):
++            if not isinstance(node, ast.Call):
++                continue
++            func = node.func
++            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
++            if name in _CLIENTS:
++                has_proxy = any(kw.arg == "proxy" for kw in node.keywords)
++                found.append((str(path.relative_to(_SRC)), node.lineno, has_proxy))
++    return found
++
++
++def test_every_slack_sdk_client_is_built_with_a_proxy() -> None:
++    sites = _constructions()
++    assert sites, "no slack_sdk client constructions found; the scan is broken"
++    missing = [f"{path}:{line}" for path, line, has_proxy in sites if not has_proxy]
++    assert missing == [], f"slack_sdk client built without proxy=: {missing}"
++
++
++@pytest.mark.parametrize("proxy", ["http://proxy.example:8080", None], ids=["proxy", "none"])
++def test_shared_access_client_forwards_the_resolved_proxy(
++    monkeypatch: Any, proxy: str | None
++) -> None:
++    from kiro_crew.dashboard import slack_shared_access
++
++    _no_proxy_env(monkeypatch)
++    asked: list[str] = []
++    monkeypatch.setattr(
++        slack_shared_access, "resolve_proxy", lambda url: asked.append(url) or proxy
++    )
++    client = slack_shared_access._web_client("xoxb-test")
++    assert client.proxy == proxy
++    assert asked == ["https://slack.com/api/"]
++
++
++@pytest.mark.parametrize("proxy", ["http://proxy.example:8080", None], ids=["proxy", "none"])
++def test_owner_claim_client_forwards_the_resolved_proxy(
++    monkeypatch: Any, proxy: str | None
++) -> None:
++    from kiro_crew.slack import owner_claim
++
++    _no_proxy_env(monkeypatch)
++    monkeypatch.setattr(owner_claim, "resolve_proxy", lambda url: proxy)
++    client = owner_claim.OwnerClaim._web_client(object(), "xoxb-test")
++    assert client.proxy == proxy
+diff --git a/test/test_telegram_client.py b/test/test_telegram_client.py
+index 04092d2d21..18ad281fb7 100644
+--- a/test/test_telegram_client.py
++++ b/test/test_telegram_client.py
+@@ -338,6 +338,62 @@ class TestLoopbackProxyBypass:
+         assert client._proxy_for("https://api.telegram.org/botT/getMe") == proxy
+         assert client._proxy_for("https://proxy.example.com/botT/getMe") == proxy
+ 
++    def test_proxy_bypassed_for_no_proxy_host(self, monkeypatch: Any) -> None:
++        from kiro_crew.telegram.client import TelegramClient
++
++        for name in ("no_proxy", "NO_PROXY"):
++            monkeypatch.delenv(name, raising=False)
++        monkeypatch.setenv("NO_PROXY", ".mirror.example,api.telegram.org")
++        proxy = "http://corp-proxy.example.com:3128"
++        client = TelegramClient(token="T", proxy=proxy)
++        # A host the system bypass list names connects directly.
++        assert client._proxy_for("https://api.telegram.org/botT/getMe") is None
++        assert client._proxy_for("https://tg.mirror.example/botT/getMe") is None
++        assert client._proxy_for("https://other.example/botT/getMe") == proxy
++
++    def test_proxy_choice_never_asks_the_os_matcher(self, monkeypatch: Any) -> None:
++        import urllib.request
++
++        from kiro_crew.telegram.client import TelegramClient
++
++        def blocking(_host: str) -> bool:
++            raise AssertionError("the OS matcher can block on DNS")
++
++        monkeypatch.setattr(urllib.request, "proxy_bypass", blocking)
++        # Read the environment only, never this host's own system proxy.
++        monkeypatch.setattr(urllib.request, "getproxies", urllib.request.getproxies_environment)
++        for name in (
++            "no_proxy",
++            "NO_PROXY",
++            "HTTPS_PROXY",
++            "HTTP_PROXY",
++            "ALL_PROXY",
++            "https_proxy",
++            "http_proxy",
++            "all_proxy",
++        ):
++            monkeypatch.delenv(name, raising=False)
++        # No proxy from the environment: no bypass check at all. A proxy: NO_PROXY only.
++        assert (
++            TelegramClient(token="T", proxy=None)._proxy_for("https://api.telegram.org/x") is None
++        )
++        proxy = "http://corp-proxy.example.com:3128"
++        assert (
++            TelegramClient(token="T", proxy=proxy)._proxy_for("https://api.telegram.org/x") == proxy
++        )
++
++    def test_proxy_bypassed_for_no_proxy_host_with_port(self, monkeypatch: Any) -> None:
++        from kiro_crew.telegram.client import TelegramClient
++
++        for name in ("no_proxy", "NO_PROXY"):
++            monkeypatch.delenv(name, raising=False)
++        monkeypatch.setenv("NO_PROXY", "api.telegram.org:443")
++        proxy = "http://corp-proxy.example.com:3128"
++        client = TelegramClient(token="T", proxy=proxy)
++        # A host:port entry matches the URL's effective port, default included.
++        assert client._proxy_for("https://api.telegram.org/botT/getMe") is None
++        assert client._proxy_for("https://api.telegram.org:8443/botT/getMe") == proxy
++
+ 
+ class TestTelegramSettingsSharedBase:
+     """The dashboard token-verify URL uses the client's shared resolver."""
+@@ -1300,3 +1356,31 @@ class TestClientClose:
+             assert client._session is None
+ 
+         asyncio.run(_run())
++
++
++class TestTelegramProxyFallback:
++    """With no proxy variable, Telegram asks the shared OS-aware reader."""
++
++    _VARS = ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy")
++
++    def test_environment_variable_wins(self, monkeypatch: Any) -> None:
++        from kiro_crew.telegram import client_http
++
++        for name in self._VARS:
++            monkeypatch.delenv(name, raising=False)
++        monkeypatch.setenv("HTTPS_PROXY", "http://env.example:3128")
++        monkeypatch.setattr(client_http, "resolve_proxy", lambda url: "http://os.example:8080")
++        assert client_http._resolve_proxy() == "http://env.example:3128"
++
++    def test_os_settings_used_when_no_variable_is_set(self, monkeypatch: Any) -> None:
++        from kiro_crew.telegram import client_http
++
++        for name in self._VARS:
++            monkeypatch.delenv(name, raising=False)
++        monkeypatch.delenv("TELEGRAM_API_BASE_URL", raising=False)
++        asked: list[str] = []
++        monkeypatch.setattr(
++            client_http, "resolve_proxy", lambda url: asked.append(url) or "http://os.example:8080"
++        )
++        assert client_http._resolve_proxy() == "http://os.example:8080"
++        assert asked and asked[0].startswith("https://api.telegram.org/")
+-- 
+2.50.1
+
