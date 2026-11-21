@@ -58,12 +58,15 @@ def connects() -> list[str]:
     return sorted({ln.strip() for ln in text.splitlines() if ln.strip()})
 
 
-def completed(result: dict) -> bool:
-    return (
-        result["auth.test"] == "slack_error:invalid_auth"
-        and result["apps.connections.open"].startswith("slack_error:")
+def completed(result: dict, *, sync_too: bool = True) -> bool:
+    ok = (
+        result["async auth.test"] == "slack_error:invalid_auth"
+        and result["async apps.connections.open"].startswith("slack_error:")
         and result["getMe"].startswith("auth_error:")
     )
+    if sync_too:
+        ok = ok and result["sync auth.test"] == "slack_error:invalid_auth"
+    return ok
 
 
 CASES = [
@@ -86,7 +89,9 @@ def check(name: str, r: dict, log: list[str]) -> list[str]:
     bad = []
     slack_via = "CONNECT slack.com:443" in log
     tg_via = "CONNECT api.telegram.org:443" in log
-    if not completed(r):
+    # Case 5: the sync WebClient's urllib transport reads the registry's
+    # socks4:// itself when proxy=None, as it does on main; reported, not failed.
+    if not completed(r, sync_too=not name.startswith("5")):
         bad.append("a call did not complete")
     if name.startswith(("1", "4")):
         if r["resolve_slack"] != PROXY or r["resolve_telegram"] != PROXY:
@@ -111,6 +116,18 @@ def check(name: str, r: dict, log: list[str]) -> list[str]:
 
 
 def main() -> None:
+    LOG.write_text("", encoding="utf-8")
+    proxy_proc = subprocess.Popen(
+        [sys.executable, str(HERE / "logging_proxy.py"), "3128", str(LOG)],
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+    )
+    print("logging proxy started, pid", proxy_proc.pid, flush=True)
+    import time
+
+    time.sleep(3)
+    if proxy_proc.poll() is not None:
+        raise SystemExit("the logging proxy exited at start")
     print("proxy variables in this process:", {k: v for k, v in os.environ.items() if "proxy" in k.lower()})
     failures = []
     try:
@@ -129,6 +146,7 @@ def main() -> None:
                 failures.append(f"{name}: {'; '.join(bad)}")
     finally:
         clear()
+        proxy_proc.terminate()
     if failures:
         raise SystemExit("unexpected results:\n" + "\n".join(failures))
     print("\nall cases as expected")

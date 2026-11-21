@@ -12,6 +12,7 @@ import urllib.request
 
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web import WebClient
+from slack_sdk.web.async_client import AsyncWebClient
 
 from kiro_crew.http_proxy import SLACK_API_URL, resolve_proxy
 from kiro_crew.telegram.client import TelegramAuthError, TelegramClient
@@ -25,11 +26,13 @@ print("getproxies():", out["getproxies"])
 print("resolve_proxy(SLACK_API_URL):", out["resolve_slack"])
 print("resolve_proxy(telegram api base):", out["resolve_telegram"])
 
+# Sync WebClient (cli_setup.py, slack/enterprise.py): urllib transport, which
+# with proxy=None reads urllib's own getproxies(), registry included.
 slack = WebClient(token="xoxb-0000-bogus", proxy=resolve_proxy(SLACK_API_URL), timeout=30)
 print("slack WebClient.proxy:", slack.proxy)
 for name, call in (
-    ("auth.test", lambda: slack.auth_test()),
-    ("apps.connections.open", lambda: slack.apps_connections_open(app_token="xapp-0-bogus")),
+    ("sync auth.test", lambda: slack.auth_test()),
+    ("sync apps.connections.open", lambda: slack.apps_connections_open(app_token="xapp-0-bogus")),
 ):
     try:
         resp = call()
@@ -39,6 +42,28 @@ for name, call in (
     except Exception as exc:  # noqa: BLE001 - evidence: report any transport failure
         out[name] = f"transport_error:{type(exc).__name__}:{exc}"
     print(f"slack {name}:", out[name])
+
+
+async def _slack_async() -> None:
+    # The gateway's live Slack path (slack/events.py, slack/client.py) uses
+    # AsyncWebClient, whose transport is aiohttp and reads only the environment.
+    client = AsyncWebClient(token="xoxb-0000-bogus", proxy=resolve_proxy(SLACK_API_URL), timeout=30)
+    print("slack AsyncWebClient.proxy:", client.proxy)
+    for name, call in (
+        ("async auth.test", lambda: client.auth_test()),
+        ("async apps.connections.open", lambda: client.apps_connections_open(app_token="xapp-0-bogus")),
+    ):
+        try:
+            resp = await call()
+            out[name] = f"ok:{resp.get('ok')}"
+        except SlackApiError as exc:
+            out[name] = f"slack_error:{exc.response.get('error')}"
+        except Exception as exc:  # noqa: BLE001 - evidence: report any transport failure
+            out[name] = f"transport_error:{type(exc).__name__}:{exc}"
+        print(f"slack {name}:", out[name])
+
+
+asyncio.run(_slack_async())
 
 
 async def _telegram() -> str:

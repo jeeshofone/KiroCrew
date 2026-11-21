@@ -58,13 +58,6 @@ jobs:
           python -m pip install --disable-pip-version-check -q -e .
           python -c "import sys, slack_sdk, aiohttp; print(sys.version); print('slack_sdk', slack_sdk.version.__version__, 'aiohttp', aiohttp.__version__)"
 
-      - name: Start the logging proxy
-        shell: pwsh
-        run: |
-          New-Item -ItemType File -Force $env:PROXY_LOG | Out-Null
-          Start-Process -NoNewWindow python -ArgumentList "harness\tools\evidence\logging_proxy.py", "3128", "$env:PROXY_LOG"
-          Start-Sleep -Seconds 3
-
       - name: Prove no proxy variable is set
         shell: cmd
         run: |
