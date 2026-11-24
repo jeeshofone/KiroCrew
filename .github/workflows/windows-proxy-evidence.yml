@@ -74,3 +74,39 @@ jobs:
         run: |
           Remove-Item Env:HTTP_PROXY, Env:HTTPS_PROXY, Env:NO_PROXY, Env:ALL_PROXY -ErrorAction SilentlyContinue
           python harness\tools\evidence\run_cases.py
+
+  no-proxy-only:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      PROXY_LOG: ${{ github.workspace }}/proxy-connect.log
+      HEAD_SRC: ${{ github.workspace }}/head
+      MAIN_SRC: ${{ github.workspace }}/main
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: PR head (14e668368d)
+        uses: actions/checkout@v4
+        with:
+          repository: kirodotdev/KiroCrew
+          ref: 14e668368d1a5a51d4ed8d9b98179dd76070f319
+          path: head
+      - name: Main at the PR base (e21208a2d7)
+        uses: actions/checkout@v4
+        with:
+          repository: kirodotdev/KiroCrew
+          ref: e21208a2d73e2cc74510708ea1a7556d43150b3f
+          path: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the PR head's dependencies
+        working-directory: head
+        run: python -m pip install --disable-pip-version-check -q -e .
+      - name: NO_PROXY-only case and control, head and main
+        run: python harness/tools/evidence/run_no_proxy.py
